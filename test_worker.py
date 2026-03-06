@@ -992,7 +992,7 @@ class TestHandlePullRequestSynchronize(unittest.TestCase):
             ):
                 await _worker.handle_pull_request_synchronize(payload, "tok")
         _run(_inner())
-        self.assertEqual(calls, ["files", "migration", "linked", "conflicts"])
+        self.assertEqual(calls, ["files", "migration", "conflicts"])
 
     def test_ignores_bot(self):
         payload = _make_pr_payload(sender={"login": "bot", "type": "Bot"})
@@ -1495,8 +1495,8 @@ class TestHandlePullRequestClosedLeaderboard(unittest.TestCase):
         leaderboard_calls, rank_calls, comments = [], [], []
         self._run_pr_closed(payload, leaderboard_calls, rank_calls, comments)
         
-        # Should check rank improvement
-        self.assertEqual(len(rank_calls), 1)
+        # Rank improvement check is disabled (shown in leaderboard display instead)
+        self.assertEqual(len(rank_calls), 0)
         # Should post leaderboard
         self.assertEqual(len(leaderboard_calls), 1)
         # Should post merge congratulations
@@ -1598,7 +1598,11 @@ class TestGetFeatureConfig(unittest.TestCase):
         env = self._make_env()
         config = get_feature_config(env)
         for key in FEATURE_DEFAULTS:
-            self.assertTrue(config[key], f"{key} should default to True")
+            # FEATURE_ISSUE_LINK_CHECK is intentionally off by default
+            if key == "FEATURE_ISSUE_LINK_CHECK":
+                self.assertFalse(config[key], f"{key} should default to False")
+            else:
+                self.assertTrue(config[key], f"{key} should default to True")
 
     def test_disable_single_feature(self):
         env = self._make_env(FEATURE_PR_SIZE_LABEL="false")
@@ -1836,7 +1840,7 @@ class TestFeatureTogglePRSynchronize(unittest.TestCase):
     def test_all_enabled(self):
         calls = []
         self._run_sync(dict(FEATURE_DEFAULTS), calls)
-        self.assertEqual(calls, ["files", "migration", "linked", "conflicts"])
+        self.assertEqual(calls, ["files", "migration", "conflicts"])
 
     def test_conflict_check_disabled(self):
         features = dict(FEATURE_DEFAULTS, FEATURE_CONFLICT_CHECK=False)

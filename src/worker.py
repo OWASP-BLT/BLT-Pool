@@ -56,7 +56,7 @@ MIGRATION_PATH_PATTERN = r"migrations/\d{4}_"
 FEATURE_DEFAULTS = {
     "FEATURE_PR_SIZE_LABEL": True,
     "FEATURE_MIGRATION_LABEL": True,
-    "FEATURE_ISSUE_LINK_CHECK": True,
+    "FEATURE_ISSUE_LINK_CHECK": False,
     "FEATURE_CONFLICT_CHECK": True,
     "FEATURE_PR_LIMIT": True,
     "FEATURE_WELCOME_COMMENT": True,
@@ -2040,9 +2040,8 @@ async def handle_pull_request_closed(payload: dict, token: str, env=None, featur
         )
         await create_comment(owner, repo, pr_number, body, token)
     
-    # Check for rank improvement and congratulate if improved
+    # Post leaderboard (rank improvement check is disabled — shown in leaderboard display instead)
     if features.get("FEATURE_LEADERBOARD", True):
-        await _check_rank_improvement(owner, repo, pr_number, author_login, token)
         if env is None:
             await _post_or_update_leaderboard(owner, repo, pr_number, author_login, token)
         else:
