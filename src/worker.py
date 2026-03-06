@@ -23,7 +23,7 @@ import hmac as _hmac
 import json
 import time
 import re
-from typing import Optional
+from typing import Optional, Tuple
 from urllib.parse import urlparse
 
 from js import Headers, Response, console, fetch  # Cloudflare Workers JS bindings
@@ -244,16 +244,66 @@ async def get_installation_token(
     return data.get("token")
 
 
+async def get_installation_access_token(installation_id: int, jwt_token: str) -> Optional[str]:
+    """Exchange a prebuilt GitHub App JWT for an installation access token."""
+    resp = await fetch(
+        f"https://api.github.com/app/installations/{installation_id}/access_tokens",
+        method="POST",
+        headers=Headers.new({
+            "Authorization": f"Bearer {jwt_token}",
+            "Accept": "application/vnd.github+json",
+            "Content-Type": "application/json",
+            "User-Agent": "BLT-GitHub-App/1.0",
+            "X-GitHub-Api-Version": "2022-11-28",
+        }.items()),
+    )
+    if resp.status != 201:
+        console.error(f"[BLT] Failed to get installation access token: {resp.status}")
+        return None
+    data = json.loads(await resp.text())
+    return data.get("token")
+
+
 async def create_comment(
     owner: str, repo: str, number: int, body: str, token: str
 ) -> None:
     """Post a comment on a GitHub issue or pull request."""
-    await github_api(
+    resp = await github_api(
         "POST",
         f"/repos/{owner}/{repo}/issues/{number}/comments",
         token,
         {"body": body},
     )
+    if resp.status not in (200, 201):
+        try:
+            err_text = await resp.text()
+        except Exception:
+            err_text = "<no response body>"
+        console.error(
+            f"[GitHub] Failed to create comment on {owner}/{repo}#{number}: "
+            f"status={resp.status} body={err_text[:300]}"
+        )
+
+
+async def create_reaction(
+    owner: str, repo: str, comment_id: int, reaction: str, token: str
+) -> None:
+    """Add a reaction to a comment. Common reactions: +1, -1, laugh, confused, heart, hooray, rocket, eyes."""
+    resp = await github_api(
+        "POST",
+        f"/repos/{owner}/{repo}/issues/comments/{comment_id}/reactions",
+        token,
+        {"content": reaction},
+    )
+    if resp.status not in (200, 201):
+        try:
+            err_text = await resp.text()
+        except Exception:
+            err_text = "<no response body>"
+        console.error(
+            f"[GitHub] Failed to create reaction on {owner}/{repo} comment={comment_id}: "
+            f"status={resp.status} body={err_text[:300]}"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -322,6 +372,21 @@ def _is_coderabbit_ping(body: str) -> bool:
     return "coderabbit" in lower or "@coderabbitai" in lower
 
 
+def _extract_command(body: str) -> Optional[str]:
+    """Extract a supported slash command from comment body (case-insensitive)."""
+    if not body:
+        return None
+    tokens = body.strip().split()
+    if not tokens:
+        return None
+    supported = {ASSIGN_COMMAND, UNASSIGN_COMMAND, LEADERBOARD_COMMAND}
+    for t in tokens:
+        tok = t.strip().lower().rstrip(".,!?:;")
+        if tok in supported:
+            return tok
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Leaderboard — Calculation & Display
 # ---------------------------------------------------------------------------
@@ -332,34 +397,599 @@ MAX_OPEN_PRS_PER_AUTHOR = 50
 LEADERBOARD_COMMENT_MARKER = LEADERBOARD_MARKER
 
 
-async def _fetch_org_repos(org: str, token: str) -> list:
-    """Fetch all repositories in the organization."""
-    repos = []
-    page = 1
-    per_page = 100
-    max_pages = 10
+def _month_key(ts: Optional[int] = None) -> str:
+    """Return YYYY-MM month key for UTC timestamp (or now)."""
+    if ts is None:
+        ts = int(time.time())
+    return time.strftime("%Y-%m", time.gmtime(ts))
+
+
+def _month_window(month_key: str) -> Tuple[int, int]:
+    """Return start/end timestamps (UTC) for a YYYY-MM key."""
+    year, month = month_key.split("-")
+    y = int(year)
+    m = int(month)
+    start_struct = time.struct_time((y, m, 1, 0, 0, 0, 0, 0, 0))
+    start_ts = int(time.mktime(start_struct))
+    if m == 12:
+        next_struct = time.struct_time((y + 1, 1, 1, 0, 0, 0, 0, 0, 0))
+    else:
+        next_struct = time.struct_time((y, m + 1, 1, 0, 0, 0, 0, 0, 0))
+    end_ts = int(time.mktime(next_struct)) - 1
+    return start_ts, end_ts
+
+
+def _d1_binding(env):
+    """Return D1 binding object if configured, otherwise None."""
+    return getattr(env, "LEADERBOARD_DB", None)
+
+
+async def _d1_run(db, sql: str, params: tuple = ()):
+    stmt = db.prepare(sql)
+    if params:
+        stmt = stmt.bind(*params)
+    return await stmt.run()
+
+
+async def _d1_all(db, sql: str, params: tuple = ()) -> list:
+    stmt = db.prepare(sql)
+    if params:
+        stmt = stmt.bind(*params)
+    result = await stmt.all()
+    rows = result.get("results") if isinstance(result, dict) else None
+    return rows or []
+
+
+async def _d1_first(db, sql: str, params: tuple = ()):
+    rows = await _d1_all(db, sql, params)
+    return rows[0] if rows else None
+
+
+async def _ensure_leaderboard_schema(db) -> None:
+    """Create leaderboard tables if they do not exist."""
+    await _d1_run(
+        db,
+        """
+        CREATE TABLE IF NOT EXISTS leaderboard_monthly_stats (
+            org TEXT NOT NULL,
+            month_key TEXT NOT NULL,
+            user_login TEXT NOT NULL,
+            merged_prs INTEGER NOT NULL DEFAULT 0,
+            closed_prs INTEGER NOT NULL DEFAULT 0,
+            reviews INTEGER NOT NULL DEFAULT 0,
+            comments INTEGER NOT NULL DEFAULT 0,
+            updated_at INTEGER NOT NULL,
+            PRIMARY KEY (org, month_key, user_login)
+        )
+        """,
+    )
+    await _d1_run(
+        db,
+        """
+        CREATE TABLE IF NOT EXISTS leaderboard_open_prs (
+            org TEXT NOT NULL,
+            user_login TEXT NOT NULL,
+            open_prs INTEGER NOT NULL DEFAULT 0,
+            updated_at INTEGER NOT NULL,
+            PRIMARY KEY (org, user_login)
+        )
+        """,
+    )
+    await _d1_run(
+        db,
+        """
+        CREATE TABLE IF NOT EXISTS leaderboard_pr_state (
+            org TEXT NOT NULL,
+            repo TEXT NOT NULL,
+            pr_number INTEGER NOT NULL,
+            author_login TEXT NOT NULL,
+            state TEXT NOT NULL,
+            merged INTEGER NOT NULL DEFAULT 0,
+            closed_at INTEGER,
+            updated_at INTEGER NOT NULL,
+            PRIMARY KEY (org, repo, pr_number)
+        )
+        """,
+    )
+    await _d1_run(
+        db,
+        """
+        CREATE TABLE IF NOT EXISTS leaderboard_review_credits (
+            org TEXT NOT NULL,
+            repo TEXT NOT NULL,
+            pr_number INTEGER NOT NULL,
+            month_key TEXT NOT NULL,
+            reviewer_login TEXT NOT NULL,
+            created_at INTEGER NOT NULL,
+            PRIMARY KEY (org, repo, pr_number, month_key, reviewer_login)
+        )
+        """,
+    )
+    await _d1_run(
+        db,
+        """
+        CREATE TABLE IF NOT EXISTS leaderboard_backfill_state (
+            org TEXT NOT NULL,
+            month_key TEXT NOT NULL,
+            next_page INTEGER NOT NULL DEFAULT 1,
+            completed INTEGER NOT NULL DEFAULT 0,
+            updated_at INTEGER NOT NULL,
+            PRIMARY KEY (org, month_key)
+        )
+        """,
+    )
+    await _d1_run(
+        db,
+        """
+        CREATE TABLE IF NOT EXISTS leaderboard_backfill_repo_done (
+            org TEXT NOT NULL,
+            month_key TEXT NOT NULL,
+            repo TEXT NOT NULL,
+            updated_at INTEGER NOT NULL,
+            PRIMARY KEY (org, month_key, repo)
+        )
+        """,
+    )
+
+
+async def _d1_inc_open_pr(db, org: str, user_login: str, delta: int) -> None:
+    now = int(time.time())
+    await _d1_run(
+        db,
+        """
+        INSERT INTO leaderboard_open_prs (org, user_login, open_prs, updated_at)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(org, user_login) DO UPDATE SET
+            open_prs = MAX(0, leaderboard_open_prs.open_prs + excluded.open_prs),
+            updated_at = excluded.updated_at
+        """,
+        (org, user_login, delta, now),
+    )
+
+
+async def _d1_inc_monthly(db, org: str, month_key: str, user_login: str, field: str, delta: int = 1) -> None:
+    now = int(time.time())
+    if field not in {"merged_prs", "closed_prs", "reviews", "comments"}:
+        return
+    await _d1_run(
+        db,
+        f"""
+        INSERT INTO leaderboard_monthly_stats (org, month_key, user_login, {field}, updated_at)
+        VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(org, month_key, user_login) DO UPDATE SET
+            {field} = leaderboard_monthly_stats.{field} + excluded.{field},
+            updated_at = excluded.updated_at
+        """,
+        (org, month_key, user_login, delta, now),
+    )
+
+
+async def _track_pr_opened_in_d1(payload: dict, env) -> None:
+    db = _d1_binding(env)
+    if not db:
+        return
+    pr = payload.get("pull_request") or {}
+    author = pr.get("user") or {}
+    if _is_bot(author):
+        return
+    org = (payload.get("repository") or {}).get("owner", {}).get("login", "")
+    repo = (payload.get("repository") or {}).get("name", "")
+    pr_number = pr.get("number")
+    author_login = author.get("login", "")
+    if not (org and repo and pr_number and author_login):
+        return
+
+    await _ensure_leaderboard_schema(db)
+    existing = await _d1_first(
+        db,
+        "SELECT state FROM leaderboard_pr_state WHERE org = ? AND repo = ? AND pr_number = ?",
+        (org, repo, pr_number),
+    )
+    if not existing or existing.get("state") != "open":
+        await _d1_inc_open_pr(db, org, author_login, 1)
+
+    now = int(time.time())
+    await _d1_run(
+        db,
+        """
+        INSERT INTO leaderboard_pr_state (org, repo, pr_number, author_login, state, merged, closed_at, updated_at)
+        VALUES (?, ?, ?, ?, 'open', 0, NULL, ?)
+        ON CONFLICT(org, repo, pr_number) DO UPDATE SET
+            author_login = excluded.author_login,
+            state = 'open',
+            merged = 0,
+            closed_at = NULL,
+            updated_at = excluded.updated_at
+        """,
+        (org, repo, pr_number, author_login, now),
+    )
+
+
+async def _track_pr_closed_in_d1(payload: dict, env) -> None:
+    db = _d1_binding(env)
+    if not db:
+        return
+    pr = payload.get("pull_request") or {}
+    author = pr.get("user") or {}
+    if _is_bot(author):
+        return
+    org = (payload.get("repository") or {}).get("owner", {}).get("login", "")
+    repo = (payload.get("repository") or {}).get("name", "")
+    pr_number = pr.get("number")
+    author_login = author.get("login", "")
+    closed_at = pr.get("closed_at")
+    merged_at = pr.get("merged_at")
+    merged = bool(pr.get("merged"))
+    closed_ts = _parse_github_timestamp(closed_at) if closed_at else int(time.time())
+    if not (org and repo and pr_number and author_login):
+        return
+
+    await _ensure_leaderboard_schema(db)
+    existing = await _d1_first(
+        db,
+        "SELECT state, merged, closed_at FROM leaderboard_pr_state WHERE org = ? AND repo = ? AND pr_number = ?",
+        (org, repo, pr_number),
+    )
+
+    # Idempotency: skip if we already recorded the same closed state.
+    if existing and existing.get("state") == "closed" and int(existing.get("merged") or 0) == int(merged):
+        existing_closed_at = int(existing.get("closed_at") or 0)
+        if existing_closed_at == int(closed_ts or 0):
+            return
+
+    if existing and existing.get("state") == "open":
+        await _d1_inc_open_pr(db, org, author_login, -1)
+
+    event_ts = _parse_github_timestamp(merged_at) if merged and merged_at else closed_ts
+    mk = _month_key(event_ts)
+    if merged:
+        await _d1_inc_monthly(db, org, mk, author_login, "merged_prs", 1)
+    else:
+        await _d1_inc_monthly(db, org, mk, author_login, "closed_prs", 1)
+
+    now = int(time.time())
+    await _d1_run(
+        db,
+        """
+        INSERT INTO leaderboard_pr_state (org, repo, pr_number, author_login, state, merged, closed_at, updated_at)
+        VALUES (?, ?, ?, ?, 'closed', ?, ?, ?)
+        ON CONFLICT(org, repo, pr_number) DO UPDATE SET
+            author_login = excluded.author_login,
+            state = 'closed',
+            merged = excluded.merged,
+            closed_at = excluded.closed_at,
+            updated_at = excluded.updated_at
+        """,
+        (org, repo, pr_number, author_login, 1 if merged else 0, closed_ts, now),
+    )
+
+
+async def _track_comment_in_d1(payload: dict, env) -> None:
+    db = _d1_binding(env)
+    if not db:
+        return
+    comment = payload.get("comment") or {}
+    user = comment.get("user") or {}
+    if _is_bot(user):
+        return
+    body = comment.get("body", "")
+    if _is_coderabbit_ping(body):
+        return
+    org = (payload.get("repository") or {}).get("owner", {}).get("login", "")
+    login = user.get("login", "")
+    created_at = comment.get("created_at")
+    if not (org and login):
+        return
+
+    await _ensure_leaderboard_schema(db)
+    mk = _month_key(_parse_github_timestamp(created_at) if created_at else int(time.time()))
+    await _d1_inc_monthly(db, org, mk, login, "comments", 1)
+
+
+async def _track_review_in_d1(payload: dict, env) -> None:
+    db = _d1_binding(env)
+    if not db:
+        return
+    review = payload.get("review") or {}
+    reviewer = review.get("user") or {}
+    if _is_bot(reviewer):
+        return
+    pr = payload.get("pull_request") or {}
+    org = (payload.get("repository") or {}).get("owner", {}).get("login", "")
+    repo = (payload.get("repository") or {}).get("name", "")
+    pr_number = pr.get("number")
+    reviewer_login = reviewer.get("login", "")
+    submitted_at = review.get("submitted_at")
+    if not (org and repo and pr_number and reviewer_login):
+        return
+
+    await _ensure_leaderboard_schema(db)
+    mk = _month_key(_parse_github_timestamp(submitted_at) if submitted_at else int(time.time()))
+
+    # Only first two unique reviewers per PR/month get credit.
+    exists = await _d1_first(
+        db,
+        """
+        SELECT 1 FROM leaderboard_review_credits
+        WHERE org = ? AND repo = ? AND pr_number = ? AND month_key = ? AND reviewer_login = ?
+        """,
+        (org, repo, pr_number, mk, reviewer_login),
+    )
+    if exists:
+        return
+
+    cnt_row = await _d1_first(
+        db,
+        """
+        SELECT COUNT(*) AS cnt FROM leaderboard_review_credits
+        WHERE org = ? AND repo = ? AND pr_number = ? AND month_key = ?
+        """,
+        (org, repo, pr_number, mk),
+    )
+    already = int((cnt_row or {}).get("cnt") or 0)
+    if already >= 2:
+        return
+
+    await _d1_run(
+        db,
+        """
+        INSERT INTO leaderboard_review_credits (org, repo, pr_number, month_key, reviewer_login, created_at)
+        VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        (org, repo, pr_number, mk, reviewer_login, int(time.time())),
+    )
+    await _d1_inc_monthly(db, org, mk, reviewer_login, "reviews", 1)
+
+
+async def _calculate_leaderboard_stats_from_d1(owner: str, env) -> Optional[dict]:
+    """Read current-month leaderboard stats from D1 if configured."""
+    db = _d1_binding(env)
+    if not db:
+        return None
+
+    await _ensure_leaderboard_schema(db)
+    mk = _month_key()
+    start_timestamp, end_timestamp = _month_window(mk)
+
+    monthly_rows = await _d1_all(
+        db,
+        """
+        SELECT user_login, merged_prs, closed_prs, reviews, comments
+        FROM leaderboard_monthly_stats
+        WHERE org = ? AND month_key = ?
+        """,
+        (owner, mk),
+    )
+    open_rows = await _d1_all(
+        db,
+        """
+        SELECT user_login, open_prs
+        FROM leaderboard_open_prs
+        WHERE org = ?
+        """,
+        (owner,),
+    )
+
+    user_stats = {}
+
+    def ensure(login: str):
+        if login not in user_stats:
+            user_stats[login] = {
+                "openPrs": 0,
+                "mergedPrs": 0,
+                "closedPrs": 0,
+                "reviews": 0,
+                "comments": 0,
+                "total": 0,
+            }
+
+    for row in monthly_rows:
+        login = row.get("user_login")
+        if not login:
+            continue
+        ensure(login)
+        user_stats[login]["mergedPrs"] = int(row.get("merged_prs") or 0)
+        user_stats[login]["closedPrs"] = int(row.get("closed_prs") or 0)
+        user_stats[login]["reviews"] = int(row.get("reviews") or 0)
+        user_stats[login]["comments"] = int(row.get("comments") or 0)
+
+    for row in open_rows:
+        login = row.get("user_login")
+        if not login:
+            continue
+        ensure(login)
+        user_stats[login]["openPrs"] = int(row.get("open_prs") or 0)
+
+    for login in user_stats:
+        s = user_stats[login]
+        s["total"] = (s["openPrs"] * 1) + (s["mergedPrs"] * 10) + (s["closedPrs"] * -2) + (s["reviews"] * 5) + (s["comments"] * 2)
+
+    sorted_users = sorted(
+        [{"login": login, **stats} for login, stats in user_stats.items()],
+        key=lambda u: (-u["total"], -u["mergedPrs"], -u["reviews"], u["login"].lower())
+    )
+
+    return {
+        "users": user_stats,
+        "sorted": sorted_users,
+        "start_timestamp": start_timestamp,
+        "end_timestamp": end_timestamp,
+    }
+
+
+async def _get_backfill_state(db, owner: str, month_key: str) -> dict:
+    row = await _d1_first(
+        db,
+        """
+        SELECT next_page, completed FROM leaderboard_backfill_state
+        WHERE org = ? AND month_key = ?
+        """,
+        (owner, month_key),
+    )
+    if row:
+        return {
+            "next_page": int(row.get("next_page") or 1),
+            "completed": bool(int(row.get("completed") or 0)),
+        }
+    return {"next_page": 1, "completed": False}
+
+
+async def _set_backfill_state(db, owner: str, month_key: str, next_page: int, completed: bool) -> None:
+    await _d1_run(
+        db,
+        """
+        INSERT INTO leaderboard_backfill_state (org, month_key, next_page, completed, updated_at)
+        VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(org, month_key) DO UPDATE SET
+            next_page = excluded.next_page,
+            completed = excluded.completed,
+            updated_at = excluded.updated_at
+        """,
+        (owner, month_key, next_page, 1 if completed else 0, int(time.time())),
+    )
+
+
+async def _run_incremental_backfill(owner: str, token: str, env, repos_per_request: int = 5) -> Optional[dict]:
+    """Backfill leaderboard data in small chunks and report progress for user-facing notes."""
+    db = _d1_binding(env)
+    if not db:
+        return None
+
+    await _ensure_leaderboard_schema(db)
+    month_key = _month_key()
+    start_ts, end_ts = _month_window(month_key)
+    start_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(start_ts))
+
+    state = await _get_backfill_state(db, owner, month_key)
+    if state["completed"]:
+        return {"ran": False, "completed": True, "processed": 0, "next_page": state["next_page"]}
+
+    page = state["next_page"]
+    repos_resp = await github_api(
+        "GET",
+        f"/orgs/{owner}/repos?sort=full_name&direction=asc&per_page={repos_per_request}&page={page}",
+        token,
+    )
+    if repos_resp.status != 200:
+        console.error(f"[Leaderboard] Backfill repo page failed for {owner}: status={repos_resp.status}")
+        return {"ran": False, "completed": False, "processed": 0, "next_page": page}
+
+    repos = json.loads(await repos_resp.text())
+    if not repos:
+        await _set_backfill_state(db, owner, month_key, page, True)
+        return {"ran": False, "completed": True, "processed": 0, "next_page": page}
+
+    processed = 0
+    for repo_obj in repos:
+        repo_name = repo_obj.get("name")
+        if not repo_name:
+            continue
+
+        already = await _d1_first(
+            db,
+            """
+            SELECT 1 FROM leaderboard_backfill_repo_done
+            WHERE org = ? AND month_key = ? AND repo = ?
+            """,
+            (owner, month_key, repo_name),
+        )
+        if already:
+            continue
+
+        # Open PRs snapshot for this repo.
+        open_resp = await github_api(
+            "GET",
+            f"/repos/{owner}/{repo_name}/pulls?state=open&per_page=100",
+            token,
+        )
+        if open_resp.status == 200:
+            open_prs = json.loads(await open_resp.text())
+            open_by_user = {}
+            for pr in open_prs:
+                user = pr.get("user") or {}
+                if _is_bot(user):
+                    continue
+                login = user.get("login")
+                if login:
+                    open_by_user[login] = open_by_user.get(login, 0) + 1
+            for login, cnt in open_by_user.items():
+                await _d1_inc_open_pr(db, owner, login, cnt)
+
+        # Closed/merged monthly stats for this repo.
+        closed_resp = await github_api(
+            "GET",
+            f"/repos/{owner}/{repo_name}/pulls?state=closed&per_page=100&sort=updated&direction=desc",
+            token,
+        )
+        if closed_resp.status == 200:
+            closed_prs = json.loads(await closed_resp.text())
+            for pr in closed_prs:
+                user = pr.get("user") or {}
+                if _is_bot(user):
+                    continue
+                login = user.get("login")
+                if not login:
+                    continue
+                merged_at = pr.get("merged_at")
+                closed_at = pr.get("closed_at")
+                if merged_at:
+                    merged_ts = _parse_github_timestamp(merged_at)
+                    if start_ts <= merged_ts <= end_ts:
+                        await _d1_inc_monthly(db, owner, month_key, login, "merged_prs", 1)
+                elif closed_at:
+                    closed_ts = _parse_github_timestamp(closed_at)
+                    if start_ts <= closed_ts <= end_ts:
+                        await _d1_inc_monthly(db, owner, month_key, login, "closed_prs", 1)
+
+        await _d1_run(
+            db,
+            """
+            INSERT INTO leaderboard_backfill_repo_done (org, month_key, repo, updated_at)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(org, month_key, repo) DO UPDATE SET
+                updated_at = excluded.updated_at
+            """,
+            (owner, month_key, repo_name, int(time.time())),
+        )
+        processed += 1
+
+    done = len(repos) < repos_per_request
+    await _set_backfill_state(db, owner, month_key, page + 1, done)
+    return {
+        "ran": True,
+        "completed": done,
+        "processed": processed,
+        "next_page": page + 1,
+        "month_key": month_key,
+        "since": start_iso,
+    }
+
+
+async def _fetch_org_repos(org: str, token: str, limit: int = 10) -> list:
+    """Fetch repositories in the organization (most recently updated first).
     
-    while page <= max_pages:
-        resp = await github_api("GET", f"/orgs/{org}/repos?per_page={per_page}&page={page}", token)
-        if resp.status != 200:
-            break
-        data = json.loads(await resp.text())
-        if not data:
-            break
-        repos.extend(data)
-        page += 1
-        if len(data) < per_page:
-            break
-    
-    return repos
+    Args:
+        org: Organization name
+        token: GitHub API token
+        limit: Maximum number of repos to return (default: 10 to prevent subrequest limits)
+    """
+    # Fetch repos sorted by most recently pushed to reduce API calls for active repos
+    resp = await github_api("GET", f"/orgs/{org}/repos?sort=pushed&direction=desc&per_page={limit}", token)
+    if resp.status != 200:
+        return []
+    repos = json.loads(await resp.text())
+    return repos[:limit]
 
 
 async def _calculate_leaderboard_stats(owner: str, repos: list, token: str, window_months: int = 1) -> dict:
-    """Calculate leaderboard stats across multiple repositories.
+    """Calculate leaderboard stats across ALL repositories using GitHub Search API.
+    
+    This approach uses GitHub's search API to query across all org repos efficiently,
+    staying well under Cloudflare's 50 subrequest limit even with 50+ repos.
     
     Args:
         owner: Organization or user name
-        repos: List of repository objects with 'name' field
+        repos: List of repository objects (used for repo count, not iteration)
         token: GitHub API token
         window_months: Number of months to look back (default: 1 for monthly)
     
@@ -383,6 +1013,10 @@ async def _calculate_leaderboard_stats(owner: str, repos: list, token: str, wind
     end_of_month = time.struct_time((end_year, end_month, 1, 0, 0, 0, 0, 0, 0))
     end_timestamp = int(time.mktime(end_of_month)) - 1
     
+    # Format date range for search API
+    start_date = time.strftime("%Y-%m-%d", time.gmtime(start_timestamp))
+    end_date = time.strftime("%Y-%m-%d", time.gmtime(end_timestamp))
+    
     user_stats = {}
     
     def ensure_user(login: str):
@@ -396,91 +1030,158 @@ async def _calculate_leaderboard_stats(owner: str, repos: list, token: str, wind
                 "total": 0
             }
     
-    # Fetch stats from each repo
-    for repo_obj in repos:
-        repo = repo_obj["name"]
+    # Use GitHub Search API to query across ALL repos efficiently
+    # This dramatically reduces API calls: ~6 calls total vs 150+ with per-repo approach
+    
+    # 1. Count open PRs (current state across all repos) - 1-2 calls
+    page = 1
+    while page <= 3:  # Max 3 pages = 300 PRs
+        resp = await github_api(
+            "GET",
+            f"/search/issues?q=is:pr+is:open+org:{owner}&per_page=100&page={page}",
+            token
+        )
+        if resp.status != 200:
+            break
+        data = json.loads(await resp.text())
+        items = data.get("items", [])
+        if not items:
+            break
         
-        # Fetch open PRs (all time)
-        resp = await github_api("GET", f"/repos/{owner}/{repo}/pulls?state=open&per_page=100", token)
-        if resp.status == 200:
-            open_prs = json.loads(await resp.text())
-            for pr in open_prs:
-                if pr.get("user") and not _is_bot(pr["user"]):
-                    login = pr["user"]["login"]
-                    ensure_user(login)
-                    user_stats[login]["openPrs"] += 1
+        for pr in items:
+            if pr.get("user") and not _is_bot(pr["user"]):
+                login = pr["user"]["login"]
+                ensure_user(login)
+                user_stats[login]["openPrs"] += 1
         
-        # Fetch closed/merged PRs from this month
-        since_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(start_timestamp))
-        resp = await github_api("GET", f"/repos/{owner}/{repo}/pulls?state=closed&per_page=100&sort=updated&direction=desc", token)
-        if resp.status == 200:
-            closed_prs = json.loads(await resp.text())
-            for pr in closed_prs:
-                # Check if merged or closed in the time window
-                merged_at = pr.get("merged_at")
-                closed_at = pr.get("closed_at")
-                
-                if merged_at:
-                    merged_ts = _parse_github_timestamp(merged_at)
-                    if start_timestamp <= merged_ts <= end_timestamp:
-                        if pr.get("user") and not _is_bot(pr["user"]):
-                            login = pr["user"]["login"]
-                            ensure_user(login)
-                            user_stats[login]["mergedPrs"] += 1
-                elif closed_at:
-                    closed_ts = _parse_github_timestamp(closed_at)
-                    if start_timestamp <= closed_ts <= end_timestamp:
-                        if pr.get("user") and not _is_bot(pr["user"]):
-                            login = pr["user"]["login"]
-                            ensure_user(login)
-                            user_stats[login]["closedPrs"] += 1
+        if len(items) < 100:
+            break
+        page += 1
+    
+    # 2. Fetch merged PRs from this month - 1-2 calls
+    page = 1
+    while page <= 3:
+        resp = await github_api(
+            "GET",
+            f"/search/issues?q=is:pr+is:merged+org:{owner}+merged:{start_date}..{end_date}&per_page=100&page={page}",
+            token
+        )
+        if resp.status != 200:
+            break
+        data = json.loads(await resp.text())
+        items = data.get("items", [])
+        if not items:
+            break
         
-        # Fetch reviews (we'll count first 2 per PR in the month)
-        # For simplicity, we'll fetch recent PRs and their reviews
-        resp = await github_api("GET", f"/repos/{owner}/{repo}/pulls?state=all&per_page=100&sort=updated&direction=desc", token)
-        if resp.status == 200:
-            prs = json.loads(await resp.text())
-            review_counts = {}  # Track first 2 reviews per PR per user
+        for pr in items:
+            if pr.get("user") and not _is_bot(pr["user"]):
+                login = pr["user"]["login"]
+                ensure_user(login)
+                user_stats[login]["mergedPrs"] += 1
+        
+        if len(items) < 100:
+            break
+        page += 1
+    
+    # 3. Fetch closed (not merged) PRs from this month - 1-2 calls
+    page = 1
+    while page <= 3:
+        resp = await github_api(
+            "GET",
+            f"/search/issues?q=is:pr+is:closed+is:unmerged+org:{owner}+closed:{start_date}..{end_date}&per_page=100&page={page}",
+            token
+        )
+        if resp.status != 200:
+            break
+        data = json.loads(await resp.text())
+        items = data.get("items", [])
+        if not items:
+            break
+        
+        for pr in items:
+            if pr.get("user") and not _is_bot(pr["user"]):
+                login = pr["user"]["login"]
+                ensure_user(login)
+                user_stats[login]["closedPrs"] += 1
+        
+        if len(items) < 100:
+            break
+        page += 1
+    
+    # 4. Search for comments in this month across org (optional, budget permitting)
+    # Limit to 2 pages to stay under budget
+    since_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(start_timestamp))
+    # Note: Skipping comment counting to conserve API budget
+    # With 50 repos, we need to prioritize PRs and reviews
+    
+    # 5. Fetch reviews from a sample of merged PRs - budget 15 calls
+    # Strategy: Get repo URLs from merged PRs, fetch reviews for top 15 PRs
+    max_review_calls = 15
+    review_calls_used = 0
+    
+    # Get merged PRs again (already cached in memory from step 2)
+    page = 1
+    sampled_prs = []
+    while page <= 2 and len(sampled_prs) < max_review_calls:
+        resp = await github_api(
+            "GET",
+            f"/search/issues?q=is:pr+is:merged+org:{owner}+merged:{start_date}..{end_date}&per_page=50&page={page}&sort=updated",
+            token
+        )
+        if resp.status != 200:
+            break
+        data = json.loads(await resp.text())
+        items = data.get("items", [])
+        if not items:
+            break
+        
+        # Extract repo and PR number from each PR
+        for pr in items:
+            if len(sampled_prs) >= max_review_calls:
+                break
+            # Parse repo from repository_url: /repos/{owner}/{repo}
+            repo_url = pr.get("repository_url", "")
+            if repo_url:
+                parts = repo_url.split("/")
+                if len(parts) >= 2:
+                    repo_name = parts[-1]
+                    pr_number = pr.get("number")
+                    if repo_name and pr_number:
+                        sampled_prs.append((repo_name, pr_number))
+        
+        if len(items) < 50:
+            break
+        page += 1
+    
+    # Fetch reviews for sampled PRs
+    for repo_name, pr_number in sampled_prs:
+        if review_calls_used >= max_review_calls:
+            break
+        
+        resp_reviews = await github_api(
+            "GET",
+            f"/repos/{owner}/{repo_name}/pulls/{pr_number}/reviews",
+            token
+        )
+        review_calls_used += 1
+        
+        if resp_reviews.status == 200:
+            reviews = json.loads(await resp_reviews.text())
+            pr_review_count = {}
             
-            for pr in prs[:50]:  # Limit to recent 50 PRs for performance
-                pr_num = pr["number"]
-                resp_reviews = await github_api("GET", f"/repos/{owner}/{repo}/pulls/{pr_num}/reviews", token)
-                if resp_reviews.status == 200:
-                    reviews = json.loads(await resp_reviews.text())
-                    pr_review_count = {}
-                    
-                    for review in reviews:
-                        if review.get("user") and not _is_bot(review["user"]):
-                            submitted_at = review.get("submitted_at")
-                            if submitted_at:
-                                review_ts = _parse_github_timestamp(submitted_at)
-                                if start_timestamp <= review_ts <= end_timestamp:
-                                    login = review["user"]["login"]
-                                    pr_review_count[login] = pr_review_count.get(login, 0) + 1
-                    
-                    # Count only first 2 reviews per PR globally
-                    counted = 0
-                    for login in pr_review_count:
-                        if counted < 2:
-                            ensure_user(login)
-                            user_stats[login]["reviews"] += 1
-                            counted += 1
-        
-        # Fetch comments from this month
-        resp = await github_api("GET", f"/repos/{owner}/{repo}/issues/comments?since={since_iso}&per_page=100", token)
-        if resp.status == 200:
-            comments = json.loads(await resp.text())
-            for comment in comments:
-                if comment.get("user") and not _is_bot(comment["user"]):
-                    created_at = comment.get("created_at")
-                    if created_at:
-                        comment_ts = _parse_github_timestamp(created_at)
-                        if start_timestamp <= comment_ts <= end_timestamp:
-                            body = comment.get("body", "")
-                            if not _is_coderabbit_ping(body):
-                                login = comment["user"]["login"]
-                                ensure_user(login)
-                                user_stats[login]["comments"] += 1
+            for review in reviews:
+                if review.get("user") and not _is_bot(review["user"]):
+                    submitted_at = review.get("submitted_at")
+                    if submitted_at:
+                        review_ts = _parse_github_timestamp(submitted_at)
+                        if start_timestamp <= review_ts <= end_timestamp:
+                            login = review["user"]["login"]
+                            pr_review_count[login] = pr_review_count.get(login, 0) + 1
+            
+            # Count only first 2 reviewers per PR to avoid spam
+            for login in list(pr_review_count.keys())[:2]:
+                ensure_user(login)
+                user_stats[login]["reviews"] += 1
     
     # Calculate total scores
     # open: +1, merged: +10, closed: -2, reviews: +5, comments: +2
@@ -514,7 +1215,7 @@ def _parse_github_timestamp(ts_str: str) -> int:
     return 0
 
 
-def _format_leaderboard_comment(author_login: str, leaderboard_data: dict, owner: str) -> str:
+def _format_leaderboard_comment(author_login: str, leaderboard_data: dict, owner: str, note: str = "") -> str:
     """Format a leaderboard comment for a specific user."""
     sorted_users = leaderboard_data["sorted"]
     start_ts = leaderboard_data["start_timestamp"]
@@ -546,7 +1247,11 @@ def _format_leaderboard_comment(author_login: str, leaderboard_data: dict, owner
                 f"{u['closedPrs']} | {u['reviews']} | {u['comments']} | **{u['total']}** |")
     
     # Show context rows around the author
-    if author_index == -1:
+    if not sorted_users:
+        # No data yet: show the requesting user with zeroes so the comment is still useful.
+        comment += f"| - | **`@{author_login}`** ✨ | 0 | 0 | 0 | 0 | 0 | **0** |\n"
+        comment += "\n_No leaderboard activity has been recorded for this month yet._\n"
+    elif author_index == -1:
         # Author not in leaderboard, show top 3
         for i in range(min(3, len(sorted_users))):
             medal = ["🥇", "🥈", "🥉"][i] if i < 3 else ""
@@ -569,55 +1274,95 @@ def _format_leaderboard_comment(author_login: str, leaderboard_data: dict, owner
         "Closed (not merged) (−2), Reviews (+5; first two per PR in-month), "
         "Comments (+2, excludes CodeRabbit). Run `/leaderboard` on any issue or PR to see your rank!\n"
     )
+    if note:
+        comment += f"\n> Note: {note}\n"
     
     return comment
 
 
-async def _post_or_update_leaderboard(owner: str, repo: str, issue_number: int, author_login: str, token: str) -> None:
+async def _post_or_update_leaderboard(owner: str, repo: str, issue_number: int, author_login: str, token: str, env=None) -> None:
     """Post or update a leaderboard comment on an issue/PR."""
-    # Determine if owner is an org or user
-    resp = await github_api("GET", f"/users/{owner}", token)
-    if resp.status != 200:
-        console.error(f"[Leaderboard] Failed to fetch owner info for {owner}")
-        return
-    
-    owner_data = json.loads(await resp.text())
-    is_org = owner_data.get("type") == "Organization"
-    
-    # Fetch repos
-    if is_org:
-        repos = await _fetch_org_repos(owner, token)
-    else:
-        # For personal accounts, just use the current repo
-        repos = [{"name": repo}]
-    
-    # Calculate leaderboard
-    leaderboard_data = await _calculate_leaderboard_stats(owner, repos, token)
+    leaderboard_note = ""
+
+    owner_data = None
+    is_org = False
+    owner_resp = await github_api("GET", f"/users/{owner}", token)
+    if owner_resp.status == 200:
+        owner_data = json.loads(await owner_resp.text())
+        is_org = owner_data.get("type") == "Organization"
+
+    # Prefer D1-backed stats for accurate and scalable org-wide leaderboard.
+    leaderboard_data = await _calculate_leaderboard_stats_from_d1(owner, env)
+
+    # If D1 is configured but currently empty, backfill in small chunks per command run.
+    if leaderboard_data is not None and is_org and not leaderboard_data.get("sorted"):
+        backfill_result = await _run_incremental_backfill(owner, token, env)
+        if backfill_result:
+            leaderboard_data = await _calculate_leaderboard_stats_from_d1(owner, env) or leaderboard_data
+            if backfill_result.get("completed"):
+                if backfill_result.get("processed", 0) > 0:
+                    leaderboard_note = (
+                        f"Backfill completed in this request; seeded data from {backfill_result.get('processed', 0)} repos."
+                    )
+            elif backfill_result.get("ran"):
+                leaderboard_note = (
+                    f"Backfill is in progress. Seeded {backfill_result.get('processed', 0)} repos in this run. "
+                    "Run `/leaderboard` again to continue filling historical data."
+                )
+            else:
+                leaderboard_note = "Backfill could not run this time; leaderboard will continue updating from new webhook events."
+
+    # Fallback to API-based calculation when D1 is unavailable.
+    if leaderboard_data is None:
+        # Determine if owner is an org or user only when fallback is needed.
+        if owner_data is None:
+            resp = await github_api("GET", f"/users/{owner}", token)
+            if resp.status != 200:
+                console.error(f"[Leaderboard] Failed to fetch owner info for {owner}: status={resp.status}")
+                await create_comment(
+                    owner,
+                    repo,
+                    issue_number,
+                    f"@{author_login} I couldn't load leaderboard data right now (owner lookup failed). Please try again shortly.",
+                    token,
+                )
+                return
+            owner_data = json.loads(await resp.text())
+            is_org = owner_data.get("type") == "Organization"
+
+        if is_org:
+            repos = await _fetch_org_repos(owner, token)
+        else:
+            repos = [{"name": repo}]
+        leaderboard_data = await _calculate_leaderboard_stats(owner, repos, token)
     
     # Format comment
-    comment_body = _format_leaderboard_comment(author_login, leaderboard_data, owner)
+    comment_body = _format_leaderboard_comment(author_login, leaderboard_data, owner, leaderboard_note)
     
-    # Check for existing leaderboard comment
+    # Delete existing leaderboard comment(s), then always create a fresh one.
     resp = await github_api("GET", f"/repos/{owner}/{repo}/issues/{issue_number}/comments?per_page=100", token)
     if resp.status == 200:
         comments = json.loads(await resp.text())
-        existing = None
         for c in comments:
             if c.get("body") and LEADERBOARD_MARKER in c["body"]:
-                existing = c
-                break
-        
-        if existing:
-            # Update existing comment
-            await github_api(
-                "PATCH",
-                f"/repos/{owner}/{repo}/issues/comments/{existing['id']}",
-                token,
-                {"body": comment_body}
-            )
-        else:
-            # Create new comment
-            await create_comment(owner, repo, issue_number, comment_body, token)
+                delete_resp = await github_api(
+                    "DELETE",
+                    f"/repos/{owner}/{repo}/issues/comments/{c['id']}",
+                    token,
+                )
+                if delete_resp.status not in (204, 200):
+                    console.error(
+                        f"[Leaderboard] Failed to delete old leaderboard comment {c['id']} "
+                        f"for {owner}/{repo}#{issue_number}: status={delete_resp.status}"
+                    )
+    else:
+        console.error(
+            f"[Leaderboard] Failed to list comments for {owner}/{repo}#{issue_number}: "
+            f"status={resp.status}; posting new leaderboard anyway"
+        )
+
+    await create_comment(owner, repo, issue_number, comment_body, token)
+    console.log(f"[Leaderboard] Posted leaderboard comment for {owner}/{repo}#{issue_number} (requested by @{author_login})")
 
 
 async def _check_and_close_excess_prs(owner: str, repo: str, pr_number: int, author_login: str, token: str) -> bool:
@@ -688,11 +1433,12 @@ async def _check_rank_improvement(owner: str, repo: str, pr_number: int, author_
     # Count merged PRs in 6-month window for all users
     merged_prs_per_author = {}
     
-    for repo_obj in repos:
+    # Limit repos to prevent subrequest errors
+    for repo_obj in repos[:10]:
         repo_name = repo_obj["name"]
         resp = await github_api(
             "GET",
-            f"/repos/{owner}/{repo_name}/pulls?state=closed&per_page=100&sort=updated&direction=desc",
+            f"/repos/{owner}/{repo_name}/pulls?state=closed&per_page=30&sort=updated&direction=desc",
             token
         )
         
@@ -749,25 +1495,52 @@ async def _check_rank_improvement(owner: str, repo: str, pr_number: int, author_
 # ---------------------------------------------------------------------------
 
 
-async def handle_issue_comment(payload: dict, token: str, features: dict | None = None) -> None:
+async def handle_issue_comment(payload: dict, token: str, env=None, features: dict | None = None) -> None:
     if features is None:
         features = dict(FEATURE_DEFAULTS)
     comment = payload["comment"]
     issue = payload["issue"]
     if not _is_human(comment["user"]):
         return
+
+    # Persist comments to D1 for leaderboard scoring.
+    try:
+        await _track_comment_in_d1(payload, env)
+    except Exception as exc:
+        console.error(f"[Leaderboard] Failed to persist comment event: {exc}")
+
     body = comment["body"].strip()
+    command = _extract_command(body)
     owner = payload["repository"]["owner"]["login"]
     repo = payload["repository"]["name"]
     login = comment["user"]["login"]
     issue_number = issue["number"]
+    comment_id = comment.get("id")
     
-    if body.startswith(ASSIGN_COMMAND):
+    # Add eyes reaction immediately to acknowledge command receipt
+    if comment_id and command:
+        await create_reaction(owner, repo, comment_id, "eyes", token)
+    
+    if command == ASSIGN_COMMAND:
         await _assign(owner, repo, issue, login, token)
-    elif body.startswith(UNASSIGN_COMMAND):
+    elif command == UNASSIGN_COMMAND:
         await _unassign(owner, repo, issue, login, token)
-    elif body.startswith(LEADERBOARD_COMMAND) and features.get("FEATURE_LEADERBOARD", True):
-        await _post_or_update_leaderboard(owner, repo, issue_number, login, token)
+    elif command == LEADERBOARD_COMMAND and features.get("FEATURE_LEADERBOARD", True):
+        console.log(f"[Leaderboard] Command received for {owner}/{repo}#{issue_number} by @{login}")
+        try:
+            if env is None:
+                await _post_or_update_leaderboard(owner, repo, issue_number, login, token)
+            else:
+                await _post_or_update_leaderboard(owner, repo, issue_number, login, token, env)
+        except Exception as exc:
+            console.error(f"[Leaderboard] Command failed for {owner}/{repo}#{issue_number}: {exc}")
+            await create_comment(
+                owner,
+                repo,
+                issue_number,
+                f"@{login} I hit an error while generating the leaderboard. Please try again in a moment.",
+                token,
+            )
 
 
 async def _assign(
@@ -1121,7 +1894,7 @@ async def enforce_pr_limit(
     return False
 
 
-async def handle_pull_request_opened(payload: dict, token: str, features: dict | None = None) -> None:
+async def handle_pull_request_opened(payload: dict, token: str, env=None, features: dict | None = None) -> None:
     if features is None:
         features = dict(FEATURE_DEFAULTS)
     pr = payload["pull_request"]
@@ -1137,12 +1910,14 @@ async def handle_pull_request_opened(payload: dict, token: str, features: dict |
     repo = payload["repository"]["name"]
     pr_number = pr["number"]
     author_login = sender["login"]
-
     # Enforce PR-per-author limit first
     if features.get("FEATURE_PR_LIMIT", True):
         closed = await enforce_pr_limit(owner, repo, pr, author_login, token)
         if closed:
             return
+
+    # Track open PR counter in D1.
+    await _track_pr_opened_in_d1(payload, env)
 
     if features.get("FEATURE_WELCOME_COMMENT", True):
         body = (
@@ -1160,7 +1935,10 @@ async def handle_pull_request_opened(payload: dict, token: str, features: dict |
 
     # Post leaderboard
     if features.get("FEATURE_LEADERBOARD", True):
-        await _post_or_update_leaderboard(owner, repo, pr_number, author_login, token)
+        if env is None:
+            await _post_or_update_leaderboard(owner, repo, pr_number, author_login, token)
+        else:
+            await _post_or_update_leaderboard(owner, repo, pr_number, author_login, token, env)
 
     # Apply automation labels
     if features.get("FEATURE_PR_SIZE_LABEL", True):
@@ -1192,7 +1970,7 @@ async def handle_pull_request_synchronize(payload: dict, token: str, features: d
         await check_pr_conflicts(owner, repo, pr, token)
 
 
-async def handle_pull_request_closed(payload: dict, token: str, features: dict | None = None) -> None:
+async def handle_pull_request_closed(payload: dict, token: str, env=None, features: dict | None = None) -> None:
     if features is None:
         features = dict(FEATURE_DEFAULTS)
     pr = payload["pull_request"]
@@ -1210,6 +1988,9 @@ async def handle_pull_request_closed(payload: dict, token: str, features: dict |
     repo = payload["repository"]["name"]
     pr_number = pr["number"]
     author_login = pr["user"]["login"]
+
+    # Track close/merge counters in D1.
+    await _track_pr_closed_in_d1(payload, env)
     
     # Post merge congratulations
     if features.get("FEATURE_MERGE_COMMENT", True):
@@ -1223,7 +2004,18 @@ async def handle_pull_request_closed(payload: dict, token: str, features: dict |
     # Check for rank improvement and congratulate if improved
     if features.get("FEATURE_LEADERBOARD", True):
         await _check_rank_improvement(owner, repo, pr_number, author_login, token)
-        await _post_or_update_leaderboard(owner, repo, pr_number, author_login, token)
+        if env is None:
+            await _post_or_update_leaderboard(owner, repo, pr_number, author_login, token)
+        else:
+            await _post_or_update_leaderboard(owner, repo, pr_number, author_login, token, env)
+
+    # Track PR closed/merged in D1
+    await _track_pr_closed_in_d1(payload, env)
+
+
+async def handle_pull_request_review_submitted(payload: dict, env=None) -> None:
+    """Track review credits in D1 (first two unique reviewers per PR per month)."""
+    await _track_review_in_d1(payload, env)
 
 
 # ---------------------------------------------------------------------------
@@ -1236,19 +2028,51 @@ async def handle_webhook(request, env) -> Response:
     body_text = await request.text()
     payload_bytes = body_text.encode("utf-8")
 
-    signature = request.headers.get("X-Hub-Signature-256") or ""
-    secret = getattr(env, "WEBHOOK_SECRET", "")
-    if secret and not verify_signature(payload_bytes, signature, secret):
-        return _json({"error": "Invalid signature"}, 401)
+    # Extract header metadata immediately so every webhook invocation is logged.
+    delivery_id = request.headers.get("X-GitHub-Delivery", "")
+    event = request.headers.get("X-GitHub-Event", "")
 
+    # Parse payload once up front for concise logging fields.
+    payload = {}
+    payload_parse_error = False
     try:
         payload = json.loads(body_text)
     except Exception:
+        payload_parse_error = True
+
+    action = payload.get("action", "") if isinstance(payload, dict) else ""
+    installation_id = ((payload.get("installation") or {}).get("id") if isinstance(payload, dict) else None)
+    repo_full_name = ((payload.get("repository") or {}).get("full_name") if isinstance(payload, dict) else "")
+    sender_login = ((payload.get("sender") or {}).get("login") if isinstance(payload, dict) else "")
+    issue_number = ((payload.get("issue") or {}).get("number") if isinstance(payload, dict) else None)
+    pr_number = ((payload.get("pull_request") or {}).get("number") if isinstance(payload, dict) else None)
+    item_number = issue_number or pr_number or ""
+
+    signature = request.headers.get("X-Hub-Signature-256") or ""
+    secret = getattr(env, "WEBHOOK_SECRET", "")
+    if secret and not verify_signature(payload_bytes, signature, secret):
+        console.log(
+            "[BLT][webhook] "
+            f"delivery={delivery_id or '-'} event={event or '-'} action={action or '-'} "
+            f"repo={repo_full_name or '-'} sender={sender_login or '-'} item={item_number or '-'} "
+            f"installation={installation_id or '-'} method={request.method} status=rejected_invalid_signature"
+        )
+        return _json({"error": "Invalid signature"}, 401)
+
+    if payload_parse_error:
+        console.log(
+            "[BLT][webhook] "
+            f"delivery={delivery_id or '-'} event={event or '-'} action=- repo=- sender=- item=- "
+            f"installation=- method={request.method} status=rejected_invalid_json"
+        )
         return _json({"error": "Invalid JSON"}, 400)
 
-    event = request.headers.get("X-GitHub-Event", "")
-    action = payload.get("action", "")
-    installation_id = (payload.get("installation") or {}).get("id")
+    console.log(
+        "[BLT][webhook] "
+        f"delivery={delivery_id or '-'} event={event or '-'} action={action or '-'} "
+        f"repo={repo_full_name or '-'} sender={sender_login or '-'} item={item_number or '-'} "
+        f"installation={installation_id or '-'} method={request.method} status=received"
+    )
 
     app_id = getattr(env, "APP_ID", "")
     private_key = getattr(env, "PRIVATE_KEY", "")
@@ -1265,7 +2089,7 @@ async def handle_webhook(request, env) -> Response:
 
     try:
         if event == "issue_comment" and action == "created":
-            await handle_issue_comment(payload, token, features)
+            await handle_issue_comment(payload, token, env, features)
         elif event == "issues":
             if action == "opened":
                 await handle_issue_opened(payload, token, blt_api_url, features)
@@ -1273,11 +2097,13 @@ async def handle_webhook(request, env) -> Response:
                 await handle_issue_labeled(payload, token, blt_api_url, features)
         elif event == "pull_request":
             if action in ("opened", "reopened"):
-                await handle_pull_request_opened(payload, token, features)
+                await handle_pull_request_opened(payload, token, env, features)
             elif action == "synchronize":
                 await handle_pull_request_synchronize(payload, token, features)
             elif action == "closed":
-                await handle_pull_request_closed(payload, token, features)
+                await handle_pull_request_closed(payload, token, env, features)
+        elif event == "pull_request_review" and action == "submitted":
+            await handle_pull_request_review_submitted(payload, env)
     except Exception as exc:
         console.error(f"[BLT] Webhook handler error: {exc}")
         return _json({"error": "Internal server error"}, 500)
@@ -1498,13 +2324,13 @@ async def scheduled(event, env):
                 console.error(f"[CRON] Failed to get token for installation {install_id}")
                 continue
             
-            # Fetch all repos for this installation
+            # Fetch all repos for this installation (limit to 20 for cron to prevent timeouts)
             repos = []
             if account.get("type") == "Organization":
-                repos = await _fetch_org_repos(account_login, token)
+                repos = await _fetch_org_repos(account_login, token, limit=20)
             else:
-                # For user accounts, fetch user repos
-                repos_resp = await github_api("GET", f"/users/{account_login}/repos?per_page=100", token)
+                # For user accounts, fetch user repos (limited)
+                repos_resp = await github_api("GET", f"/users/{account_login}/repos?per_page=20", token)
                 if repos_resp.status == 200:
                     repos = json.loads(await repos_resp.text())
             
