@@ -2393,7 +2393,7 @@ async def handle_webhook(request, env) -> Response:
         elif event == "pull_request_review":
             if action in ("submitted", "dismissed"):
                 if action == "submitted":
-                  await handle_pull_request_review_submitted(payload, env)
+                    await handle_pull_request_review_submitted(payload, env)
                 await handle_pull_request_review(payload, token)
         elif event == "pull_request_review_comment":
             await check_unresolved_conversations(payload, token)
