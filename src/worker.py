@@ -4205,7 +4205,7 @@ async def handle_changes_requested_label(owner: str, repo: str, pr_number: int, 
         return
 
     labels = json.loads(await resp.text())
-    current = {l["name"] for l in labels}
+    current = {label["name"] for label in labels}
 
     if has_changes_requested:
         if label_name not in current:
