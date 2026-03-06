@@ -4901,10 +4901,9 @@ async def handle_webhook(request, env) -> Response:
             elif action == "closed":
                 await handle_pull_request_closed(payload, token, env)
         elif event == "pull_request_review":
-            if action == "submitted":
-                # Preserve existing D1 review-credit tracking
-                await handle_pull_request_review_submitted(payload, env)
-                # Also check peer review status
+            if action in ("submitted", "dismissed"):
+                if action == "submitted":
+                    await handle_pull_request_review_submitted(payload, env)
                 await handle_pull_request_review(payload, token)
                 # Update unresolved conversations label/check/comment
                 await check_unresolved_conversations(payload, token)
