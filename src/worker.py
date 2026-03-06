@@ -1784,16 +1784,37 @@ async def _remove_labels_with_prefix(
 # ---------------------------------------------------------------------------
 
 
+async def _get_all_pr_files(
+    owner: str, repo: str, pr_number: int, token: str
+) -> list | None:
+    """Fetch all files for a PR, paginating through all pages."""
+    all_files: list = []
+    page = 1
+    while True:
+        resp = await github_api(
+            "GET",
+            f"/repos/{owner}/{repo}/pulls/{pr_number}/files?per_page=100&page={page}",
+            token,
+        )
+        if resp.status != 200:
+            return None
+        batch = json.loads(await resp.text())
+        if not batch:
+            break
+        all_files.extend(batch)
+        if len(batch) < 100:
+            break
+        page += 1
+    return all_files
+
+
 async def apply_files_changed_label(
     owner: str, repo: str, pr: dict, token: str
 ) -> None:
     """Add a colour-coded 'files-changed: N' label to a pull request."""
-    resp = await github_api(
-        "GET", f"/repos/{owner}/{repo}/pulls/{pr['number']}/files", token
-    )
-    if resp.status != 200:
+    files = await _get_all_pr_files(owner, repo, pr["number"], token)
+    if files is None:
         return
-    files = json.loads(await resp.text())
     count = len(files)
     label_name = f"files-changed: {count}"
     color = _files_changed_color(count)
@@ -1807,18 +1828,30 @@ async def apply_migration_label(
     owner: str, repo: str, pr: dict, token: str
 ) -> None:
     """Add a 'migration' label if the PR touches Django migration files."""
-    resp = await github_api(
-        "GET", f"/repos/{owner}/{repo}/pulls/{pr['number']}/files", token
-    )
-    if resp.status != 200:
+    files = await _get_all_pr_files(owner, repo, pr["number"], token)
+    if files is None:
         return
-    files = json.loads(await resp.text())
     has_migration = any(
         re.search(MIGRATION_PATH_PATTERN, f.get("filename", ""))
         for f in files
     )
     if has_migration:
         await _set_label(owner, repo, pr["number"], "migration", "5319e7", token)
+
+
+async def _has_bot_comment(
+    owner: str, repo: str, number: int, marker: str, token: str
+) -> bool:
+    """Return True if the bot has already posted a comment containing *marker*."""
+    resp = await github_api(
+        "GET",
+        f"/repos/{owner}/{repo}/issues/{number}/comments?per_page=100",
+        token,
+    )
+    if resp.status != 200:
+        return False
+    comments = json.loads(await resp.text())
+    return any(marker in (c.get("body") or "") for c in comments)
 
 
 async def check_linked_issue(
@@ -1830,13 +1863,16 @@ async def check_linked_issue(
         await _set_label(owner, repo, pr["number"], "linked-issue", "0e8a16", token)
     else:
         await _remove_labels_with_prefix(owner, repo, pr["number"], "linked-issue", token)
-        await create_comment(
-            owner, repo, pr["number"],
-            "⚠️ **No linked issue detected.** Please reference an issue in your PR "
-            "description using a keyword like `Closes #123` or `Fixes #456`.\n\n"
-            "This helps us track which issues are resolved by this PR.",
-            token,
-        )
+        marker = "<!-- no-linked-issue -->"
+        if not await _has_bot_comment(owner, repo, pr["number"], marker, token):
+            await create_comment(
+                owner, repo, pr["number"],
+                f"{marker}\n"
+                "⚠️ **No linked issue detected.** Please reference an issue in your PR "
+                "description using a keyword like `Closes #123` or `Fixes #456`.\n\n"
+                "This helps us track which issues are resolved by this PR.",
+                token,
+            )
 
 
 async def check_pr_conflicts(
@@ -1846,14 +1882,17 @@ async def check_pr_conflicts(
     mergeable = pr.get("mergeable")
     if mergeable is False:
         await _set_label(owner, repo, pr["number"], "has-conflicts", "e74c3c", token)
-        await create_comment(
-            owner, repo, pr["number"],
-            "⚠️ **Merge conflicts detected.** Please resolve the conflicts "
-            "in this PR so that it can be reviewed and merged.\n\n"
-            "You can resolve conflicts by rebasing on the latest `main` branch:\n"
-            "```bash\ngit fetch origin\ngit rebase origin/main\n```",
-            token,
-        )
+        marker = "<!-- conflict-warning -->"
+        if not await _has_bot_comment(owner, repo, pr["number"], marker, token):
+            await create_comment(
+                owner, repo, pr["number"],
+                f"{marker}\n"
+                "⚠️ **Merge conflicts detected.** Please resolve the conflicts "
+                "in this PR so that it can be reviewed and merged.\n\n"
+                "You can resolve conflicts by rebasing on the latest `main` branch:\n"
+                "```bash\ngit fetch origin\ngit rebase origin/main\n```",
+                token,
+            )
     else:
         await _remove_labels_with_prefix(owner, repo, pr["number"], "has-conflicts", token)
 
