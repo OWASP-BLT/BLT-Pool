@@ -117,6 +117,8 @@ _is_bot = _worker._is_bot
 _is_coderabbit_ping = _worker._is_coderabbit_ping
 _parse_github_timestamp = _worker._parse_github_timestamp
 _format_leaderboard_comment = _worker._format_leaderboard_comment
+get_feature_config = _worker.get_feature_config
+FEATURE_DEFAULTS = _worker.FEATURE_DEFAULTS
 
 
 # ---------------------------------------------------------------------------
@@ -1489,6 +1491,365 @@ class TestCheckAndCloseExcessPrs(unittest.TestCase):
             method == "PATCH" and "pulls" in path and body and body.get("state") == "closed"
             for method, path, body in api_calls
         ))
+
+
+# ---------------------------------------------------------------------------
+# Feature Toggle Tests
+# ---------------------------------------------------------------------------
+
+
+class TestGetFeatureConfig(unittest.TestCase):
+    """get_feature_config — reads toggle env vars."""
+
+    def _make_env(self, **attrs):
+        env = types.SimpleNamespace()
+        for k, v in attrs.items():
+            setattr(env, k, v)
+        return env
+
+    def test_all_defaults_true(self):
+        env = self._make_env()
+        config = get_feature_config(env)
+        for key in FEATURE_DEFAULTS:
+            self.assertTrue(config[key], f"{key} should default to True")
+
+    def test_disable_single_feature(self):
+        env = self._make_env(FEATURE_PR_SIZE_LABEL="false")
+        config = get_feature_config(env)
+        self.assertFalse(config["FEATURE_PR_SIZE_LABEL"])
+        # Others should still be True
+        self.assertTrue(config["FEATURE_MIGRATION_LABEL"])
+        self.assertTrue(config["FEATURE_WELCOME_COMMENT"])
+
+    def test_disable_multiple_features(self):
+        env = self._make_env(
+            FEATURE_LEADERBOARD="false",
+            FEATURE_BUG_REPORTING="false",
+            FEATURE_MERGE_COMMENT="false",
+        )
+        config = get_feature_config(env)
+        self.assertFalse(config["FEATURE_LEADERBOARD"])
+        self.assertFalse(config["FEATURE_BUG_REPORTING"])
+        self.assertFalse(config["FEATURE_MERGE_COMMENT"])
+        self.assertTrue(config["FEATURE_PR_LIMIT"])
+
+    def test_case_insensitive_false(self):
+        env = self._make_env(FEATURE_CONFLICT_CHECK="False")
+        config = get_feature_config(env)
+        self.assertFalse(config["FEATURE_CONFLICT_CHECK"])
+
+    def test_non_false_value_treated_as_true(self):
+        env = self._make_env(FEATURE_PR_LIMIT="yes")
+        config = get_feature_config(env)
+        self.assertTrue(config["FEATURE_PR_LIMIT"])
+
+    def test_empty_string_treated_as_true(self):
+        env = self._make_env(FEATURE_PR_LIMIT="")
+        config = get_feature_config(env)
+        self.assertTrue(config["FEATURE_PR_LIMIT"])
+
+
+class TestFeatureToggleIssueOpened(unittest.TestCase):
+    """Verify handle_issue_opened respects feature toggles."""
+
+    def _run_opened(self, features, comments, bug_calls, bug_return=None):
+        payload = _make_issue_payload(labels=[{"name": "bug"}])
+
+        async def _inner():
+            async def _mock_report(url, data):
+                bug_calls.append(data)
+                return bug_return
+
+            with (
+                patch.object(_worker, "create_comment", new=AsyncMock(
+                    side_effect=lambda o, r, n, b, t: comments.append(b)
+                )),
+                patch.object(_worker, "report_bug_to_blt", new=_mock_report),
+            ):
+                await _worker.handle_issue_opened(
+                    payload, "tok", "https://blt.example", features
+                )
+        _run(_inner())
+
+    def test_welcome_disabled_skips_comment(self):
+        features = dict(FEATURE_DEFAULTS, FEATURE_WELCOME_COMMENT=False)
+        comments, bugs = [], []
+        self._run_opened(features, comments, bugs, bug_return={"id": 1})
+        self.assertEqual(comments, [])
+        # Bug reporting should still happen
+        self.assertEqual(len(bugs), 1)
+
+    def test_bug_reporting_disabled_skips_blt(self):
+        features = dict(FEATURE_DEFAULTS, FEATURE_BUG_REPORTING=False)
+        comments, bugs = [], []
+        self._run_opened(features, comments, bugs)
+        # Welcome comment still posted, but no bug report
+        self.assertEqual(len(comments), 1)
+        self.assertIn("Thanks for opening", comments[0])
+        self.assertEqual(bugs, [])
+
+    def test_both_disabled(self):
+        features = dict(
+            FEATURE_DEFAULTS,
+            FEATURE_WELCOME_COMMENT=False,
+            FEATURE_BUG_REPORTING=False,
+        )
+        comments, bugs = [], []
+        self._run_opened(features, comments, bugs)
+        self.assertEqual(comments, [])
+        self.assertEqual(bugs, [])
+
+
+class TestFeatureToggleIssueLabeled(unittest.TestCase):
+    """Verify handle_issue_labeled respects FEATURE_BUG_REPORTING toggle."""
+
+    def _run_labeled(self, features, comments, bug_calls, bug_return=None):
+        payload = _make_issue_payload(
+            labels=[{"name": "bug"}], label={"name": "bug"}
+        )
+
+        async def _inner():
+            async def _mock_report(url, data):
+                bug_calls.append(data)
+                return bug_return
+
+            with (
+                patch.object(_worker, "create_comment", new=AsyncMock(
+                    side_effect=lambda o, r, n, b, t: comments.append(b)
+                )),
+                patch.object(_worker, "report_bug_to_blt", new=_mock_report),
+            ):
+                await _worker.handle_issue_labeled(
+                    payload, "tok", "https://blt.example", features
+                )
+        _run(_inner())
+
+    def test_bug_reporting_disabled_skips_everything(self):
+        features = dict(FEATURE_DEFAULTS, FEATURE_BUG_REPORTING=False)
+        comments, bugs = [], []
+        self._run_labeled(features, comments, bugs)
+        self.assertEqual(comments, [])
+        self.assertEqual(bugs, [])
+
+
+class TestFeatureTogglePROpened(unittest.TestCase):
+    """Verify handle_pull_request_opened respects feature toggles."""
+
+    def _run_opened(self, features, comments, label_calls):
+        payload = _make_pr_payload()
+
+        async def _inner():
+            with (
+                patch.object(_worker, "create_comment", new=AsyncMock(
+                    side_effect=lambda o, r, n, b, t: comments.append(b)
+                )),
+                patch.object(_worker, "enforce_pr_limit", new=AsyncMock(return_value=False)),
+                patch.object(_worker, "apply_files_changed_label", new=AsyncMock(
+                    side_effect=lambda *a: label_calls.append("files")
+                )),
+                patch.object(_worker, "apply_migration_label", new=AsyncMock(
+                    side_effect=lambda *a: label_calls.append("migration")
+                )),
+                patch.object(_worker, "check_linked_issue", new=AsyncMock(
+                    side_effect=lambda *a: label_calls.append("linked")
+                )),
+                patch.object(_worker, "_post_or_update_leaderboard", new=AsyncMock(
+                    side_effect=lambda *a: label_calls.append("leaderboard")
+                )),
+            ):
+                await _worker.handle_pull_request_opened(payload, "tok", features)
+        _run(_inner())
+
+    def test_welcome_disabled_skips_comment(self):
+        features = dict(FEATURE_DEFAULTS, FEATURE_WELCOME_COMMENT=False)
+        comments, labels = [], []
+        self._run_opened(features, comments, labels)
+        self.assertEqual(comments, [])
+        # Labels should still be applied
+        self.assertIn("files", labels)
+
+    def test_pr_size_label_disabled(self):
+        features = dict(FEATURE_DEFAULTS, FEATURE_PR_SIZE_LABEL=False)
+        comments, labels = [], []
+        self._run_opened(features, comments, labels)
+        self.assertNotIn("files", labels)
+        self.assertIn("migration", labels)
+
+    def test_migration_label_disabled(self):
+        features = dict(FEATURE_DEFAULTS, FEATURE_MIGRATION_LABEL=False)
+        comments, labels = [], []
+        self._run_opened(features, comments, labels)
+        self.assertNotIn("migration", labels)
+        self.assertIn("files", labels)
+
+    def test_issue_link_check_disabled(self):
+        features = dict(FEATURE_DEFAULTS, FEATURE_ISSUE_LINK_CHECK=False)
+        comments, labels = [], []
+        self._run_opened(features, comments, labels)
+        self.assertNotIn("linked", labels)
+
+    def test_leaderboard_disabled(self):
+        features = dict(FEATURE_DEFAULTS, FEATURE_LEADERBOARD=False)
+        comments, labels = [], []
+        self._run_opened(features, comments, labels)
+        self.assertNotIn("leaderboard", labels)
+
+    def test_pr_limit_disabled_skips_enforcement(self):
+        payload = _make_pr_payload()
+        enforce_calls = []
+
+        async def _inner():
+            with (
+                patch.object(_worker, "create_comment", new=AsyncMock()),
+                patch.object(_worker, "enforce_pr_limit", new=AsyncMock(
+                    side_effect=lambda *a: enforce_calls.append(1) or False
+                )),
+                patch.object(_worker, "apply_files_changed_label", new=AsyncMock()),
+                patch.object(_worker, "apply_migration_label", new=AsyncMock()),
+                patch.object(_worker, "check_linked_issue", new=AsyncMock()),
+                patch.object(_worker, "_post_or_update_leaderboard", new=AsyncMock()),
+            ):
+                features = dict(FEATURE_DEFAULTS, FEATURE_PR_LIMIT=False)
+                await _worker.handle_pull_request_opened(payload, "tok", features)
+        _run(_inner())
+        self.assertEqual(enforce_calls, [])
+
+    def test_all_pr_features_disabled(self):
+        features = {k: False for k in FEATURE_DEFAULTS}
+        comments, labels = [], []
+        self._run_opened(features, comments, labels)
+        self.assertEqual(comments, [])
+        self.assertEqual(labels, [])
+
+
+class TestFeatureTogglePRSynchronize(unittest.TestCase):
+    """Verify handle_pull_request_synchronize respects feature toggles."""
+
+    def _run_sync(self, features, calls):
+        payload = _make_pr_payload()
+
+        async def _inner():
+            with (
+                patch.object(_worker, "apply_files_changed_label", new=AsyncMock(
+                    side_effect=lambda *a: calls.append("files")
+                )),
+                patch.object(_worker, "apply_migration_label", new=AsyncMock(
+                    side_effect=lambda *a: calls.append("migration")
+                )),
+                patch.object(_worker, "check_linked_issue", new=AsyncMock(
+                    side_effect=lambda *a: calls.append("linked")
+                )),
+                patch.object(_worker, "check_pr_conflicts", new=AsyncMock(
+                    side_effect=lambda *a: calls.append("conflicts")
+                )),
+            ):
+                await _worker.handle_pull_request_synchronize(payload, "tok", features)
+        _run(_inner())
+
+    def test_all_enabled(self):
+        calls = []
+        self._run_sync(dict(FEATURE_DEFAULTS), calls)
+        self.assertEqual(calls, ["files", "migration", "linked", "conflicts"])
+
+    def test_conflict_check_disabled(self):
+        features = dict(FEATURE_DEFAULTS, FEATURE_CONFLICT_CHECK=False)
+        calls = []
+        self._run_sync(features, calls)
+        self.assertNotIn("conflicts", calls)
+        self.assertIn("files", calls)
+
+    def test_all_disabled(self):
+        features = {k: False for k in FEATURE_DEFAULTS}
+        calls = []
+        self._run_sync(features, calls)
+        self.assertEqual(calls, [])
+
+
+class TestFeatureTogglePRClosed(unittest.TestCase):
+    """Verify handle_pull_request_closed respects feature toggles."""
+
+    def _run_closed(self, features, comments, leaderboard_calls):
+        payload = _make_pr_payload(merged=True)
+
+        async def _inner():
+            with (
+                patch.object(_worker, "create_comment", new=AsyncMock(
+                    side_effect=lambda o, r, n, b, t: comments.append(b)
+                )),
+                patch.object(_worker, "_check_rank_improvement", new=AsyncMock(
+                    side_effect=lambda *a: leaderboard_calls.append("rank")
+                )),
+                patch.object(_worker, "_post_or_update_leaderboard", new=AsyncMock(
+                    side_effect=lambda *a: leaderboard_calls.append("leaderboard")
+                )),
+            ):
+                await _worker.handle_pull_request_closed(payload, "tok", features)
+        _run(_inner())
+
+    def test_merge_comment_disabled(self):
+        features = dict(FEATURE_DEFAULTS, FEATURE_MERGE_COMMENT=False)
+        comments, lb = [], []
+        self._run_closed(features, comments, lb)
+        self.assertEqual(comments, [])
+        # Leaderboard should still work
+        self.assertIn("leaderboard", lb)
+
+    def test_leaderboard_disabled(self):
+        features = dict(FEATURE_DEFAULTS, FEATURE_LEADERBOARD=False)
+        comments, lb = [], []
+        self._run_closed(features, comments, lb)
+        self.assertEqual(len(comments), 1)
+        self.assertIn("PR merged", comments[0])
+        self.assertEqual(lb, [])
+
+    def test_both_disabled(self):
+        features = dict(
+            FEATURE_DEFAULTS,
+            FEATURE_MERGE_COMMENT=False,
+            FEATURE_LEADERBOARD=False,
+        )
+        comments, lb = [], []
+        self._run_closed(features, comments, lb)
+        self.assertEqual(comments, [])
+        self.assertEqual(lb, [])
+
+
+class TestFeatureToggleIssueComment(unittest.TestCase):
+    """Verify handle_issue_comment respects FEATURE_LEADERBOARD toggle."""
+
+    def test_leaderboard_disabled_ignores_command(self):
+        payload = _make_issue_payload(comment_body="/leaderboard")
+        leaderboard_calls = []
+
+        async def _inner():
+            with (
+                patch.object(_worker, "_assign", new=AsyncMock()),
+                patch.object(_worker, "_unassign", new=AsyncMock()),
+                patch.object(_worker, "_post_or_update_leaderboard", new=AsyncMock(
+                    side_effect=lambda *a: leaderboard_calls.append(1)
+                )),
+            ):
+                features = dict(FEATURE_DEFAULTS, FEATURE_LEADERBOARD=False)
+                await _worker.handle_issue_comment(payload, "tok", features)
+        _run(_inner())
+        self.assertEqual(leaderboard_calls, [])
+
+    def test_leaderboard_enabled_runs_command(self):
+        payload = _make_issue_payload(comment_body="/leaderboard")
+        leaderboard_calls = []
+
+        async def _inner():
+            with (
+                patch.object(_worker, "_assign", new=AsyncMock()),
+                patch.object(_worker, "_unassign", new=AsyncMock()),
+                patch.object(_worker, "_post_or_update_leaderboard", new=AsyncMock(
+                    side_effect=lambda *a: leaderboard_calls.append(1)
+                )),
+            ):
+                features = dict(FEATURE_DEFAULTS)
+                await _worker.handle_issue_comment(payload, "tok", features)
+        _run(_inner())
+        self.assertEqual(len(leaderboard_calls), 1)
 
 
 if __name__ == "__main__":

@@ -52,6 +52,35 @@ FILES_CHANGED_COLORS = {
 ISSUE_LINK_PATTERN = r"(?i)(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\s+#\d+"
 MIGRATION_PATH_PATTERN = r"migrations/\d{4}_"
 
+# Feature toggle defaults — all enabled unless explicitly set to "false" in env
+FEATURE_DEFAULTS = {
+    "FEATURE_PR_SIZE_LABEL": True,
+    "FEATURE_MIGRATION_LABEL": True,
+    "FEATURE_ISSUE_LINK_CHECK": True,
+    "FEATURE_CONFLICT_CHECK": True,
+    "FEATURE_PR_LIMIT": True,
+    "FEATURE_WELCOME_COMMENT": True,
+    "FEATURE_BUG_REPORTING": True,
+    "FEATURE_LEADERBOARD": True,
+    "FEATURE_MERGE_COMMENT": True,
+}
+
+
+def get_feature_config(env) -> dict:
+    """Read feature toggles from environment variables.
+
+    Each toggle defaults to True and is only disabled when its env var
+    is explicitly set to the string ``"false"`` (case-insensitive).
+    """
+    config = {}
+    for key, default in FEATURE_DEFAULTS.items():
+        val = getattr(env, key, None)
+        if val is not None and str(val).strip().lower() == "false":
+            config[key] = False
+        else:
+            config[key] = default
+    return config
+
 # DER OID sequence for rsaEncryption (used when wrapping PKCS#1 → PKCS#8)
 _RSA_OID_SEQ = bytes([
     0x30, 0x0D,
@@ -720,7 +749,9 @@ async def _check_rank_improvement(owner: str, repo: str, pr_number: int, author_
 # ---------------------------------------------------------------------------
 
 
-async def handle_issue_comment(payload: dict, token: str) -> None:
+async def handle_issue_comment(payload: dict, token: str, features: dict | None = None) -> None:
+    if features is None:
+        features = dict(FEATURE_DEFAULTS)
     comment = payload["comment"]
     issue = payload["issue"]
     if not _is_human(comment["user"]):
@@ -735,7 +766,7 @@ async def handle_issue_comment(payload: dict, token: str) -> None:
         await _assign(owner, repo, issue, login, token)
     elif body.startswith(UNASSIGN_COMMAND):
         await _unassign(owner, repo, issue, login, token)
-    elif body.startswith(LEADERBOARD_COMMAND):
+    elif body.startswith(LEADERBOARD_COMMAND) and features.get("FEATURE_LEADERBOARD", True):
         await _post_or_update_leaderboard(owner, repo, issue_number, login, token)
 
 
@@ -823,8 +854,10 @@ async def _unassign(
 
 
 async def handle_issue_opened(
-    payload: dict, token: str, blt_api_url: str
+    payload: dict, token: str, blt_api_url: str, features: dict | None = None
 ) -> None:
+    if features is None:
+        features = dict(FEATURE_DEFAULTS)
     issue = payload["issue"]
     sender = payload["sender"]
     if not _is_human(sender):
@@ -833,33 +866,46 @@ async def handle_issue_opened(
     repo = payload["repository"]["name"]
     labels = [lb["name"].lower() for lb in issue.get("labels", [])]
     is_bug = any(lb in BUG_LABELS for lb in labels)
-    msg = (
-        f"👋 Thanks for opening this issue, @{sender['login']}!\n\n"
-        "Our team will review it shortly. In the meantime:\n"
-        "- If you'd like to work on this issue, comment `/assign` to get assigned.\n"
-        "- Visit [OWASP BLT](https://owaspblt.org) for more information about "
-        "our bug bounty platform.\n"
-    )
-    if is_bug:
-        bug_data = await report_bug_to_blt(blt_api_url, {
+
+    if features.get("FEATURE_WELCOME_COMMENT", True):
+        msg = (
+            f"👋 Thanks for opening this issue, @{sender['login']}!\n\n"
+            "Our team will review it shortly. In the meantime:\n"
+            "- If you'd like to work on this issue, comment `/assign` to get assigned.\n"
+            "- Visit [OWASP BLT](https://owaspblt.org) for more information about "
+            "our bug bounty platform.\n"
+        )
+        if is_bug and features.get("FEATURE_BUG_REPORTING", True):
+            bug_data = await report_bug_to_blt(blt_api_url, {
+                "url": issue["html_url"],
+                "description": issue["title"],
+                "github_url": issue["html_url"],
+                "label": labels[0] if labels else "bug",
+            })
+            if bug_data and bug_data.get("id"):
+                msg += (
+                    "\n🐛 This issue has been automatically reported to "
+                    "[OWASP BLT](https://owaspblt.org) "
+                    f"(Bug ID: #{bug_data['id']}). "
+                    "Thank you for helping improve security!\n"
+                )
+        await create_comment(owner, repo, issue["number"], msg, token)
+    elif is_bug and features.get("FEATURE_BUG_REPORTING", True):
+        await report_bug_to_blt(blt_api_url, {
             "url": issue["html_url"],
             "description": issue["title"],
             "github_url": issue["html_url"],
             "label": labels[0] if labels else "bug",
         })
-        if bug_data and bug_data.get("id"):
-            msg += (
-                "\n🐛 This issue has been automatically reported to "
-                "[OWASP BLT](https://owaspblt.org) "
-                f"(Bug ID: #{bug_data['id']}). "
-                "Thank you for helping improve security!\n"
-            )
-    await create_comment(owner, repo, issue["number"], msg, token)
 
 
 async def handle_issue_labeled(
-    payload: dict, token: str, blt_api_url: str
+    payload: dict, token: str, blt_api_url: str, features: dict | None = None
 ) -> None:
+    if features is None:
+        features = dict(FEATURE_DEFAULTS)
+    if not features.get("FEATURE_BUG_REPORTING", True):
+        return
     issue = payload["issue"]
     label = payload.get("label") or {}
     label_name = label.get("name", "").lower()
@@ -1075,7 +1121,9 @@ async def enforce_pr_limit(
     return False
 
 
-async def handle_pull_request_opened(payload: dict, token: str) -> None:
+async def handle_pull_request_opened(payload: dict, token: str, features: dict | None = None) -> None:
+    if features is None:
+        features = dict(FEATURE_DEFAULTS)
     pr = payload["pull_request"]
     sender = payload["sender"]
     if not _is_human(sender):
@@ -1091,34 +1139,42 @@ async def handle_pull_request_opened(payload: dict, token: str) -> None:
     author_login = sender["login"]
 
     # Enforce PR-per-author limit first
-    closed = await enforce_pr_limit(owner, repo, pr, author_login, token)
-    if closed:
-        return
+    if features.get("FEATURE_PR_LIMIT", True):
+        closed = await enforce_pr_limit(owner, repo, pr, author_login, token)
+        if closed:
+            return
 
-    body = (
-        f"👋 Thanks for opening this pull request, @{author_login}!\n\n"
-        "**Before your PR is reviewed, please ensure:**\n"
-        "- [ ] Your code follows the project's coding style and guidelines.\n"
-        "- [ ] You have written or updated tests for your changes.\n"
-        "- [ ] The commit messages are clear and descriptive.\n"
-        "- [ ] You have linked any relevant issues (e.g., `Closes #123`).\n\n"
-        "🔍 Our team will review your PR shortly. "
-        "If you have questions, feel free to ask in the comments.\n\n"
-        "🚀 Keep up the great work! — [OWASP BLT](https://owaspblt.org)"
-    )
-    await create_comment(owner, repo, pr_number, body, token)
-    
+    if features.get("FEATURE_WELCOME_COMMENT", True):
+        body = (
+            f"\U0001f44b Thanks for opening this pull request, @{author_login}!\n\n"
+            "**Before your PR is reviewed, please ensure:**\n"
+            "- [ ] Your code follows the project's coding style and guidelines.\n"
+            "- [ ] You have written or updated tests for your changes.\n"
+            "- [ ] The commit messages are clear and descriptive.\n"
+            "- [ ] You have linked any relevant issues (e.g., `Closes #123`).\n\n"
+            "\U0001f50d Our team will review your PR shortly. "
+            "If you have questions, feel free to ask in the comments.\n\n"
+            "\U0001f680 Keep up the great work! \u2014 [OWASP BLT](https://owaspblt.org)"
+        )
+        await create_comment(owner, repo, pr_number, body, token)
+
     # Post leaderboard
-    await _post_or_update_leaderboard(owner, repo, pr_number, author_login, token)
+    if features.get("FEATURE_LEADERBOARD", True):
+        await _post_or_update_leaderboard(owner, repo, pr_number, author_login, token)
 
     # Apply automation labels
-    await apply_files_changed_label(owner, repo, pr, token)
-    await apply_migration_label(owner, repo, pr, token)
-    await check_linked_issue(owner, repo, pr, token)
+    if features.get("FEATURE_PR_SIZE_LABEL", True):
+        await apply_files_changed_label(owner, repo, pr, token)
+    if features.get("FEATURE_MIGRATION_LABEL", True):
+        await apply_migration_label(owner, repo, pr, token)
+    if features.get("FEATURE_ISSUE_LINK_CHECK", True):
+        await check_linked_issue(owner, repo, pr, token)
 
 
-async def handle_pull_request_synchronize(payload: dict, token: str) -> None:
+async def handle_pull_request_synchronize(payload: dict, token: str, features: dict | None = None) -> None:
     """Re-run automation labels when new commits are pushed to a PR."""
+    if features is None:
+        features = dict(FEATURE_DEFAULTS)
     pr = payload["pull_request"]
     sender = payload["sender"]
     if not _is_human(sender):
@@ -1126,13 +1182,19 @@ async def handle_pull_request_synchronize(payload: dict, token: str) -> None:
     owner = payload["repository"]["owner"]["login"]
     repo = payload["repository"]["name"]
 
-    await apply_files_changed_label(owner, repo, pr, token)
-    await apply_migration_label(owner, repo, pr, token)
-    await check_linked_issue(owner, repo, pr, token)
-    await check_pr_conflicts(owner, repo, pr, token)
+    if features.get("FEATURE_PR_SIZE_LABEL", True):
+        await apply_files_changed_label(owner, repo, pr, token)
+    if features.get("FEATURE_MIGRATION_LABEL", True):
+        await apply_migration_label(owner, repo, pr, token)
+    if features.get("FEATURE_ISSUE_LINK_CHECK", True):
+        await check_linked_issue(owner, repo, pr, token)
+    if features.get("FEATURE_CONFLICT_CHECK", True):
+        await check_pr_conflicts(owner, repo, pr, token)
 
 
-async def handle_pull_request_closed(payload: dict, token: str) -> None:
+async def handle_pull_request_closed(payload: dict, token: str, features: dict | None = None) -> None:
+    if features is None:
+        features = dict(FEATURE_DEFAULTS)
     pr = payload["pull_request"]
     sender = payload["sender"]
     if not pr.get("merged"):
@@ -1150,18 +1212,18 @@ async def handle_pull_request_closed(payload: dict, token: str) -> None:
     author_login = pr["user"]["login"]
     
     # Post merge congratulations
-    body = (
-        f"🎉 PR merged! Thanks for your contribution, @{author_login}!\n\n"
-        "Your work is now part of the project. Keep contributing to "
-        "[OWASP BLT](https://owaspblt.org) and help make the web a safer place! 🛡️"
-    )
-    await create_comment(owner, repo, pr_number, body, token)
+    if features.get("FEATURE_MERGE_COMMENT", True):
+        body = (
+            f"🎉 PR merged! Thanks for your contribution, @{author_login}!\n\n"
+            "Your work is now part of the project. Keep contributing to "
+            "[OWASP BLT](https://owaspblt.org) and help make the web a safer place! 🛡️"
+        )
+        await create_comment(owner, repo, pr_number, body, token)
     
     # Check for rank improvement and congratulate if improved
-    await _check_rank_improvement(owner, repo, pr_number, author_login, token)
-    
-    # Post/update leaderboard
-    await _post_or_update_leaderboard(owner, repo, pr_number, author_login, token)
+    if features.get("FEATURE_LEADERBOARD", True):
+        await _check_rank_improvement(owner, repo, pr_number, author_login, token)
+        await _post_or_update_leaderboard(owner, repo, pr_number, author_login, token)
 
 
 # ---------------------------------------------------------------------------
@@ -1199,22 +1261,23 @@ async def handle_webhook(request, env) -> Response:
         return _json({"error": "Authentication failed"}, 500)
 
     blt_api_url = getattr(env, "BLT_API_URL", "https://blt-api.owasp-blt.workers.dev")
+    features = get_feature_config(env)
 
     try:
         if event == "issue_comment" and action == "created":
-            await handle_issue_comment(payload, token)
+            await handle_issue_comment(payload, token, features)
         elif event == "issues":
             if action == "opened":
-                await handle_issue_opened(payload, token, blt_api_url)
+                await handle_issue_opened(payload, token, blt_api_url, features)
             elif action == "labeled":
-                await handle_issue_labeled(payload, token, blt_api_url)
+                await handle_issue_labeled(payload, token, blt_api_url, features)
         elif event == "pull_request":
             if action in ("opened", "reopened"):
-                await handle_pull_request_opened(payload, token)
+                await handle_pull_request_opened(payload, token, features)
             elif action == "synchronize":
-                await handle_pull_request_synchronize(payload, token)
+                await handle_pull_request_synchronize(payload, token, features)
             elif action == "closed":
-                await handle_pull_request_closed(payload, token)
+                await handle_pull_request_closed(payload, token, features)
     except Exception as exc:
         console.error(f"[BLT] Webhook handler error: {exc}")
         return _json({"error": "Internal server error"}, 500)
