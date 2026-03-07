@@ -4192,7 +4192,7 @@ async def handle_changes_requested_label(owner: str, repo: str, pr_number: int, 
     label_color = "e74c3c"
 
     # Ensure label exists
-    await _ensure_label_exists(owner, repo, label_name, label_color, token)
+    await ensure_label_exists(owner, repo, label_name, label_color, "", token)
 
     # Get current labels
     resp = await github_api(
