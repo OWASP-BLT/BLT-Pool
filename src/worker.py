@@ -1958,7 +1958,7 @@ async def handle_changes_requested_label(owner: str, repo: str, pr_number: int, 
     label_color = "e74c3c"
 
     # Ensure label exists
-    await _ensure_label_exists(owner, repo, label_name, label_color, token)
+    await ensure_label_exists(owner, repo, label_name, label_color, "", token)
 
     # Get current labels
     resp = await github_api(
@@ -1989,31 +1989,7 @@ async def handle_changes_requested_label(owner: str, repo: str, pr_number: int, 
                 token,
             )
 
-async def _ensure_label_exists(
-    owner: str, repo: str, name: str, color: str, token: str
-) -> None:
-    """Create a label if it does not already exist, or update its colour."""
-    resp = await github_api(
-        "GET",
-        f"/repos/{owner}/{repo}/labels/{quote(name, safe='')}",
-        token,
-    )
-    if resp.status == 404:
-        await github_api(
-            "POST",
-            f"/repos/{owner}/{repo}/labels",
-            token,
-            {"name": name, "color": color},
-        )
-    elif resp.status == 200:
-        data = json.loads(await resp.text())
-        if data.get("color") != color:
-            await github_api(
-                "PATCH",
-                f"/repos/{owner}/{repo}/labels/{quote(name, safe='')}",
-                token,
-                {"color": color},
-            )
+
 
 async def check_unresolved_conversations(payload, token):
     """Add label if PR has unresolved review conversations"""
@@ -2091,9 +2067,9 @@ async def check_unresolved_conversations(payload, token):
     label = f"unresolved-conversations: {unresolved_count}"
 
     if unresolved:
-        await _ensure_label_exists(owner, repo, label, "e74c3c", token)
+        await ensure_label_exists(owner, repo, label, "e74c3c", "", token)
     else:
-        await _ensure_label_exists(owner, repo, label, "5cb85c", token)
+        await ensure_label_exists(owner, repo, label, "5cb85c", "", token)
 
     await github_api(
         "POST",
@@ -2183,13 +2159,14 @@ async def get_valid_reviewers(owner: str, repo: str, pr_number: int, pr_author: 
 
 async def ensure_label_exists(owner: str, repo: str, label_name: str, color: str, description: str, token: str) -> None:
     """Create or update a label to ensure it exists with the correct color/description."""
-    resp = await github_api("GET", f"/repos/{owner}/{repo}/labels/{label_name}", token)
+    encoded_name = quote(label_name, safe='')
+    resp = await github_api("GET", f"/repos/{owner}/{repo}/labels/{encoded_name}", token)
     
     if resp.status == 200:
         # Label exists, check if it needs update
         data = json.loads(await resp.text())
         if data.get("color") != color or data.get("description") != description:
-            update_resp = await github_api("PATCH", f"/repos/{owner}/{repo}/labels/{label_name}", token, {
+            update_resp = await github_api("PATCH", f"/repos/{owner}/{repo}/labels/{encoded_name}", token, {
                 "color": color,
                 "description": description,
             })
