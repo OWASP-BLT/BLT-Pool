@@ -46,6 +46,8 @@ _CONSOLE_JS_EXTENSIONS = (".js", ".ts", ".jsx", ".tsx")
 
 # Regex pattern from check-console-log.yml — matches any console.* call
 _CONSOLE_PATTERN = re.compile(r"console\.[a-zA-Z]+\s*\(")
+_STRIP_STRINGS_RE = re.compile(r'"[^"]*"|\'[^\']*\'|`[^`]*`')
+_STRIP_INLINE_RE = re.compile(r"//.*")
 
 # Regexes used by _scan_console_statements to strip noise before testing a line
 _BLOCK_COMMENT_RE = re.compile(r"/\*.*?\*/", re.DOTALL)
@@ -1943,7 +1945,7 @@ async def _ensure_label_exists(
     """Create a label if it does not already exist, or update its colour."""
     resp = await github_api(
         "GET",
-        f"/repos/{owner}/{repo}/labels/{quote(name, safe='')}",
+        f"/repos/{owner}/{repo}/labels/{_url_quote(name, safe='')}",
         token,
     )
     if resp.status == 404:
@@ -1958,7 +1960,7 @@ async def _ensure_label_exists(
         if data.get("color") != color:
             await github_api(
                 "PATCH",
-                f"/repos/{owner}/{repo}/labels/{quote(name, safe='')}",
+                f"/repos/{owner}/{repo}/labels/{_url_quote(name, safe='')}",
                 token,
                 {"color": color},
             )
@@ -2032,7 +2034,7 @@ async def check_unresolved_conversations(payload, token):
             if lb["name"].startswith("unresolved-conversations"):
                 await github_api(
                     "DELETE",
-                    f"/repos/{owner}/{repo}/issues/{number}/labels/{quote(lb['name'], safe='')}",
+                    f"/repos/{owner}/{repo}/issues/{number}/labels/{_url_quote(lb['name'], safe='')}",
                     token,
                 )
 
@@ -2306,11 +2308,21 @@ async def update_check_run(
 def _scan_console_statements(content: str, filename: str) -> list:
     """Return GitHub Check annotation dicts for each console.* call found."""
     annotations = []
+    in_block = False
     for line_no, line in enumerate(content.splitlines(), start=1):
         stripped = line.lstrip()
-        if stripped.startswith("//") or stripped.startswith("*") or stripped.startswith("/*"):
+        if in_block:
+            if "*/" in stripped:
+                in_block = False
             continue
-        if _CONSOLE_PATTERN.search(stripped):
+        if stripped.startswith("//") or stripped.startswith("*"):
+            continue
+        if stripped.startswith("/*"):
+            if "*/" not in stripped:
+                in_block = True
+            continue
+        cleaned = _STRIP_INLINE_RE.sub("", _STRIP_STRINGS_RE.sub("", stripped))
+        if _CONSOLE_PATTERN.search(cleaned):
             annotations.append({
                 "path": filename,
                 "start_line": line_no,
@@ -2357,7 +2369,7 @@ async def run_console_check(owner: str, repo: str, pr_number: int, head_sha: str
             continue
         data = json.loads(await content_resp.text())
         raw_b64 = data.get("content", "")
-        if not raw_b64 or data.get("encoding") != "base64":
+        if not raw_b64 or data.get("encoding", "base64") != "base64":
             continue
         try:
             content = base64.b64decode(raw_b64.replace("\n", "")).decode("utf-8", errors="replace")

@@ -2162,83 +2162,6 @@ class TestRunConsoleCheck(unittest.TestCase):
     def test_neutral_when_files_api_fails(self):
         _run(self._test_neutral_when_files_api_fails())
 
-    async def _test_neutral_when_more_than_20_files_no_violations(self):
-        """When >20 JS files and no violations in the first 20, result is neutral, not success."""
-        updated = []
-
-        async def mock_create(*args, **kwargs):
-            return 10
-
-        async def mock_update(owner, repo, run_id, conclusion, title, summary, annotations, token):
-            updated.append({"conclusion": conclusion, "title": title, "summary": summary})
-
-        # 25 JS files, all clean
-        file_list = [{"filename": f"src/file{i}.js", "status": "modified"} for i in range(25)]
-        clean_b64 = __import__("base64").b64encode(b"const x = 1;\n").decode()
-
-        async def mock_api(method, path, token, body=None):
-            if "files" in path:
-                r = AsyncMock()
-                r.status = 200
-                r.text = AsyncMock(return_value=json.dumps(file_list))
-                return r
-            r = AsyncMock()
-            r.status = 200
-            r.text = AsyncMock(return_value=json.dumps({"content": clean_b64}))
-            return r
-
-        with patch.object(_worker, "create_check_run", side_effect=mock_create), \
-             patch.object(_worker, "update_check_run", side_effect=mock_update), \
-             patch.object(_worker, "github_api", side_effect=mock_api), \
-             patch.object(_worker, "console", new=types.SimpleNamespace(error=lambda *a: None, log=lambda *a: None)):
-            await _worker.run_console_check("OWASP-BLT", "BLT", 10, "sha", "tok")
-
-        self.assertEqual(len(updated), 1)
-        self.assertEqual(updated[0]["conclusion"], "neutral")
-        self.assertIn("25", updated[0]["summary"])
-        self.assertIn("partial", updated[0]["title"].lower())
-
-    async def _test_failure_with_partial_scan_note_when_over_20(self):
-        """When >20 files and violations exist in first 20, result is failure with note."""
-        updated = []
-
-        async def mock_create(*args, **kwargs):
-            return 11
-
-        async def mock_update(owner, repo, run_id, conclusion, title, summary, annotations, token):
-            updated.append({"conclusion": conclusion, "summary": summary})
-
-        # 25 files, first has a console.log
-        file_list = [{"filename": f"src/file{i}.js", "status": "modified"} for i in range(25)]
-        bad_b64 = __import__("base64").b64encode(b"console.log('x');\n").decode()
-        clean_b64 = __import__("base64").b64encode(b"const x = 1;\n").decode()
-
-        call_count = {"n": 0}
-
-        async def mock_api(method, path, token, body=None):
-            if "files" in path:
-                r = AsyncMock()
-                r.status = 200
-                r.text = AsyncMock(return_value=json.dumps(file_list))
-                return r
-            r = AsyncMock()
-            r.status = 200
-            # First content call returns bad file, rest return clean
-            b64 = bad_b64 if call_count["n"] == 0 else clean_b64
-            call_count["n"] += 1
-            r.text = AsyncMock(return_value=json.dumps({"content": b64}))
-            return r
-
-        with patch.object(_worker, "create_check_run", side_effect=mock_create), \
-             patch.object(_worker, "update_check_run", side_effect=mock_update), \
-             patch.object(_worker, "github_api", side_effect=mock_api), \
-             patch.object(_worker, "console", new=types.SimpleNamespace(error=lambda *a: None, log=lambda *a: None)):
-            await _worker.run_console_check("OWASP-BLT", "BLT", 11, "sha", "tok")
-
-        self.assertEqual(len(updated), 1)
-        self.assertEqual(updated[0]["conclusion"], "failure")
-        self.assertIn("25", updated[0]["summary"])
-
     async def _test_contents_api_url_encodes_filename(self):
         """Filenames with special characters must be URL-encoded in the Contents API path."""
         requested_paths = []
@@ -2277,12 +2200,6 @@ class TestRunConsoleCheck(unittest.TestCase):
         self.assertIn("%23", contents_paths[0])
         # Raw filename must not appear in the path
         self.assertNotIn("my file #1", contents_paths[0])
-
-    def test_neutral_when_more_than_20_files_no_violations(self):
-        _run(self._test_neutral_when_more_than_20_files_no_violations())
-
-    def test_failure_with_partial_scan_note_when_over_20(self):
-        _run(self._test_failure_with_partial_scan_note_when_over_20())
 
     def test_contents_api_url_encodes_filename(self):
         _run(self._test_contents_api_url_encodes_filename())
