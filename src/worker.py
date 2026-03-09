@@ -15,6 +15,7 @@ Environment variables / secrets (configure via ``wrangler.toml`` or
     BLT_API_URL        — BLT API base URL (default: https://blt-api.owasp-blt.workers.dev)
     GITHUB_CLIENT_ID   — OAuth client ID (optional)
     GITHUB_CLIENT_SECRET — OAuth client secret (optional)
+    ENABLE_DEPENDABOT_AUTO_APPROVAL — Enable/disable Dependabot auto-approval (default: true)
 """
 
 import base64
@@ -1951,8 +1952,17 @@ def _is_dependabot_dependency_update(pr: dict) -> bool:
     return title_looks_like_bump or body_looks_like_dependabot
 
 
-async def handle_dependabot_pr(payload: dict, token: str) -> None:
+async def handle_dependabot_pr(payload: dict, token: str, env=None) -> None:
     """Auto-approve pull requests opened by Dependabot."""
+    # Check if feature is enabled
+    enabled = True
+    if env is not None:
+        enabled_val = getattr(env, "ENABLE_DEPENDABOT_AUTO_APPROVAL", "true").lower()
+        enabled = enabled_val not in ("false", "0", "no", "off")
+    
+    if not enabled:
+        return
+    
     pr = payload["pull_request"]
     pr_author = (pr.get("user") or {}).get("login") or "<deleted>"
     owner = payload["repository"]["owner"]["login"]
@@ -2105,6 +2115,9 @@ async def handle_webhook(request, env) -> Response:
         elif event == "pull_request":
             if action == "opened":
                 await handle_pull_request_opened(payload, token, env)
+                await handle_dependabot_pr(payload, token, env)
+            elif action in ("synchronize", "reopened"):
+                await handle_dependabot_pr(payload, token, env)
             elif action == "closed":
                 await handle_pull_request_closed(payload, token, env)
         elif event == "pull_request_review" and action == "submitted":
