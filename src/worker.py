@@ -1,4 +1,4 @@
-"""BLT GitHub App — Python Cloudflare Worker.
+﻿"""BLT GitHub App — Python Cloudflare Worker.
 
 Handles GitHub webhooks and serves a landing homepage.
 This is the Python / Cloudflare Workers port of the original Node.js Probot app.
@@ -2019,6 +2019,8 @@ async def apply_migration_label(
     )
     if has_migration:
         await _set_label(owner, repo, pr["number"], "migration", "5319e7", token)
+    else:
+        await _remove_labels_with_prefix(owner, repo, pr["number"], "migration", token)
 
 
 async def _has_bot_comment(
@@ -2033,7 +2035,11 @@ async def _has_bot_comment(
     if resp.status != 200:
         return False
     comments = json.loads(await resp.text())
-    return any(marker in (c.get("body") or "") for c in comments)
+    return any(
+        marker in (c.get("body") or "")
+        and c.get("user", {}).get("type") == "Bot"
+        for c in comments
+    )
 
 
 async def check_linked_issue(
@@ -2639,12 +2645,13 @@ async def handle_webhook(request, env) -> Response:
                 await handle_issue_labeled(payload, token, blt_api_url, features)
         elif event == "pull_request":
             if action == "opened":
-                await handle_pull_request_opened(payload, token, env)
+                await handle_pull_request_opened(payload, token, env, features)
                 await handle_pull_request_for_review(payload, token)
-            elif action == "synchronize" or action == "reopened":
+            elif action in ("synchronize", "reopened"):
+                await handle_pull_request_synchronize(payload, token, features)
                 await handle_pull_request_for_review(payload, token)
             elif action == "closed":
-                await handle_pull_request_closed(payload, token, env)
+                await handle_pull_request_closed(payload, token, env, features)
         elif event == "pull_request_review":
             if action == "submitted":
                 # Preserve existing D1 review-credit tracking

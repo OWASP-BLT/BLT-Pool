@@ -819,7 +819,7 @@ class TestCheckLinkedIssue(unittest.TestCase):
 
     def test_skips_duplicate_comment(self):
         """Do not post a warning if the marker comment already exists."""
-        existing_comments = [{"body": "<!-- no-linked-issue -->\n⚠️ **No linked issue detected.**"}]
+        existing_comments = [{"body": "<!-- no-linked-issue -->\n⚠️ **No linked issue detected.**", "user": {"type": "Bot"}}]
         comments_posted = []
 
         async def mock_api(method, path, token, body=None):
@@ -892,7 +892,7 @@ class TestCheckPRConflicts(unittest.TestCase):
 
     def test_skips_duplicate_conflict_comment(self):
         """Do not post a warning if the marker comment already exists."""
-        existing_comments = [{"body": "<!-- conflict-warning -->\n⚠️ **Merge conflicts detected.**"}]
+        existing_comments = [{"body": "<!-- conflict-warning -->\n⚠️ **Merge conflicts detected.**", "user": {"type": "Bot"}}]
         comments_posted = []
 
         async def mock_api(method, path, token, body=None):
