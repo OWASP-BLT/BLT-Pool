@@ -2038,19 +2038,22 @@ async def _has_bot_comment(
     owner: str, repo: str, number: int, marker: str, token: str
 ) -> bool:
     """Return True if the bot has already posted a comment containing *marker*."""
-    resp = await github_api(
-        "GET",
-        f"/repos/{owner}/{repo}/issues/{number}/comments?per_page=100",
-        token,
-    )
-    if resp.status != 200:
-        return False
-    comments = json.loads(await resp.text())
-    return any(
-        marker in (c.get("body") or "")
-        and c.get("user", {}).get("type") == "Bot"
-        for c in comments
-    )
+    page = 1
+    while True:
+        resp = await github_api(
+            "GET",
+            f"/repos/{owner}/{repo}/issues/{number}/comments?per_page=100&page={page}",
+            token,
+        )
+        if resp.status != 200:
+            return False
+        comments = json.loads(await resp.text())
+        if not comments:
+            return False
+        for c in comments:
+            if marker in (c.get("body") or "") and c.get("user", {}).get("type") == "Bot":
+                return True
+        page += 1
 
 
 async def check_linked_issue(
@@ -2103,15 +2106,25 @@ async def enforce_pr_limit(
 
     Returns True if the PR was closed.
     """
-    resp = await github_api(
-        "GET",
-        f"/repos/{owner}/{repo}/pulls?state=open&per_page=100",
-        token,
-    )
-    if resp.status != 200:
-        return False
-    open_prs = json.loads(await resp.text())
-    author_prs = [p for p in open_prs if (p.get("user") or {}).get("login") == sender]
+    author_prs = []
+    page = 1
+    while True:
+        resp = await github_api(
+            "GET",
+            f"/repos/{owner}/{repo}/pulls?state=open&per_page=100&page={page}",
+            token,
+        )
+        if resp.status != 200:
+            return False
+        page_prs = json.loads(await resp.text())
+        if not page_prs:
+            break
+        for p in page_prs:
+            if (p.get("user") or {}).get("login") == sender:
+                author_prs.append(p)
+        if len(author_prs) > MAX_OPEN_PRS_PER_AUTHOR:
+            break
+        page += 1
     if len(author_prs) > MAX_OPEN_PRS_PER_AUTHOR:
         await create_comment(
             owner, repo, pr["number"],
@@ -2218,6 +2231,10 @@ async def handle_pull_request_closed(payload: dict, token: str, env=None, featur
         features = dict(FEATURE_DEFAULTS)
     pr = payload["pull_request"]
     sender = payload["sender"]
+
+    # Record every closed PR (merged or not) in D1.
+    await _track_pr_closed_in_d1(payload, env)
+
     if not pr.get("merged"):
         return
     if not _is_human(sender):
@@ -2232,9 +2249,6 @@ async def handle_pull_request_closed(payload: dict, token: str, env=None, featur
     pr_number = pr["number"]
     author_login = pr["user"]["login"]
 
-    # Track close/merge counters in D1.
-    await _track_pr_closed_in_d1(payload, env)
-    
     # Post merge congratulations
     if features.get("FEATURE_MERGE_COMMENT", True):
         body = (
@@ -2250,9 +2264,6 @@ async def handle_pull_request_closed(payload: dict, token: str, env=None, featur
             await _post_or_update_leaderboard(owner, repo, pr_number, author_login, token)
         else:
             await _post_or_update_leaderboard(owner, repo, pr_number, author_login, token, env)
-
-    # Track PR closed/merged in D1
-    await _track_pr_closed_in_d1(payload, env)
 
 
 async def handle_pull_request_review_submitted(payload: dict, env=None) -> None:
