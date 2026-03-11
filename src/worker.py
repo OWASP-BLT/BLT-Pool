@@ -2590,6 +2590,13 @@ async def handle_dependabot_pr(payload: dict, token: str, env=None) -> None:
         )
         return
 
+    if not _is_dependabot(actor):
+        console.log(
+            f"[BLT] Skip auto-approval: non-Dependabot sender "
+            f"repo={owner}/{repo} pr={pr_number} actor={actor or '-'} author={pr_author}"
+        )
+        return
+
     pr_state = (pr.get("state") or "").strip().lower()
     if pr_state != "open":
         console.log(
