@@ -2310,7 +2310,7 @@ async def check_pr_conflicts(
                 "```bash\ngit fetch origin\ngit rebase origin/main\n```",
                 token,
             )
-    else:
+    elif mergeable is True:
         await _remove_labels_with_prefix(owner, repo, pr["number"], "has-conflicts", token)
 
 
@@ -2957,7 +2957,11 @@ async def handle_webhook(request, env) -> Response:
             if action == "opened":
                 await handle_pull_request_opened(payload, token, env, features)
                 await handle_pull_request_for_review(payload, token)
-            elif action in ("synchronize", "reopened"):
+            elif action == "synchronize":
+                await handle_pull_request_synchronize(payload, token, features)
+                await handle_pull_request_for_review(payload, token)
+            elif action == "reopened":
+                await _track_pr_opened_in_d1(payload, env)
                 await handle_pull_request_synchronize(payload, token, features)
                 await handle_pull_request_for_review(payload, token)
             elif action == "closed":
