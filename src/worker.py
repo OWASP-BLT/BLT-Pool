@@ -626,21 +626,46 @@ async def _track_daily_stat(db, org: str, field: str, delta: int = 1) -> None:
     """Increment a daily stat counter for the given org and today's UTC date."""
     today = time.strftime("%Y-%m-%d", time.gmtime())
     now = int(time.time())
-    valid_fields = {"prs_opened", "prs_merged", "prs_closed", "reviews", "comments"}
-    if field not in valid_fields:
+    # Map each valid field to an explicit, parameterized SQL statement to avoid
+    # any string-interpolation risk in the query.  Only these five fields are
+    # ever written to stats_daily.
+    _field_sql: dict = {
+        "prs_opened": (
+            "INSERT INTO stats_daily (org, date, prs_opened, updated_at) VALUES (?, ?, ?, ?)"
+            " ON CONFLICT(org, date) DO UPDATE SET"
+            " prs_opened = stats_daily.prs_opened + excluded.prs_opened,"
+            " updated_at = excluded.updated_at"
+        ),
+        "prs_merged": (
+            "INSERT INTO stats_daily (org, date, prs_merged, updated_at) VALUES (?, ?, ?, ?)"
+            " ON CONFLICT(org, date) DO UPDATE SET"
+            " prs_merged = stats_daily.prs_merged + excluded.prs_merged,"
+            " updated_at = excluded.updated_at"
+        ),
+        "prs_closed": (
+            "INSERT INTO stats_daily (org, date, prs_closed, updated_at) VALUES (?, ?, ?, ?)"
+            " ON CONFLICT(org, date) DO UPDATE SET"
+            " prs_closed = stats_daily.prs_closed + excluded.prs_closed,"
+            " updated_at = excluded.updated_at"
+        ),
+        "reviews": (
+            "INSERT INTO stats_daily (org, date, reviews, updated_at) VALUES (?, ?, ?, ?)"
+            " ON CONFLICT(org, date) DO UPDATE SET"
+            " reviews = stats_daily.reviews + excluded.reviews,"
+            " updated_at = excluded.updated_at"
+        ),
+        "comments": (
+            "INSERT INTO stats_daily (org, date, comments, updated_at) VALUES (?, ?, ?, ?)"
+            " ON CONFLICT(org, date) DO UPDATE SET"
+            " comments = stats_daily.comments + excluded.comments,"
+            " updated_at = excluded.updated_at"
+        ),
+    }
+    sql = _field_sql.get(field)
+    if not sql:
         return
     try:
-        await _d1_run(
-            db,
-            f"""
-            INSERT INTO stats_daily (org, date, {field}, updated_at)
-            VALUES (?, ?, ?, ?)
-            ON CONFLICT(org, date) DO UPDATE SET
-                {field} = stats_daily.{field} + excluded.{field},
-                updated_at = excluded.updated_at
-            """,
-            (org, today, delta, now),
-        )
+        await _d1_run(db, sql, (org, today, delta, now))
     except Exception as e:
         console.error(f"[D1] Failed to update daily stat {field} for {org}: {e}")
 
@@ -1343,6 +1368,22 @@ async def _reset_leaderboard_month(org: str, month_key: str, db) -> dict:
     return deleted
 
 
+def _empty_daily_data() -> list:
+    """Return a list of 30 zero-valued per-day dicts (oldest → newest) for the stats page."""
+    now_ts = int(time.time())
+    return [
+        {
+            "date": time.strftime("%Y-%m-%d", time.gmtime(now_ts - (29 - i) * 86400)),
+            "prs_opened": 0,
+            "prs_merged": 0,
+            "prs_closed": 0,
+            "reviews": 0,
+            "comments": 0,
+        }
+        for i in range(30)
+    ]
+
+
 async def _get_stats_data(org: str, db) -> dict:
     """Fetch all stats data from D1 for the /stats page.
 
@@ -1358,11 +1399,15 @@ async def _get_stats_data(org: str, db) -> dict:
     """
     await _ensure_leaderboard_schema(db)
 
-    # Collect all known orgs from every relevant table.
+    # Collect all known orgs from every relevant table using explicit (non-interpolated) queries.
     all_orgs: list = []
-    for table in ("stats_daily", "leaderboard_monthly_stats", "leaderboard_open_prs"):
+    for sql in (
+        "SELECT DISTINCT org FROM stats_daily ORDER BY org",
+        "SELECT DISTINCT org FROM leaderboard_monthly_stats ORDER BY org",
+        "SELECT DISTINCT org FROM leaderboard_open_prs ORDER BY org",
+    ):
         try:
-            rows = await _d1_all(db, f"SELECT DISTINCT org FROM {table} ORDER BY org", ())
+            rows = await _d1_all(db, sql, ())
             for row in rows or []:
                 o = row.get("org")
                 if o and o not in all_orgs:
@@ -1370,12 +1415,9 @@ async def _get_stats_data(org: str, db) -> dict:
         except Exception:
             pass
 
-    # Build the 30-day date range (oldest → newest).
-    now_ts = int(time.time())
-    dates_30 = [
-        time.strftime("%Y-%m-%d", time.gmtime(now_ts - (29 - i) * 86400))
-        for i in range(30)
-    ]
+    # Build the 30-day date range (oldest → newest) using the shared helper.
+    empty_days = _empty_daily_data()
+    dates_30 = [d["date"] for d in empty_days]
 
     # Query daily stats for the org over the last 30 days.
     daily_rows: list = []
@@ -1593,7 +1635,8 @@ def _stats_html(data: dict) -> str:
         )
 
     # --- chart data as JSON ---
-    chart_labels = json.dumps([d["date"][-5:] for d in daily_data])  # MM-DD
+    # Dates are stored as YYYY-MM-DD; slice from index 5 to get the MM-DD portion for compact chart labels.
+    chart_labels = json.dumps([d["date"][5:] for d in daily_data])
     chart_labels_full = json.dumps([d["date"] for d in daily_data])
     chart_opened = json.dumps([d["prs_opened"] for d in daily_data])
     chart_merged = json.dumps([d["prs_merged"] for d in daily_data])
@@ -1618,7 +1661,7 @@ def _stats_html(data: dict) -> str:
   <meta name="description" content="Full activity stats for OWASP BLT-Pool — PR activity, reviews, comments, and 30-day charts.">
   <title>{page_title} | OWASP BLT</title>
   <script src="https://cdn.tailwindcss.com"></script>
-  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.4/dist/chart.umd.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.4/dist/chart.umd.min.js" integrity="sha384-pFM5INePUCrorA1ek/y2zAAEdoTbM4E63hBfZkzRF6rUV9/gxH63QI4wiycANgyR" crossorigin="anonymous"></script>
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap" rel="stylesheet">
@@ -3738,10 +3781,10 @@ async def on_fetch(request, env) -> Response:
     # Stats page — reads D1 for all tracked activity + 30-day charts.
     if method == "GET" and path == "/stats":
         db = _d1_binding(env)
-        org = urlparse(str(request.url)).query
+        query_string = urlparse(str(request.url)).query
         # Parse ?org=... from the raw query string
         org_param = ""
-        for part in (org or "").split("&"):
+        for part in (query_string or "").split("&"):
             if part.startswith("org="):
                 org_param = part[4:].strip()
                 break
@@ -3751,7 +3794,7 @@ async def on_fetch(request, env) -> Response:
             stats_data = {
                 "org": org_param,
                 "all_orgs": [],
-                "daily_data": [{"date": time.strftime("%Y-%m-%d", time.gmtime(int(time.time()) - i * 86400)), "prs_opened": 0, "prs_merged": 0, "prs_closed": 0, "reviews": 0, "comments": 0} for i in range(29, -1, -1)],
+                "daily_data": _empty_daily_data(),
                 "totals": {"prs_opened": 0, "prs_merged": 0, "prs_closed": 0, "reviews": 0, "comments": 0},
                 "monthly_data": [],
                 "open_pr_count": 0,
