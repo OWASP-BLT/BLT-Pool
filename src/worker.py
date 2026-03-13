@@ -3128,17 +3128,14 @@ def _html(html: str, status: int = 200) -> Response:
 # ---------------------------------------------------------------------------
 
 def _handle_mentors_list(request) -> Response:
-    """
-    GET /api/mentors
-    GET /api/mentors?status=available
-    GET /api/mentors?status=assigned
+    """Return the full list of mentors with optional status filtering.
 
-    Returns the full mentor pool as JSON, with optional status filtering.
-    Each mentor entry includes: name, github_username, slack_username,
-    project, mentee, and status.
+    Query params:
+        status (str, optional): Filter by 'available' or 'assigned'.
 
-    Sensitive fields (slack_username) are included only for transparency
-    within the OWASP BLT platform.
+    Returns:
+        Response: JSON with total, filtered, status_filter, and mentors array.
+        400 if an invalid status value is provided.
     """
     url = urlparse(str(request.url))
     params = {}
@@ -3183,11 +3180,13 @@ def _handle_mentors_list(request) -> Response:
 
 
 def _handle_mentor_detail(username: str) -> Response:
-    """
-    GET /api/mentors/{github_username}
+    """Return a single mentor by GitHub username (case-insensitive).
 
-    Returns a single mentor by GitHub username (case-insensitive).
-    Returns 404 if not found.
+    Args:
+        username (str): The GitHub username to look up.
+
+    Returns:
+        Response: JSON mentor object, or 404 if not found.
     """
     mentor = next(
         (m for m in MENTORS if (m.get("github_username") or "").lower() == username),
