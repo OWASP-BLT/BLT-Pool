@@ -3124,6 +3124,88 @@ def _html(html: str, status: int = 200) -> Response:
 
 
 # ---------------------------------------------------------------------------
+# Mentor API handlers
+# ---------------------------------------------------------------------------
+
+def _handle_mentors_list(request) -> Response:
+    """
+    GET /api/mentors
+    GET /api/mentors?status=available
+    GET /api/mentors?status=assigned
+
+    Returns the full mentor pool as JSON, with optional status filtering.
+    Each mentor entry includes: name, github_username, slack_username,
+    project, mentee, and status.
+
+    Sensitive fields (slack_username) are included only for transparency
+    within the OWASP BLT platform.
+    """
+    url = urlparse(str(request.url))
+    params = {}
+    if url.query:
+        for part in url.query.split("&"):
+            if "=" in part:
+                k, v = part.split("=", 1)
+                params[k.strip()] = v.strip()
+
+    status_filter = params.get("status", "").lower()
+    valid_statuses = {"available", "assigned"}
+
+    if status_filter and status_filter not in valid_statuses:
+        return _json(
+            {
+                "error": f"Invalid status filter '{status_filter}'. "
+                         f"Valid values: {sorted(valid_statuses)}"
+            },
+            400,
+        )
+
+    mentors = MENTORS
+    if status_filter:
+        mentors = [m for m in MENTORS if m.get("status", "").lower() == status_filter]
+
+    return _json({
+        "total": len(MENTORS),
+        "filtered": len(mentors),
+        "status_filter": status_filter or None,
+        "mentors": [
+            {
+                "name": m.get("name", ""),
+                "github_username": m.get("github_username", "") or None,
+                "slack_username": m.get("slack_username", "") or None,
+                "project": m.get("project") or None,
+                "mentee": m.get("mentee") or None,
+                "status": m.get("status", "available"),
+            }
+            for m in mentors
+        ],
+    })
+
+
+def _handle_mentor_detail(username: str) -> Response:
+    """
+    GET /api/mentors/{github_username}
+
+    Returns a single mentor by GitHub username (case-insensitive).
+    Returns 404 if not found.
+    """
+    mentor = next(
+        (m for m in MENTORS if (m.get("github_username") or "").lower() == username),
+        None,
+    )
+    if not mentor:
+        return _json({"error": f"Mentor '{username}' not found"}, 404)
+
+    return _json({
+        "name": mentor.get("name", ""),
+        "github_username": mentor.get("github_username", "") or None,
+        "slack_username": mentor.get("slack_username", "") or None,
+        "project": mentor.get("project") or None,
+        "mentee": mentor.get("mentee") or None,
+        "status": mentor.get("status", "available"),
+    })
+
+# ---------------------------------------------------------------------------
 # Main entry point — called by the Cloudflare runtime
 # ---------------------------------------------------------------------------
 
@@ -3141,6 +3223,12 @@ async def on_fetch(request, env) -> Response:
 
     if method == "GET" and path == "/health":
         return _json({"status": "ok", "service": "BLT-Pool"})
+    
+    if method == "GET" and path == "/api/mentors":
+        return _handle_mentors_list(request)
+    if method == "GET" and re.fullmatch(r"/api/mentors/[^/]+", path):
+        username = path.split("/")[-1].lower()
+        return _handle_mentor_detail(username)
 
     if method == "POST" and path == "/api/github/webhooks":
         return await handle_webhook(request, env)
