@@ -32,7 +32,7 @@ import os
 import re
 import time
 from typing import Optional, Tuple
-from urllib.parse import quote, urlparse
+from urllib.parse import parse_qs, quote, urlparse
 
 from js import Headers, Response, console, fetch  # Cloudflare Workers JS bindings
 from index_template import GITHUB_PAGE_HTML  # Landing page HTML template
@@ -4929,6 +4929,84 @@ def _html(html: str, status: int = 200) -> Response:
 
 
 # ---------------------------------------------------------------------------
+# Mentor API handlers
+# ---------------------------------------------------------------------------
+
+def _handle_mentors_list(request) -> Response:
+    """Return the full list of mentors with optional status filtering.
+
+    Query params:
+        status (str, optional): Filter by 'available' or 'assigned'.
+
+    Returns:
+        Response: JSON with total, filtered, status_filter, and mentors array.
+        400 if an invalid status value is provided.
+    """
+    url = urlparse(str(request.url))
+    params = {k: v[0] for k, v in parse_qs(url.query).items()}
+
+    status_filter = params.get("status", "").lower()
+    valid_statuses = {"available", "assigned"}
+
+    if status_filter and status_filter not in valid_statuses:
+        return _json(
+            {
+                "error": f"Invalid status filter '{status_filter}'. "
+                         f"Valid values: {sorted(valid_statuses)}"
+            },
+            400,
+        )
+
+    mentors = MENTORS
+    if status_filter:
+        mentors = [m for m in MENTORS if m.get("status", "").lower() == status_filter]
+
+    return _json({
+        "total": len(MENTORS),
+        "filtered": len(mentors),
+        "status_filter": status_filter or None,
+        "mentors": [
+            {
+                "name": m.get("name", ""),
+                "github_username": m.get("github_username", "") or None,
+                "status": m.get("status", "available"),
+                "specialties": m.get("specialties", []),
+                "max_mentees": m.get("max_mentees", 3),
+                "active": m.get("active", True),
+                "timezone": m.get("timezone") or None,
+            }
+            for m in mentors
+        ],
+    })
+
+
+def _handle_mentor_detail(username: str) -> Response:
+    """Return a single mentor by GitHub username (case-insensitive).
+
+    Args:
+        username (str): The GitHub username to look up.
+
+    Returns:
+        Response: JSON mentor object, or 404 if not found.
+    """
+    mentor = next(
+        (m for m in MENTORS if (m.get("github_username") or "").lower() == username),
+        None,
+    )
+    if not mentor:
+        return _json({"error": f"Mentor '{username}' not found"}, 404)
+
+    return _json({
+        "name": mentor.get("name", ""),
+        "github_username": mentor.get("github_username", "") or None,
+        "status": mentor.get("status", "available"),
+        "specialties": mentor.get("specialties", []),
+        "max_mentees": mentor.get("max_mentees", 3),
+        "active": mentor.get("active", True),
+        "timezone": mentor.get("timezone") or None,
+    })
+
+# ---------------------------------------------------------------------------
 # Main entry point — called by the Cloudflare runtime
 # ---------------------------------------------------------------------------
 
@@ -4959,6 +5037,12 @@ async def on_fetch(request, env) -> Response:
 
     if method == "GET" and path == "/health":
         return _json({"status": "ok", "service": "BLT-Pool"})
+    
+    if method == "GET" and path == "/api/mentors":
+        return _handle_mentors_list(request)
+    if method == "GET" and re.fullmatch(r"/api/mentors/[^/]+", path):
+        username = path.split("/")[-1].lower()
+        return _handle_mentor_detail(username)
 
     if method == "POST" and path == "/api/mentors":
         return await _handle_add_mentor(request, env)
