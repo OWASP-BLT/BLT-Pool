@@ -664,7 +664,7 @@ _INITIAL_MENTORS = [
     {
         "github_username": "shriyashsoni",
         "name": "Shriyash Soni",
-        "specialties": [],
+        "specialties": ["Blockchain", "Web3"],
         "max_mentees": 3,
         "active": True,
         "timezone": "",
@@ -673,7 +673,7 @@ _INITIAL_MENTORS = [
     {
         "github_username": "Mohammedfaiyaz29",
         "name": "Mohammed Faiyaz Shaikh",
-        "specialties": [],
+        "specialties": ["react-native", "UI/UX"],
         "max_mentees": 3,
         "active": True,
         "timezone": "",
@@ -682,7 +682,7 @@ _INITIAL_MENTORS = [
     {
         "github_username": "Vaswani2003",
         "name": "Vinamra Vaswani",
-        "specialties": [],
+        "specialties": ["backend", "python"],
         "max_mentees": 3,
         "active": True,
         "timezone": "",
@@ -691,7 +691,7 @@ _INITIAL_MENTORS = [
     {
         "github_username": "kittenbytes",
         "name": "Carla Voorhees",
-        "specialties": [],
+        "specialties": ["cybersecurity", "product-management"],
         "max_mentees": 3,
         "active": True,
         "timezone": "",
@@ -700,7 +700,7 @@ _INITIAL_MENTORS = [
     {
         "github_username": "Captain-T2004",
         "name": "Akshay Behl",
-        "specialties": [],
+        "specialties": ["full stack", "systems"],
         "max_mentees": 3,
         "active": True,
         "timezone": "",
@@ -709,7 +709,7 @@ _INITIAL_MENTORS = [
     {
         "github_username": "elsheik21",
         "name": "Ahmed ElSheik",
-        "specialties": [],
+        "specialties": ["cybersecurity", "Ai-Security"],
         "max_mentees": 3,
         "active": True,
         "timezone": "",
@@ -718,7 +718,7 @@ _INITIAL_MENTORS = [
     {
         "github_username": "Kunal1522",
         "name": "Kunal Kashyap",
-        "specialties": [],
+        "specialties": ["backend", "agentic-systems"],
         "max_mentees": 3,
         "active": True,
         "timezone": "",
@@ -727,7 +727,7 @@ _INITIAL_MENTORS = [
     {
         "github_username": "RudraBhaskar9439",
         "name": "Rudra Bhaskar",
-        "specialties": [],
+        "specialties": ["web3", "blockchain"],
         "max_mentees": 3,
         "active": True,
         "timezone": "",
@@ -745,7 +745,7 @@ _INITIAL_MENTORS = [
     {
         "github_username": "VedantAnand17",
         "name": "Vedant Anand",
-        "specialties": [],
+        "specialties": ["full stack", "web3"],
         "max_mentees": 3,
         "active": True,
         "timezone": "",
@@ -754,7 +754,7 @@ _INITIAL_MENTORS = [
     {
         "github_username": "Rishab87",
         "name": "Rishab Kumar Jha",
-        "specialties": [],
+        "specialties": ["full stack", "blockchain"],
         "max_mentees": 3,
         "active": True,
         "timezone": "",
