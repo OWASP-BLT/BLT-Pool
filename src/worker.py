@@ -3959,6 +3959,7 @@ def _generate_mentor_row(mentor: dict) -> str:
     """Generate HTML for a single mentor list row."""
     name = _html_mod.escape(mentor.get("name", "Unknown"))
     github = mentor.get("github_username", "")
+    slack = mentor.get("slack_username", "")
     specialties = mentor.get("specialties", [])
     max_mentees = mentor.get("max_mentees", 3)
     timezone = mentor.get("timezone", "")
@@ -3991,12 +3992,23 @@ def _generate_mentor_row(mentor: dict) -> str:
         else '<span class="text-gray-300"><i class="fa-brands fa-github" aria-hidden="true"></i></span>'
     )
 
+    slack_display = _html_mod.escape(slack[1:] if slack.startswith("@") else slack) if slack else ""
+    slack_cell = (
+        f'<a href="https://owaspblt.slack.com" target="_blank" rel="noopener" '
+        f'class="inline-flex items-center gap-1 text-xs text-gray-500 hover:text-[#E10101]" '
+        f'aria-label="{name} Slack profile">'
+        f'<i class="fa-brands fa-slack" aria-hidden="true"></i>'
+        f'<span>{slack_display}</span></a>'
+        if slack_display
+        else '<span class="text-xs text-gray-400">—</span>'
+    )
+
     tz_cell = f'<span class="text-xs text-gray-500">{_html_mod.escape(timezone)}</span>' if timezone else '<span class="text-xs text-gray-400">—</span>'
 
     return f'''
     <li class="flex items-center gap-4 rounded-xl border border-[#E5E5E5] bg-white px-4 py-3 transition hover:shadow-sm">
       <img src="{avatar_url}" alt="{name}" class="h-10 w-10 shrink-0 rounded-full border border-[#E5E5E5] bg-white object-cover">
-      <div class="min-w-0 flex-1 grid grid-cols-1 gap-1 sm:grid-cols-[1fr_auto_auto_auto_auto] sm:items-center sm:gap-4">
+      <div class="min-w-0 flex-1 grid grid-cols-1 gap-1 sm:grid-cols-[1fr_auto_auto_auto_auto_auto] sm:items-center sm:gap-4">
         <div class="min-w-0">
           <p class="truncate font-semibold text-[#111827] text-sm">{name}</p>
           <div class="mt-0.5 flex flex-wrap gap-1">{specialty_chips}</div>
@@ -4007,6 +4019,7 @@ def _generate_mentor_row(mentor: dict) -> str:
           <p class="text-sm font-semibold text-gray-700">{max_mentees}</p>
         </div>
         <div class="hidden sm:block">{tz_cell}</div>
+        <div class="hidden sm:block">{slack_cell}</div>
         <div>{github_link}</div>
       </div>
     </li>
@@ -4294,6 +4307,21 @@ def _index_html(mentors: list = None) -> str:
                  class="w-full rounded-md border border-gray-300 px-3 py-2 text-sm text-gray-900 placeholder:text-gray-400 focus:border-[#E10101] focus:ring-1 focus:ring-[#E10101] focus:outline-none">
         </div>
         <div class="sm:col-span-2">
+          <label for="mf-slack" class="mb-1 block text-sm font-semibold text-gray-700">
+            OWASP BLT Slack Username <span class="text-[#E10101]">*</span>
+          </label>
+          <p class="mb-1.5 text-xs text-gray-500">
+            Your username on the
+            <a href="https://join.slack.com/t/owaspblt/shared_invite/zt-3rstz26wj-WtlZFo5RXqT_9UwNYJeycw"
+               target="_blank" rel="noopener" class="text-[#E10101] hover:underline">
+              OWASP BLT Slack workspace
+            </a>.
+            Not a member yet? Join via the link and then enter your username here.
+          </p>
+          <input id="mf-slack" type="text" required placeholder="e.g. janedoe"
+                 class="w-full rounded-md border border-gray-300 px-3 py-2 text-sm text-gray-900 placeholder:text-gray-400 focus:border-[#E10101] focus:ring-1 focus:ring-[#E10101] focus:outline-none">
+        </div>
+        <div class="sm:col-span-2">
           <label for="mf-specialties" class="mb-1 block text-sm font-semibold text-gray-700">
             Specialties <span class="text-xs font-normal text-gray-400">(optional — comma-separated)</span>
           </label>
@@ -4336,13 +4364,14 @@ def _index_html(mentors: list = None) -> str:
             e.preventDefault();
             var name     = document.getElementById('mf-name').value.trim();
             var github   = document.getElementById('mf-github').value.trim().replace(/^@/, '');
+            var slack    = document.getElementById('mf-slack').value.trim();
             var specs    = document.getElementById('mf-specialties').value.trim();
             var maxM     = document.getElementById('mf-max').value.trim() || '3';
             var tz       = document.getElementById('mf-tz').value.trim();
             var referral = document.getElementById('mf-referral').value.trim().replace(/^@/, '');
             var errEl    = document.getElementById('mf-error');
-            if (!name || !github) {{
-              errEl.textContent = 'Display name and GitHub username are required.';
+            if (!name || !github || !slack) {{
+              errEl.textContent = 'Display name, GitHub username, and OWASP BLT Slack username are required.';
               errEl.classList.remove('hidden');
               return;
             }}
@@ -4352,6 +4381,7 @@ def _index_html(mentors: list = None) -> str:
               '',
               '- **Name**: ' + name,
               '- **GitHub Username**: @' + github,
+              '- **Slack Username**: ' + slack,
               '- **Specialties**: ' + (specs || '_none_'),
               '- **Max Mentees**: ' + maxM,
               '- **Timezone**: ' + (tz || '_not specified_'),

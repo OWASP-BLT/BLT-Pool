@@ -7,6 +7,8 @@
 # Each entry supports the following fields:
 #   github_username  - GitHub login (required for assignment)
 #   name             - Display name shown in assignment comments
+#   slack_username   - OWASP BLT Slack workspace username (https://owaspblt.slack.com)
+#                      Join the workspace: https://join.slack.com/t/owaspblt/shared_invite/zt-3rstz26wj-WtlZFo5RXqT_9UwNYJeycw
 #   specialties      - Optional list of area tags used to match issue labels
 #                      (e.g. frontend, backend, javascript, python, docs, security)
 #   max_mentees      - Maximum concurrent open mentee issues (default: 3)
@@ -25,6 +27,7 @@
 mentors:
   - github_username: rinkitadhana
     name: Rinkit Adhana
+    slack_username: Rinkit Adhana
     specialties:
       - frontend
       - javascript
@@ -34,6 +37,7 @@ mentors:
 
   - github_username: Rajgupta36
     name: Raj Gupta
+    slack_username: raj
     specialties:
       - backend
       - python
@@ -43,55 +47,66 @@ mentors:
 
   - github_username: shriyashsoni
     name: Shriyash Soni
+    slack_username: shriyash soni
     max_mentees: 3
     active: true
 
   - github_username: Mohammedfaiyaz29
     name: Mohammed Faiyaz Shaikh
+    slack_username: faiyaz
     max_mentees: 3
     active: true
 
   - github_username: Vaswani2003
     name: Vinamra Vaswani
+    slack_username: Vinamra
     max_mentees: 3
     active: true
 
   - github_username: kittenbytes
     name: Carla Voorhees
+    slack_username: Carla
     max_mentees: 3
     active: true
 
   - github_username: Captain-T2004
     name: Akshay Behl
+    slack_username: Akshay Behl
     max_mentees: 3
     active: true
 
   - github_username: elsheik21
     name: Ahmed ElSheik
+    slack_username: Ahmed ElSheik
     max_mentees: 3
     active: true
 
   - github_username: Kunal1522
     name: Kunal Kashyap
+    slack_username: Kunal
     max_mentees: 3
     active: true
 
   - github_username: RudraBhaskar9439
     name: Rudra Bhaskar
+    slack_username: Rudra9439
     max_mentees: 3
     active: true
 
   - github_username: dev-sanidhya
     name: Sanidhya Shishodia
+    slack_username: Sanidhya Shishodia
     max_mentees: 3
     active: true
 
   - github_username: VedantAnand17
     name: Vedant Anand
+    slack_username: Vedant Anand
     max_mentees: 3
     active: true
 
   - github_username: Rishab87
     name: Rishab Kumar Jha
+    slack_username: Rishab Kumar Jha
     max_mentees: 3
     active: true
