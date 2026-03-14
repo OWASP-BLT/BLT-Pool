@@ -30,7 +30,7 @@ import json
 import re
 import time
 from typing import Optional, Tuple
-from urllib.parse import quote, urlparse
+from urllib.parse import parse_qs, quote, urlparse
 
 from js import Headers, Response, console, fetch  # Cloudflare Workers JS bindings
 from index_template import GITHUB_PAGE_HTML  # Landing page HTML template
@@ -3138,12 +3138,7 @@ def _handle_mentors_list(request) -> Response:
         400 if an invalid status value is provided.
     """
     url = urlparse(str(request.url))
-    params = {}
-    if url.query:
-        for part in url.query.split("&"):
-            if "=" in part:
-                k, v = part.split("=", 1)
-                params[k.strip()] = v.strip()
+    params = {k: v[0] for k, v in parse_qs(url.query).items()}
 
     status_filter = params.get("status", "").lower()
     valid_statuses = {"available", "assigned"}
@@ -3173,6 +3168,9 @@ def _handle_mentors_list(request) -> Response:
                 "project": m.get("project") or None,
                 "mentee": m.get("mentee") or None,
                 "status": m.get("status", "available"),
+                "specialties": m.get("specialties", []),
+                "max_mentees": m.get("max_mentees", 3),
+                "active": m.get("active", True),
             }
             for m in mentors
         ],
