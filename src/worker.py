@@ -73,6 +73,10 @@ _SECONDS_PER_DAY = 86400
 # Worker environment variable ``MENTOR_AUTO_PR_REVIEWER_ENABLED=true``.
 MENTOR_AUTO_PR_REVIEWER_ENABLED = False
 
+# OWASP BLT Slack workspace invite URL.
+# Update this constant when the invite link is rotated.
+SLACK_INVITE_URL = "https://join.slack.com/t/owaspblt/shared_invite/zt-3rstz26wj-WtlZFo5RXqT_9UwNYJeycw"
+
 # Mentor pool for BLT-Pool platform
 MENTORS = [
     {
@@ -3959,7 +3963,7 @@ def _generate_mentor_row(mentor: dict) -> str:
     """Generate HTML for a single mentor list row."""
     name = _html_mod.escape(mentor.get("name", "Unknown"))
     github = mentor.get("github_username", "")
-    slack = mentor.get("slack_username", "")
+    slack = str(mentor.get("slack_username") or "")
     specialties = mentor.get("specialties", [])
     max_mentees = mentor.get("max_mentees", 3)
     timezone = mentor.get("timezone", "")
@@ -3996,7 +4000,7 @@ def _generate_mentor_row(mentor: dict) -> str:
     slack_cell = (
         f'<a href="https://owaspblt.slack.com" target="_blank" rel="noopener" '
         f'class="inline-flex items-center gap-1 text-xs text-gray-500 hover:text-[#E10101]" '
-        f'aria-label="{name} Slack profile">'
+        f'aria-label="Open OWASP BLT Slack workspace">'
         f'<i class="fa-brands fa-slack" aria-hidden="true"></i>'
         f'<span>{slack_display}</span></a>'
         if slack_display
@@ -4312,7 +4316,7 @@ def _index_html(mentors: list = None) -> str:
           </label>
           <p class="mb-1.5 text-xs text-gray-500">
             Your username on the
-            <a href="https://join.slack.com/t/owaspblt/shared_invite/zt-3rstz26wj-WtlZFo5RXqT_9UwNYJeycw"
+            <a href="{SLACK_INVITE_URL}"
                target="_blank" rel="noopener" class="text-[#E10101] hover:underline">
               OWASP BLT Slack workspace
             </a>.
@@ -4364,7 +4368,7 @@ def _index_html(mentors: list = None) -> str:
             e.preventDefault();
             var name     = document.getElementById('mf-name').value.trim();
             var github   = document.getElementById('mf-github').value.trim().replace(/^@/, '');
-            var slack    = document.getElementById('mf-slack').value.trim();
+            var slack    = document.getElementById('mf-slack').value.trim().replace(/^@/, '');
             var specs    = document.getElementById('mf-specialties').value.trim();
             var maxM     = document.getElementById('mf-max').value.trim() || '3';
             var tz       = document.getElementById('mf-tz').value.trim();

@@ -61,6 +61,7 @@ def parse_body(body: str) -> dict:
     """Extract mentor fields from the markdown-formatted issue body."""
     name = _parse_field(r"^\s*-\s*\*\*Name\*\*:\s*(.+)$", body)
     raw_username = _parse_field(r"^\s*-\s*\*\*GitHub Username\*\*:\s*@?(\S+)", body)
+    raw_slack = _parse_field(r"^\s*-\s*\*\*Slack Username\*\*:\s*(.+)$", body)
     raw_specialties = _parse_field(r"^\s*-\s*\*\*Specialties\*\*:\s*(.+)$", body)
     max_mentees_raw = _parse_field(r"^\s*-\s*\*\*Max Mentees\*\*:\s*(\d+)", body)
     timezone = _parse_field(r"^\s*-\s*\*\*Timezone\*\*:\s*(.+)$", body)
@@ -74,6 +75,11 @@ def parse_body(body: str) -> dict:
             timezone = ""
         if raw_referred_by.lower() == placeholder:
             raw_referred_by = ""
+        if raw_slack.lower() == placeholder:
+            raw_slack = ""
+
+    # Strip a single leading @ from slack username if present
+    slack_username = (raw_slack[1:] if raw_slack.startswith("@") else raw_slack).strip()
 
     # Strip leading @ from referred_by if present (single @ only)
     referred_by = (raw_referred_by[1:] if raw_referred_by.startswith("@") else raw_referred_by).strip()
@@ -98,6 +104,7 @@ def parse_body(body: str) -> dict:
     return {
         "name": name,
         "github_username": raw_username,
+        "slack_username": slack_username,
         "specialties": specialties,
         "max_mentees": max_mentees,
         "timezone": timezone,
@@ -121,6 +128,8 @@ def build_entry(fields: dict) -> str:
         f'  - github_username: {_yaml_quote(fields["github_username"])}',
         f'    name: {_yaml_quote(fields["name"])}',
     ]
+    if fields.get("slack_username"):
+        lines.append(f'    slack_username: {_yaml_quote(fields["slack_username"])}')
     if fields["specialties"]:
         lines.append("    specialties:")
         for tag in fields["specialties"]:

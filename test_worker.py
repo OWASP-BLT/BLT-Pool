@@ -3995,6 +3995,32 @@ class TestGenerateMentorRow(unittest.TestCase):
         html = _worker._generate_mentor_row(self._make_mentor(specialties=[]))
         self.assertIn("—", html)
 
+    def test_slack_username_shown(self):
+        html = _worker._generate_mentor_row(self._make_mentor(slack_username="janedoe"))
+        self.assertIn("janedoe", html)
+
+    def test_slack_username_xss_escaped(self):
+        html = _worker._generate_mentor_row(self._make_mentor(slack_username='<script>xss</script>'))
+        self.assertNotIn("<script>", html)
+        self.assertIn("&lt;script&gt;", html)
+
+    def test_slack_leading_at_stripped(self):
+        html = _worker._generate_mentor_row(self._make_mentor(slack_username="@janedoe"))
+        self.assertIn("janedoe", html)
+        # The raw @janedoe should not appear in the HTML
+        self.assertNotIn("@janedoe", html)
+
+    def test_slack_none_shows_dash(self):
+        html = _worker._generate_mentor_row(self._make_mentor(slack_username=None))
+        # Should not raise and should render a dash placeholder
+        self.assertIn("—", html)
+
+    def test_slack_missing_key_shows_dash(self):
+        mentor = self._make_mentor()
+        mentor.pop("slack_username", None)
+        html = _worker._generate_mentor_row(mentor)
+        self.assertIn("—", html)
+
 
 class TestIndexHtml(unittest.TestCase):
     """_index_html — homepage HTML generation."""

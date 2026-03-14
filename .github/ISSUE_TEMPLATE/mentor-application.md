@@ -11,6 +11,7 @@ labels: mentor-application
 
 - **Name**: Your Full Name
 - **GitHub Username**: @your-github-username
+- **Slack Username**: your-slack-username  <!-- your display name or handle on the OWASP BLT Slack workspace: https://join.slack.com/t/owaspblt/shared_invite/zt-3rstz26wj-WtlZFo5RXqT_9UwNYJeycw -->
 - **Specialties**: frontend, python  <!-- comma-separated, or delete this line if none -->
 - **Max Mentees**: 3  <!-- how many concurrent mentees you can handle (1–10) -->
 - **Timezone**: UTC+0  <!-- e.g. UTC+5:30, or delete this line -->

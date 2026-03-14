@@ -7,8 +7,9 @@
 # Each entry supports the following fields:
 #   github_username  - GitHub login (required for assignment)
 #   name             - Display name shown in assignment comments
-#   slack_username   - OWASP BLT Slack workspace username (https://owaspblt.slack.com)
+#   slack_username   - OWASP BLT Slack workspace display name or handle (https://owaspblt.slack.com)
 #                      Join the workspace: https://join.slack.com/t/owaspblt/shared_invite/zt-3rstz26wj-WtlZFo5RXqT_9UwNYJeycw
+#                      Can be a handle (e.g. janedoe) or a display name (e.g. Jane Doe).
 #   specialties      - Optional list of area tags used to match issue labels
 #                      (e.g. frontend, backend, javascript, python, docs, security)
 #   max_mentees      - Maximum concurrent open mentee issues (default: 3)
