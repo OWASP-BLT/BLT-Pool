@@ -660,6 +660,15 @@ async def _ensure_leaderboard_schema(db) -> None:
         )
         """,
     )
+    # Migrations: add commits and comments columns to existing tables.
+    try:
+        await _d1_run(db, "ALTER TABLE mentor_stats_cache ADD COLUMN commits INTEGER NOT NULL DEFAULT 0")
+    except Exception:
+        pass  # Column already exists — ignore the error.
+    try:
+        await _d1_run(db, "ALTER TABLE mentor_stats_cache ADD COLUMN comments INTEGER NOT NULL DEFAULT 0")
+    except Exception:
+        pass  # Column already exists — ignore the error.
     await _populate_mentors_table(db)
 
 
@@ -2449,8 +2458,8 @@ async def _load_mentors_local(env=None) -> list:
     return []
 
 
-async def _fetch_mentor_stats_from_d1(env, org: str, mentors: Optional[list] = None, token: str = "") -> dict:
-    """Return per-mentor all-time PR/review totals for homepage display.
+async def _fetch_mentor_stats_from_d1(env, org: str, mentors: Optional[list] = None, token: str = "", force_refresh: bool = False) -> dict:
+    """Return per-mentor all-time PR/review/commit/comment totals for homepage display.
 
     When ``mentors`` and ``token`` are provided, fetches accurate all-time
     counts directly from the GitHub Search API (using ``total_count``), caching
@@ -2458,10 +2467,14 @@ async def _fetch_mentor_stats_from_d1(env, org: str, mentors: Optional[list] = N
     reflects the full lifespan of the organisation rather than only the period
     since the webhook was first deployed.
 
+    When ``force_refresh`` is ``True``, the cache is bypassed and all stats are
+    re-fetched from the GitHub API unconditionally.
+
     Falls back to aggregating ``leaderboard_monthly_stats`` across all months
     when no GitHub token is available or D1 is not configured.
 
-    Returns a mapping of ``github_username → {"merged_prs": int, "reviews": int}``.
+    Returns a mapping of ``github_username → {"merged_prs": int, "reviews": int,
+    "commits": int, "comments": int}``.
     Returns ``{}`` when D1 is unavailable and the GitHub API path is not used.
     """
     db = _d1_binding(env)
@@ -2478,7 +2491,7 @@ async def _fetch_mentor_stats_from_d1(env, org: str, mentors: Optional[list] = N
             # Load all cached stats for this org in one query.
             cached_rows = await _d1_all(
                 db,
-                "SELECT github_username, merged_prs, reviews, fetched_at FROM mentor_stats_cache WHERE org = ?",
+                "SELECT github_username, merged_prs, reviews, commits, comments, fetched_at FROM mentor_stats_cache WHERE org = ?",
                 (org,),
             )
             cache = {
@@ -2493,17 +2506,21 @@ async def _fetch_mentor_stats_from_d1(env, org: str, mentors: Optional[list] = N
                 if not username:
                     continue
                 cached = cache.get(username)
-                if cached and int(cached.get("fetched_at") or 0) >= fresh_cutoff:
+                if not force_refresh and cached and int(cached.get("fetched_at") or 0) >= fresh_cutoff:
                     # Cache hit — return stored values directly.
                     stats[username] = {
                         "merged_prs": int(cached.get("merged_prs") or 0),
                         "reviews": int(cached.get("reviews") or 0),
+                        "commits": int(cached.get("commits") or 0),
+                        "comments": int(cached.get("comments") or 0),
                     }
                     continue
 
                 # Cache miss or stale — fetch from GitHub Search API.
                 merged_prs = 0
                 reviews = 0
+                commits = 0
+                comments = 0
                 safe_org = quote(org, safe="")
                 safe_user = quote(username, safe="")
                 try:
@@ -2528,22 +2545,46 @@ async def _fetch_mentor_stats_from_d1(env, org: str, mentors: Optional[list] = N
                         reviews = int(rev_data.get("total_count") or 0)
                 except Exception as exc:
                     console.error(f"[MentorPool] GitHub review count failed for {username}: {exc}")
+                try:
+                    commit_resp = await github_api(
+                        "GET",
+                        f"/search/commits?q=org:{safe_org}+author:{safe_user}&per_page=1",
+                        token,
+                    )
+                    if commit_resp.status == 200:
+                        commit_data = json.loads(await commit_resp.text())
+                        commits = int(commit_data.get("total_count") or 0)
+                except Exception as exc:
+                    console.error(f"[MentorPool] GitHub commit count failed for {username}: {exc}")
+                try:
+                    comment_resp = await github_api(
+                        "GET",
+                        f"/search/issues?q=org:{safe_org}+commenter:{safe_user}+-author:{safe_user}&per_page=1",
+                        token,
+                    )
+                    if comment_resp.status == 200:
+                        comment_data = json.loads(await comment_resp.text())
+                        comments = int(comment_data.get("total_count") or 0)
+                except Exception as exc:
+                    console.error(f"[MentorPool] GitHub comment count failed for {username}: {exc}")
 
-                stats[username] = {"merged_prs": merged_prs, "reviews": reviews}
+                stats[username] = {"merged_prs": merged_prs, "reviews": reviews, "commits": commits, "comments": comments}
 
                 # Persist into cache for future requests.
                 try:
                     await _d1_run(
                         db,
                         """
-                        INSERT INTO mentor_stats_cache (org, github_username, merged_prs, reviews, fetched_at)
-                        VALUES (?, ?, ?, ?, ?)
+                        INSERT INTO mentor_stats_cache (org, github_username, merged_prs, reviews, commits, comments, fetched_at)
+                        VALUES (?, ?, ?, ?, ?, ?, ?)
                         ON CONFLICT(org, github_username) DO UPDATE SET
                             merged_prs = excluded.merged_prs,
                             reviews    = excluded.reviews,
+                            commits    = excluded.commits,
+                            comments   = excluded.comments,
                             fetched_at = excluded.fetched_at
                         """,
-                        (org, username, merged_prs, reviews, now_ts),
+                        (org, username, merged_prs, reviews, commits, comments, now_ts),
                     )
                 except Exception as exc:
                     console.error(f"[MentorPool] Failed to cache mentor stats for {username}: {exc}")
@@ -4601,10 +4642,20 @@ def _generate_mentor_row(mentor: dict, stats: Optional[dict] = None) -> str:
     if stats:
         merged_prs = int(stats.get("merged_prs") or 0)
         reviews = int(stats.get("reviews") or 0)
+        commits = int(stats.get("commits") or 0)
+        comments = int(stats.get("comments") or 0)
         stats_desktop = (
             f'<div class="text-center">'
             f'  <p class="text-xs text-gray-400 leading-none">PRs</p>'
             f'  <p class="text-sm font-semibold text-gray-700">{merged_prs}</p>'
+            f'</div>'
+            f'<div class="text-center">'
+            f'  <p class="text-xs text-gray-400 leading-none">Commits</p>'
+            f'  <p class="text-sm font-semibold text-gray-700">{commits}</p>'
+            f'</div>'
+            f'<div class="text-center">'
+            f'  <p class="text-xs text-gray-400 leading-none">Comments</p>'
+            f'  <p class="text-sm font-semibold text-gray-700">{comments}</p>'
             f'</div>'
             f'<div class="text-center">'
             f'  <p class="text-xs text-gray-400 leading-none">Reviews</p>'
@@ -4615,9 +4666,13 @@ def _generate_mentor_row(mentor: dict, stats: Optional[dict] = None) -> str:
             f'<span class="text-xs text-gray-500">'
             f'<i class="fa-solid fa-code-pull-request text-gray-400" aria-hidden="true"></i> {merged_prs} PRs</span>'
             f'<span class="text-xs text-gray-500">'
+            f'<i class="fa-solid fa-code-commit text-gray-400" aria-hidden="true"></i> {commits} commits</span>'
+            f'<span class="text-xs text-gray-500">'
+            f'<i class="fa-solid fa-comment text-gray-400" aria-hidden="true"></i> {comments} comments</span>'
+            f'<span class="text-xs text-gray-500">'
             f'<i class="fa-solid fa-magnifying-glass-chart text-gray-400" aria-hidden="true"></i> {reviews} reviews</span>'
         )
-        desktop_cols = "sm:grid-cols-[1fr_auto_auto_auto_auto_auto_auto]"
+        desktop_cols = "sm:grid-cols-[1fr_auto_auto_auto_auto_auto_auto_auto_auto]"
     else:
         stats_desktop = ""
         stats_mobile = ""
@@ -4949,12 +5004,24 @@ def _index_html(mentors: list = None, mentor_stats: Optional[dict] = None, activ
         </div>
         <ul class="space-y-2" aria-label="Mentor list">
           <!-- Header row (desktop) -->
-          <li class="hidden sm:grid sm:grid-cols-[1fr_auto_auto_auto_auto] sm:items-center sm:gap-4 sm:px-4 sm:py-1 text-xs font-semibold uppercase tracking-wide text-gray-400">
+          <li class="hidden sm:grid sm:grid-cols-[1fr_auto_auto_auto_auto_auto_auto_auto_auto] sm:items-center sm:gap-4 sm:px-4 sm:py-1 text-xs font-semibold uppercase tracking-wide text-gray-400">
             <span>Mentor</span>
             <span>Status</span>
             <span class="text-center">Cap</span>
+            <span class="text-center">PRs</span>
+            <span class="text-center">Commits</span>
+            <span class="text-center">Comments</span>
+            <span class="text-center">Reviews</span>
             <span>Timezone</span>
-            <span>Link</span>
+            <span class="flex items-center gap-2">Link
+              <button id="refresh-stats-btn"
+                onclick="refreshMentorStats(this)"
+                title="Refresh all mentor stats"
+                class="inline-flex items-center gap-1 rounded-md border border-gray-200 bg-white px-2 py-0.5 text-xs font-semibold text-gray-500 hover:bg-gray-50 hover:text-[#E10101] transition-colors normal-case tracking-normal">
+                <i class="fa-solid fa-arrows-rotate" aria-hidden="true"></i>
+                <span id="refresh-stats-label">Refresh Stats</span>
+              </button>
+            </span>
           </li>
           {mentor_rows_html}
         </ul>
@@ -5249,6 +5316,40 @@ def _index_html(mentors: list = None, mentor_stats: Optional[dict] = None, activ
     </div>
   </footer>
 
+  <script>
+    function refreshMentorStats(btn) {{
+      var label = document.getElementById('refresh-stats-label');
+      var icon = btn.querySelector('i');
+      btn.disabled = true;
+      label.textContent = 'Refreshing\u2026';
+      icon.classList.add('animate-spin');
+      fetch('/api/refresh-mentor-stats', {{ method: 'POST' }})
+        .then(function(r) {{ return r.json(); }})
+        .then(function(data) {{
+          if (data && data.ok) {{
+            label.textContent = 'Done!';
+            icon.classList.remove('animate-spin');
+            setTimeout(function() {{ window.location.reload(); }}, 800);
+          }} else {{
+            label.textContent = 'Error';
+            icon.classList.remove('animate-spin');
+            btn.disabled = false;
+            setTimeout(function() {{
+              label.textContent = 'Refresh Stats';
+            }}, 3000);
+          }}
+        }})
+        .catch(function() {{
+          label.textContent = 'Error';
+          icon.classList.remove('animate-spin');
+          btn.disabled = false;
+          setTimeout(function() {{
+            label.textContent = 'Refresh Stats';
+          }}, 3000);
+        }});
+    }}
+  </script>
+
 </body>
 </html>'''
 
@@ -5419,6 +5520,36 @@ def _html(html: str, status: int = 200) -> Response:
 # ---------------------------------------------------------------------------
 
 
+async def _handle_refresh_mentor_stats(request, env) -> "Response":
+    """POST /api/refresh-mentor-stats — force-refresh all mentor stats from GitHub.
+
+    Bypasses the D1 cache and re-fetches PR, commit, comment, and review counts
+    for every mentor from the GitHub Search API.  Results are written back to the
+    ``mentor_stats_cache`` table so the next homepage load reflects up-to-date data.
+
+    Returns JSON ``{"ok": true, "refreshed": <count>}`` on success or an error
+    object on failure.
+    """
+    org = getattr(env, "GITHUB_ORG", "OWASP-BLT")
+    token = getattr(env, "GITHUB_TOKEN", "")
+    if not token:
+        return _json({"error": "GitHub token not configured; cannot refresh stats"}, 503)
+    db = _d1_binding(env)
+    if not db:
+        return _json({"error": "No D1 binding available"}, 500)
+    try:
+        mentors = await _load_mentors_local(env)
+    except Exception as exc:
+        console.error(f"[MentorPool] refresh-mentor-stats: failed to load mentors: {exc}")
+        return _json({"error": "Failed to load mentor list"}, 500)
+    try:
+        stats = await _fetch_mentor_stats_from_d1(env, org, mentors=mentors, token=token, force_refresh=True)
+    except Exception as exc:
+        console.error(f"[MentorPool] refresh-mentor-stats: fetch failed: {exc}")
+        return _json({"error": "Failed to refresh mentor stats"}, 500)
+    return _json({"ok": True, "refreshed": len(stats)})
+
+
 async def on_fetch(request, env) -> Response:
     method = request.method
     path = urlparse(str(request.url)).path.rstrip("/") or "/"
@@ -5474,6 +5605,9 @@ async def on_fetch(request, env) -> Response:
 
     if method == "POST" and path == "/api/mentors":
         return await _handle_add_mentor(request, env)
+
+    if method == "POST" and path == "/api/refresh-mentor-stats":
+        return await _handle_refresh_mentor_stats(request, env)
 
     if method == "POST" and path == "/api/github/webhooks":
         return await handle_webhook(request, env)
