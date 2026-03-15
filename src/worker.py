@@ -5750,6 +5750,14 @@ async def _handle_login_github(request, env) -> "Response":
             503,
         )
 
+    # Build the redirect_uri from APP_BASE_URL env var, falling back to the
+    # origin of the incoming request so the callback always points back here.
+    app_base_url = (getattr(env, "APP_BASE_URL", "") or "").rstrip("/")
+    if not app_base_url:
+        parsed = urlparse(str(request.url))
+        app_base_url = f"{parsed.scheme}://{parsed.netloc}"
+    redirect_uri = f"{app_base_url}/oauth/callback"
+
     # Generate a random, HMAC-signed state token (256-bit random base).
     raw_state = base64.b64encode(os.urandom(32)).decode().rstrip("=")
     secret = _cookie_signing_secret(env)
@@ -5758,6 +5766,7 @@ async def _handle_login_github(request, env) -> "Response":
     github_auth_url = (
         "https://github.com/login/oauth/authorize"
         f"?client_id={quote(client_id)}"
+        f"&redirect_uri={quote(redirect_uri)}"
         f"&state={quote(signed_state)}"
         f"&scope={quote(_OAUTH_SCOPE)}"
     )
@@ -5822,6 +5831,13 @@ async def _handle_oauth_callback(request, env) -> "Response":
         )
 
     # Exchange the code for an access token.
+    # Include redirect_uri to satisfy GitHub's strict matching requirement.
+    app_base_url = (getattr(env, "APP_BASE_URL", "") or "").rstrip("/")
+    if not app_base_url:
+        parsed_cb = urlparse(str(request.url))
+        app_base_url = f"{parsed_cb.scheme}://{parsed_cb.netloc}"
+    redirect_uri = f"{app_base_url}/oauth/callback"
+
     token_resp = await fetch(
         "https://github.com/login/oauth/access_token",
         method="POST",
@@ -5834,6 +5850,7 @@ async def _handle_oauth_callback(request, env) -> "Response":
             "client_id": client_id,
             "client_secret": client_secret,
             "code": code,
+            "redirect_uri": redirect_uri,
         }),
     )
 

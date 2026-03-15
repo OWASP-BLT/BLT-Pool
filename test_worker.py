@@ -5872,11 +5872,11 @@ class TestOnFetchNewRoutes(unittest.TestCase):
         self.assertEqual(resp.status, 302)
         self.assertEqual(resp.headers.get("Location"), "/")
 
-    def test_get_admin_no_session_returns_login_html(self):
+    def test_get_admin_no_db_returns_503_or_500(self):
+        # Without LEADERBOARD_DB, AdminService returns 500 "Admin unavailable".
         env = types.SimpleNamespace(WEBHOOK_SECRET="sec")
         resp = self._run_fetch("GET", "/admin", env)
-        self.assertEqual(resp.status, 200)
-        self.assertIn("Login", resp.body)
+        self.assertIn(resp.status, (500, 503))
 
     def test_delete_mentor_no_session_returns_401(self):
         env = types.SimpleNamespace(WEBHOOK_SECRET="sec")

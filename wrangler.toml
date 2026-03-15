@@ -21,6 +21,10 @@ directory = "./public"
 # BLT API base URL
 BLT_API_URL = "https://github-app.owaspblt.org"
 
+# Public base URL of this Worker — used to build the OAuth redirect_uri.
+# Must match the "Authorization callback URL" configured in the GitHub OAuth App.
+APP_BASE_URL = "https://a3768ef6-blt-github-app.della-cloudflare-4a1.workers.dev"
+
 # GitHub organization — used for D1 leaderboard and mentor stats queries.
 GITHUB_ORG = "OWASP-BLT"
 
