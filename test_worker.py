@@ -4908,24 +4908,29 @@ class TestHandleAddMentor(unittest.TestCase):
         )
         return req
 
-    def _run_add(self, body: dict, db_raises=False):
+    def _run_add(self, body: dict, db_raises=False, already_exists=False, gh_user_exists=True):
         req = self._make_post_request(body)
         env = types.SimpleNamespace()
         captured = {}
 
         async def _inner():
+            import contextlib
             mock_db = MagicMock()
-            with patch.object(_worker, "_d1_binding", return_value=mock_db):
-                with patch.object(_worker, "_ensure_leaderboard_schema", new=AsyncMock()):
-                    if db_raises:
-                        with patch.object(_worker, "_d1_add_mentor", new=AsyncMock(side_effect=RuntimeError("db error"))):
-                            with patch.object(_worker, "console", new=types.SimpleNamespace(error=lambda *a: None, log=lambda *a: None)):
-                                resp = await _worker._handle_add_mentor(req, env)
-                    else:
-                        with patch.object(_worker, "_d1_add_mentor", new=AsyncMock()) as mock_add:
-                            with patch.object(_worker, "console", new=types.SimpleNamespace(error=lambda *a: None, log=lambda *a: None)):
-                                resp = await _worker._handle_add_mentor(req, env)
-                            captured["add_args"] = mock_add.call_args
+            mock_fetch_response = types.SimpleNamespace(status=200 if gh_user_exists else 404)
+            mock_existing = [{"github_username": body.get("github_username", "").lstrip("@")}] if already_exists else []
+            add_mock = AsyncMock(side_effect=RuntimeError("db error")) if db_raises else AsyncMock()
+
+            with contextlib.ExitStack() as stack:
+                stack.enter_context(patch.object(_worker, "_d1_binding", return_value=mock_db))
+                stack.enter_context(patch.object(_worker, "_ensure_leaderboard_schema", new=AsyncMock()))
+                stack.enter_context(patch.object(_worker, "fetch", new=AsyncMock(return_value=mock_fetch_response)))
+                stack.enter_context(patch.object(_worker, "_d1_all", new=AsyncMock(return_value=mock_existing)))
+                stack.enter_context(patch.object(_worker, "console", new=types.SimpleNamespace(error=lambda *a: None, log=lambda *a: None)))
+                stack.enter_context(patch.object(_worker, "_d1_add_mentor", new=add_mock))
+                resp = await _worker._handle_add_mentor(req, env)
+
+            if not db_raises:
+                captured["add_args"] = add_mock.call_args
             return resp
 
         return _run(_inner()), captured
@@ -4960,6 +4965,22 @@ class TestHandleAddMentor(unittest.TestCase):
         import json as _json
         data = _json.loads(resp.body)
         self.assertEqual(data["github_username"], "janedoe")
+
+    def test_nonexistent_github_user_returns_400(self):
+        """If the GitHub username does not exist on GitHub, return 400."""
+        resp, _ = self._run_add({"name": "Ghost User", "github_username": "this-user-definitely-does-not-exist-xyz"}, gh_user_exists=False)
+        self.assertEqual(resp.status, 400)
+        import json as _json
+        data = _json.loads(resp.body)
+        self.assertIn("does not exist", data["error"])
+
+    def test_duplicate_mentor_returns_409(self):
+        """If the github_username is already in the mentor pool, return 409 Conflict."""
+        resp, _ = self._run_add({"name": "Jane Doe", "github_username": "janedoe"}, already_exists=True)
+        self.assertEqual(resp.status, 409)
+        import json as _json
+        data = _json.loads(resp.body)
+        self.assertIn("already in the mentor pool", data["error"])
 
 
 if __name__ == "__main__":
