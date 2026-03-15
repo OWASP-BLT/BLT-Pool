@@ -35,8 +35,8 @@ GITHUB_APP_SLUG = "blt-github-app"
 # APP_ID               — GitHub App numeric ID
 # PRIVATE_KEY          — GitHub App private key (full PEM, PKCS#1 or PKCS#8)
 # WEBHOOK_SECRET       — GitHub App webhook secret
-# GITHUB_CLIENT_ID     — OAuth client ID     (optional)
-# GITHUB_CLIENT_SECRET — OAuth client secret (optional)
+# GITHUB_CLIENT_ID     — OAuth client ID     (required for /admin login)
+# GITHUB_CLIENT_SECRET — OAuth client secret (required for /admin login)
 # ADMIN_SECRET         — Bearer token for POST /admin/reset-leaderboard-month (optional)
 
 
