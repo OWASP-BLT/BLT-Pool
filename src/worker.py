@@ -5521,7 +5521,7 @@ def _admin_html(username: str, avatar_url: str, mentors: list) -> str:
       if (!confirm('Delete mentor @' + username + '? This cannot be undone.')) return;
 
       btn.disabled = true;
-      btn.textContent = 'Deleting\u2026';
+      btn.textContent = 'Deleting\u2026';  // horizontal ellipsis
 
       try {{
         const res = await fetch('/api/mentors/' + encodeURIComponent(username), {{
@@ -5651,8 +5651,8 @@ async def _handle_login_github(request, env) -> "Response":
             503,
         )
 
-    # Generate a random, HMAC-signed state token.
-    raw_state = base64.b64encode(os.urandom(16)).decode().rstrip("=")
+    # Generate a random, HMAC-signed state token (256-bit random base).
+    raw_state = base64.b64encode(os.urandom(32)).decode().rstrip("=")
     secret = _cookie_signing_secret(env)
     signed_state = f"{raw_state}.{_hmac_sign(raw_state, secret)}"
 
@@ -5699,13 +5699,26 @@ async def _handle_oauth_callback(request, env) -> "Response":
     if not code:
         return _html("<h1>Bad Request</h1><p>Missing OAuth code.</p>", 400)
 
-    # Verify the CSRF state — compare signed state from cookie with URL param.
+    # Verify the CSRF state:
+    # 1. The signed_state cookie must match the URL parameter (cookie-to-param binding).
+    # 2. The HMAC signature embedded in the state must be authentic (server-generated).
     cookies = _parse_cookies(request)
     stored_state = cookies.get(_OAUTH_STATE_COOKIE, "")
     if not stored_state or not _hmac.compare_digest(stored_state, state):
         return _html(
             "<h1>Bad Request</h1>"
             "<p>OAuth state mismatch — possible CSRF. Please try again.</p>",
+            400,
+        )
+    # Validate the HMAC signature embedded in the state token itself.
+    raw_state_part, _, state_sig = state.rpartition(".")
+    if not raw_state_part or not state_sig:
+        return _html("<h1>Bad Request</h1><p>Malformed OAuth state.</p>", 400)
+    secret = _cookie_signing_secret(env)
+    if not _hmac.compare_digest(state_sig, _hmac_sign(raw_state_part, secret)):
+        return _html(
+            "<h1>Bad Request</h1>"
+            "<p>OAuth state signature invalid — possible CSRF. Please try again.</p>",
             400,
         )
 

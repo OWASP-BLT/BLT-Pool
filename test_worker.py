@@ -5377,6 +5377,15 @@ class TestHandleOAuthCallback(unittest.TestCase):
         resp = self._run_callback(env, req)
         self.assertEqual(resp.status, 400)
 
+    def test_invalid_state_hmac_returns_400(self):
+        """State whose HMAC signature was forged must be rejected."""
+        env = self._make_env()
+        # Build a state where cookie and URL param match but signature is wrong.
+        bad_state = "somepayload.badsignature0000000000000000000000000000000000000000000"
+        req = self._make_request(env, state=bad_state, cookie_state=bad_state)
+        resp = self._run_callback(env, req)
+        self.assertEqual(resp.status, 400)
+
     def test_missing_client_credentials_returns_503(self):
         env = self._make_env(client_id="", client_secret="")
         req = self._make_request(env)
