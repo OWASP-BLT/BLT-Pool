@@ -458,7 +458,6 @@ async def _d1_run(db, sql: str, params: tuple = ()):
         if params:
             stmt = stmt.bind(*params)
         result = await stmt.run()
-        console.log(f"[D1.run] Executed: {sql[:60]}...")
         return result
     except Exception as e:
         console.error(f"[D1.run] Error executing {sql[:60]}: {e}")
@@ -613,10 +612,19 @@ async def _ensure_leaderboard_schema(db) -> None:
             issue_repo TEXT NOT NULL,
             issue_number INTEGER NOT NULL,
             assigned_at INTEGER NOT NULL,
+            mentee_login TEXT NOT NULL DEFAULT '',
             PRIMARY KEY (org, issue_repo, issue_number)
         )
         """,
     )
+    # Migration: add mentee_login column to existing tables that pre-date this field.
+    try:
+        await _d1_run(
+            db,
+            "ALTER TABLE mentor_assignments ADD COLUMN mentee_login TEXT NOT NULL DEFAULT ''",
+        )
+    except Exception:
+        pass  # Column already exists — ignore the error.
     await _d1_run(
         db,
         """
@@ -890,7 +898,7 @@ async def _d1_add_mentor(
 
 
 async def _d1_record_mentor_assignment(
-    db, org: str, mentor_login: str, repo: str, issue_number: int
+    db, org: str, mentor_login: str, repo: str, issue_number: int, mentee_login: str = ""
 ) -> None:
     """Upsert a mentor→issue assignment into D1 for load-map tracking."""
     now = int(time.time())
@@ -898,13 +906,14 @@ async def _d1_record_mentor_assignment(
         await _d1_run(
             db,
             """
-            INSERT INTO mentor_assignments (org, mentor_login, issue_repo, issue_number, assigned_at)
-            VALUES (?, ?, ?, ?, ?)
+            INSERT INTO mentor_assignments (org, mentor_login, issue_repo, issue_number, assigned_at, mentee_login)
+            VALUES (?, ?, ?, ?, ?, ?)
             ON CONFLICT(org, issue_repo, issue_number) DO UPDATE SET
                 mentor_login = excluded.mentor_login,
+                mentee_login = excluded.mentee_login,
                 assigned_at  = excluded.assigned_at
             """,
-            (org, mentor_login, repo, issue_number, now),
+            (org, mentor_login, repo, issue_number, now, mentee_login),
         )
         console.log(f"[D1] Recorded mentor assignment: @{mentor_login} → {org}/{repo}#{issue_number}")
     except Exception as exc:
@@ -950,14 +959,14 @@ async def _d1_get_mentor_loads(db, org: str) -> dict:
 async def _d1_get_active_assignments(db, org: str) -> list:
     """Return all active mentor assignments from D1 for the given org.
 
-    Returns a list of dicts with keys: org, mentor_login, issue_repo, issue_number, assigned_at.
+    Returns a list of dicts with keys: org, mentor_login, mentee_login, issue_repo, issue_number, assigned_at.
     Returns an empty list when D1 is unavailable or the query fails.
     """
     try:
         rows = await _d1_all(
             db,
             """
-            SELECT org, mentor_login, issue_repo, issue_number, assigned_at
+            SELECT org, mentor_login, mentee_login, issue_repo, issue_number, assigned_at
             FROM mentor_assignments
             WHERE org = ?
             ORDER BY assigned_at DESC
@@ -968,6 +977,7 @@ async def _d1_get_active_assignments(db, org: str) -> list:
             {
                 "org": row.get("org", org),
                 "mentor_login": row.get("mentor_login", ""),
+                "mentee_login": row.get("mentee_login", ""),
                 "issue_repo": row.get("issue_repo", ""),
                 "issue_number": int(row.get("issue_number") or 0),
                 "assigned_at": int(row.get("assigned_at") or 0),
@@ -978,6 +988,61 @@ async def _d1_get_active_assignments(db, org: str) -> list:
     except Exception as exc:
         console.error(f"[D1] Failed to get active assignments: {exc}")
         return []
+
+
+def _time_ago(ts: int) -> str:
+    """Return a human-readable 'X time ago' string for a Unix timestamp."""
+    diff = int(time.time()) - ts
+    if diff < 60:
+        return "just now"
+    if diff < 3600:
+        m = diff // 60
+        return f"{m} minute{'s' if m != 1 else ''} ago"
+    if diff < 86400:
+        h = diff // 3600
+        return f"{h} hour{'s' if h != 1 else ''} ago"
+    if diff < 86400 * 30:
+        d = diff // 86400
+        return f"{d} day{'s' if d != 1 else ''} ago"
+    if diff < 86400 * 365:
+        mo = diff // (86400 * 30)
+        return f"{mo} month{'s' if mo != 1 else ''} ago"
+    y = diff // (86400 * 365)
+    return f"{y} year{'s' if y != 1 else ''} ago"
+
+
+async def _d1_get_user_comment_totals(db, org: str, logins: list) -> dict:
+    """Return total all-time comment counts per user from leaderboard_monthly_stats.
+
+    Args:
+        db:     D1 database binding.
+        org:    GitHub organisation name.
+        logins: List of GitHub usernames to look up.
+
+    Returns a ``{login: total_comments}`` mapping.  Missing users default to 0.
+    """
+    if not logins:
+        return {}
+    try:
+        placeholders = ",".join("?" for _ in logins)
+        rows = await _d1_all(
+            db,
+            f"""
+            SELECT user_login, COALESCE(SUM(comments), 0) AS total_comments
+            FROM leaderboard_monthly_stats
+            WHERE org = ? AND user_login IN ({placeholders})
+            GROUP BY user_login
+            """,
+            (org, *logins),
+        )
+        return {
+            row["user_login"]: int(row.get("total_comments") or 0)
+            for row in rows
+            if row.get("user_login")
+        }
+    except Exception as exc:
+        console.error(f"[D1] Failed to get user comment totals: {exc}")
+        return {}
 
 
 async def _d1_inc_open_pr(db, org: str, user_login: str, delta: int) -> None:
@@ -1216,13 +1281,6 @@ async def _calculate_leaderboard_stats_from_d1(owner: str, env) -> Optional[dict
     await _ensure_leaderboard_schema(db)
     mk = _month_key()
     start_timestamp, end_timestamp = _month_window(mk)
-
-    # DEBUG: Check if there's ANY data in the tables
-    all_monthly = await _d1_all(db, "SELECT COUNT(*) as cnt FROM leaderboard_monthly_stats", ())
-    all_open = await _d1_all(db, "SELECT COUNT(*) as cnt FROM leaderboard_open_prs", ())
-    total_monthly = all_monthly[0].get('cnt') if all_monthly else 0
-    total_open = all_open[0].get('cnt') if all_open else 0
-    console.log(f"[D1] DEBUG: Total rows in DB: monthly_stats={total_monthly}, open_prs={total_open}")
 
     monthly_rows = await _d1_all(
         db,
@@ -2862,7 +2920,7 @@ async def _assign_mentor_to_issue(
     if db:
         try:
             await _ensure_leaderboard_schema(db)
-            await _d1_record_mentor_assignment(db, owner, mentor_username, repo, issue_number)
+            await _d1_record_mentor_assignment(db, owner, mentor_username, repo, issue_number, mentee_login=contributor_login or "")
         except Exception as exc:
             console.error(f"[MentorPool] Failed to record assignment in D1 (best-effort): {exc}")
 
@@ -4644,18 +4702,21 @@ def _build_referral_leaderboard(mentors: list) -> list:
     return sorted(counts.items(), key=lambda x: x[1], reverse=True)
 
 
-def _index_html(mentors: list = None, mentor_stats: Optional[dict] = None, active_assignments: Optional[list] = None) -> str:
+def _index_html(mentors: list = None, mentor_stats: Optional[dict] = None, active_assignments: Optional[list] = None, assignment_comment_stats: Optional[dict] = None) -> str:
     """Generate the BLT-Pool mentor directory homepage.
 
     Args:
-        mentors:            Mentor list loaded from D1.
-                            Defaults to an empty list when omitted or ``None``.
-        mentor_stats:       Optional mapping of ``github_username → {"merged_prs", "reviews"}``
-                            from D1, used to show activity stats on each mentor card.
-                            When ``None`` or empty, stats columns are hidden.
-        active_assignments: Optional list of active mentor-issue assignment dicts from D1.
-                            Each dict has keys: org, mentor_login, issue_repo, issue_number, assigned_at.
-                            When ``None`` or empty, the section is hidden.
+        mentors:                  Mentor list loaded from D1.
+                                  Defaults to an empty list when omitted or ``None``.
+        mentor_stats:             Optional mapping of ``github_username → {"merged_prs", "reviews"}``
+                                  from D1, used to show activity stats on each mentor card.
+                                  When ``None`` or empty, stats columns are hidden.
+        active_assignments:       Optional list of active mentor-issue assignment dicts from D1.
+                                  Each dict has keys: org, mentor_login, mentee_login, issue_repo,
+                                  issue_number, assigned_at.
+                                  When ``None`` or empty, the section is hidden.
+        assignment_comment_stats: Optional mapping of ``github_username → total_comments`` used to
+                                  show comment-point badges on each assignment card.
     """
     if mentors is None:
         mentors = []
@@ -4663,6 +4724,8 @@ def _index_html(mentors: list = None, mentor_stats: Optional[dict] = None, activ
         mentor_stats = {}
     if active_assignments is None:
         active_assignments = []
+    if assignment_comment_stats is None:
+        assignment_comment_stats = {}
     # Normalize mentor_stats keys to lowercase for case-insensitive lookup.
     mentor_stats_lower = {k.lower(): v for k, v in mentor_stats.items()}
     year = time.gmtime().tm_year
@@ -4676,26 +4739,63 @@ def _index_html(mentors: list = None, mentor_stats: Optional[dict] = None, activ
 
     # Build active assignments section HTML.
     if active_assignments:
-        assignment_items = "\n".join(
-            f'''<li class="flex flex-col gap-1 rounded-xl border border-[#E5E5E5] bg-gray-50 p-4 sm:flex-row sm:items-center sm:justify-between">
-              <div class="flex items-center gap-3 min-w-0">
-                <img src="https://github.com/{_html_mod.escape(a["mentor_login"])}.png"
-                     alt="{_html_mod.escape(a["mentor_login"])}"
-                     class="h-8 w-8 shrink-0 rounded-full border border-[#E5E5E5]">
-                <a href="https://github.com/{_html_mod.escape(a["mentor_login"])}" target="_blank" rel="noopener"
-                   class="font-semibold text-sm text-[#111827] hover:text-[#E10101] truncate">
-                  @{_html_mod.escape(a["mentor_login"])}
+        def _assignment_item(a: dict) -> str:
+            mentor = _html_mod.escape(a["mentor_login"])
+            mentee_raw = a.get("mentee_login", "")
+            mentee = _html_mod.escape(mentee_raw)
+            org = _html_mod.escape(a["org"])
+            repo = _html_mod.escape(a["issue_repo"])
+            number = _html_mod.escape(str(a["issue_number"]))
+            time_ago = _html_mod.escape(_time_ago(a["assigned_at"]))
+            mentor_comments = assignment_comment_stats.get(a["mentor_login"], 0)
+            mentee_comments = assignment_comment_stats.get(mentee_raw, 0) if mentee_raw else 0
+
+            mentee_html = ""
+            if mentee:
+                mentee_html = f'''
+              <div class="flex items-center gap-2 min-w-0">
+                <img src="https://github.com/{mentee}.png"
+                     alt="{mentee}"
+                     class="h-7 w-7 shrink-0 rounded-full border border-[#E5E5E5]">
+                <div class="min-w-0">
+                  <p class="text-xs text-gray-400 leading-none">Mentee</p>
+                  <a href="https://github.com/{mentee}" target="_blank" rel="noopener"
+                     class="text-sm font-semibold text-[#111827] hover:text-[#E10101] truncate block">
+                    @{mentee}
+                  </a>
+                </div>
+                <span class="shrink-0 rounded-full bg-gray-100 px-2 py-0.5 text-xs font-semibold text-gray-600" title="Total comments">{mentee_comments} pts</span>
+              </div>'''
+
+            return f'''<li class="rounded-xl border border-[#E5E5E5] bg-gray-50 p-4">
+              <div class="flex flex-wrap items-center justify-between gap-3">
+                <div class="flex items-center gap-2 min-w-0">
+                  <img src="https://github.com/{mentor}.png"
+                       alt="{mentor}"
+                       class="h-7 w-7 shrink-0 rounded-full border border-[#E5E5E5]">
+                  <div class="min-w-0">
+                    <p class="text-xs text-gray-400 leading-none">Mentor</p>
+                    <a href="https://github.com/{mentor}" target="_blank" rel="noopener"
+                       class="text-sm font-semibold text-[#111827] hover:text-[#E10101] truncate block">
+                      @{mentor}
+                    </a>
+                  </div>
+                  <span class="shrink-0 rounded-full bg-[#feeae9] px-2 py-0.5 text-xs font-semibold text-[#E10101]" title="Total comments">{mentor_comments} pts</span>
+                </div>
+                {mentee_html}
+                <a href="https://github.com/{org}/{repo}/issues/{number}"
+                   target="_blank" rel="noopener"
+                   class="inline-flex items-center gap-1.5 rounded-full bg-[#feeae9] px-3 py-1 text-xs font-semibold text-[#E10101] hover:bg-red-100 transition shrink-0">
+                  <i class="fa-brands fa-github text-xs" aria-hidden="true"></i>
+                  {org}/{repo}#{number}
                 </a>
               </div>
-              <a href="https://github.com/{_html_mod.escape(a["org"])}/{_html_mod.escape(a["issue_repo"])}/issues/{_html_mod.escape(str(a["issue_number"]))}"
-                 target="_blank" rel="noopener"
-                 class="inline-flex items-center gap-1.5 rounded-full bg-[#feeae9] px-3 py-1 text-xs font-semibold text-[#E10101] hover:bg-red-100 transition shrink-0">
-                <i class="fa-brands fa-github text-xs" aria-hidden="true"></i>
-                {_html_mod.escape(a["org"])}/{_html_mod.escape(a["issue_repo"])}#{_html_mod.escape(str(a["issue_number"]))}
-              </a>
+              <p class="mt-2 text-xs text-gray-400">
+                <i class="fa-regular fa-clock mr-1" aria-hidden="true"></i>Assigned {time_ago}
+              </p>
             </li>'''
-            for a in active_assignments
-        )
+
+        assignment_items = "\n".join(_assignment_item(a) for a in active_assignments)
         active_assignments_html = f'''
     <section id="active-assignments" class="rounded-2xl border border-[#E5E5E5] bg-white p-7 sm:p-9">
       <div class="mb-5 flex items-center gap-3">
@@ -4965,6 +5065,7 @@ def _index_html(mentors: list = None, mentor_stats: Optional[dict] = None, activ
             Display Name <span class="text-[#E10101]">*</span>
           </label>
           <input id="mf-name" type="text" required autocomplete="name" placeholder="Jane Doe"
+                 maxlength="100"
                  class="w-full rounded-md border border-gray-300 px-3 py-2 text-sm text-gray-900 placeholder:text-gray-400 focus:border-[#E10101] focus:ring-1 focus:ring-[#E10101] focus:outline-none">
         </div>
         <div>
@@ -4972,6 +5073,7 @@ def _index_html(mentors: list = None, mentor_stats: Optional[dict] = None, activ
             GitHub Username <span class="text-[#E10101]">*</span>
           </label>
           <input id="mf-github" type="text" required autocomplete="username" placeholder="janedoe"
+                 maxlength="39" pattern="[a-zA-Z0-9]([a-zA-Z0-9\\-]{{0,37}}[a-zA-Z0-9])?"
                  class="w-full rounded-md border border-gray-300 px-3 py-2 text-sm text-gray-900 placeholder:text-gray-400 focus:border-[#E10101] focus:ring-1 focus:ring-[#E10101] focus:outline-none">
         </div>
         <div class="sm:col-span-2">
@@ -4979,6 +5081,7 @@ def _index_html(mentors: list = None, mentor_stats: Optional[dict] = None, activ
             Specialties <span class="text-xs font-normal text-gray-400">(optional — comma-separated)</span>
           </label>
           <input id="mf-specialties" type="text" placeholder="e.g. frontend, python, security, docs"
+                 maxlength="300"
                  class="w-full rounded-md border border-gray-300 px-3 py-2 text-sm text-gray-900 placeholder:text-gray-400 focus:border-[#E10101] focus:ring-1 focus:ring-[#E10101] focus:outline-none">
         </div>
         <div>
@@ -4993,6 +5096,7 @@ def _index_html(mentors: list = None, mentor_stats: Optional[dict] = None, activ
             Timezone <span class="text-xs font-normal text-gray-400">(optional)</span>
           </label>
           <input id="mf-tz" type="text" placeholder="e.g. UTC+5:30"
+                 maxlength="60"
                  class="w-full rounded-md border border-gray-300 px-3 py-2 text-sm text-gray-900 placeholder:text-gray-400 focus:border-[#E10101] focus:ring-1 focus:ring-[#E10101] focus:outline-none">
         </div>
         <div class="sm:col-span-2">
@@ -5000,6 +5104,7 @@ def _index_html(mentors: list = None, mentor_stats: Optional[dict] = None, activ
             Referred By <span class="text-xs font-normal text-gray-400">(optional — GitHub username of who invited you)</span>
           </label>
           <input id="mf-referral" type="text" placeholder="e.g. janedoe"
+                 maxlength="39" pattern="[a-zA-Z0-9]([a-zA-Z0-9\\-]{{0,37}}[a-zA-Z0-9])?"
                  class="w-full rounded-md border border-gray-300 px-3 py-2 text-sm text-gray-900 placeholder:text-gray-400 focus:border-[#E10101] focus:ring-1 focus:ring-[#E10101] focus:outline-none">
         </div>
         <div id="mf-error" role="alert" class="hidden sm:col-span-2 text-sm font-semibold text-[#E10101]"></div>
@@ -5014,12 +5119,28 @@ def _index_html(mentors: list = None, mentor_stats: Optional[dict] = None, activ
       </form>
       <script>
         (function () {{
+          // Regex matching GitHub's username rules (identical to server-side _GH_USERNAME_RE).
+          var GH_USERNAME_RE = /^[a-zA-Z0-9](?:[a-zA-Z0-9\\-]{{0,37}}[a-zA-Z0-9])?$/;
+          // Regex matching each specialty tag (identical to server-side _SPECIALTY_RE).
+          var SPECIALTY_RE = /^[a-z0-9][a-z0-9+#.\\-]{{0,29}}$/;
+
+          /**
+           * Return true if the value contains HTML angle brackets, raw ampersands,
+           * double-quotes, or common scripting injection patterns.
+           */
+          function containsScripting(val) {{
+            if (/[<>"&]/.test(val)) return true;
+            if (/javascript\\s*:/i.test(val)) return true;
+            if (/on\\w+\\s*=/i.test(val)) return true;
+            return false;
+          }}
+
           document.getElementById('mentor-form').addEventListener('submit', function (e) {{
             e.preventDefault();
             var name     = document.getElementById('mf-name').value.trim();
             var github   = document.getElementById('mf-github').value.trim().replace(/^@/, '');
             var specs    = document.getElementById('mf-specialties').value.trim();
-            var maxM     = parseInt(document.getElementById('mf-max').value.trim(), 10) || 3;
+            var maxM     = parseInt(document.getElementById('mf-max').value.trim(), 10);
             var tz       = document.getElementById('mf-tz').value.trim();
             var referral = document.getElementById('mf-referral').value.trim().replace(/^@/, '');
             var errEl    = document.getElementById('mf-error');
@@ -5027,12 +5148,77 @@ def _index_html(mentors: list = None, mentor_stats: Optional[dict] = None, activ
             var btn      = document.getElementById('mf-submit');
             errEl.classList.add('hidden');
             okEl.classList.add('hidden');
-            if (!name || !github) {{
-              errEl.textContent = 'Display name and GitHub username are required.';
+
+            // Required fields.
+            if (!name) {{
+              errEl.textContent = 'Display name is required.';
               errEl.classList.remove('hidden');
               return;
             }}
+            if (!github) {{
+              errEl.textContent = 'GitHub username is required.';
+              errEl.classList.remove('hidden');
+              return;
+            }}
+
+            // Length guards (mirrors maxlength attributes).
+            if (name.length > 100) {{
+              errEl.textContent = 'Display name must be 100 characters or fewer.';
+              errEl.classList.remove('hidden');
+              return;
+            }}
+            if (tz.length > 60) {{
+              errEl.textContent = 'Timezone must be 60 characters or fewer.';
+              errEl.classList.remove('hidden');
+              return;
+            }}
+
+            // Script / HTML injection checks on free-text fields.
+            if (containsScripting(name)) {{
+              errEl.textContent = 'Display name contains invalid characters. HTML and scripting are not allowed.';
+              errEl.classList.remove('hidden');
+              return;
+            }}
+            if (containsScripting(tz)) {{
+              errEl.textContent = 'Timezone contains invalid characters. HTML and scripting are not allowed.';
+              errEl.classList.remove('hidden');
+              return;
+            }}
+            if (containsScripting(specs)) {{
+              errEl.textContent = 'Specialties contain invalid characters. HTML and scripting are not allowed.';
+              errEl.classList.remove('hidden');
+              return;
+            }}
+
+            // GitHub username format validation.
+            if (!GH_USERNAME_RE.test(github)) {{
+              errEl.textContent = 'GitHub username may only contain letters, digits, and single hyphens, and cannot begin or end with a hyphen (max 39 characters).';
+              errEl.classList.remove('hidden');
+              return;
+            }}
+            if (referral && !GH_USERNAME_RE.test(referral)) {{
+              errEl.textContent = 'Referred-by username may only contain letters, digits, and single hyphens, and cannot begin or end with a hyphen (max 39 characters).';
+              errEl.classList.remove('hidden');
+              return;
+            }}
+
+            // Validate each specialty tag format.
             var specialties = specs ? specs.split(',').map(function(s) {{ return s.trim(); }}).filter(Boolean) : [];
+            for (var i = 0; i < specialties.length; i++) {{
+              if (!SPECIALTY_RE.test(specialties[i])) {{
+                errEl.textContent = 'Invalid specialty tag "' + specialties[i] + '". Tags must be 1-30 lowercase alphanumeric characters (also +, #, ., -).';
+                errEl.classList.remove('hidden');
+                return;
+              }}
+            }}
+
+            // max_mentees range guard.
+            if (isNaN(maxM) || maxM < 1 || maxM > 10) {{
+              errEl.textContent = 'Max concurrent mentees must be a number between 1 and 10.';
+              errEl.classList.remove('hidden');
+              return;
+            }}
+
             btn.disabled = true;
             fetch('/api/mentors', {{
               method: 'POST',
@@ -5095,9 +5281,30 @@ def _index_html(mentors: list = None, mentor_stats: Optional[dict] = None, activ
 _GH_USERNAME_RE = re.compile(r"^[a-zA-Z0-9](?:[a-zA-Z0-9\-]{0,37}[a-zA-Z0-9])?$")
 # Specialty tag: 1-30 chars; lowercase letters, digits, +, #, dot, hyphen allowed.
 _SPECIALTY_RE = re.compile(r"^[a-z0-9][a-z0-9+#.\-]{0,29}$")
+# Display name: 1-100 printable characters, no HTML angle brackets, ampersands,
+# double quotes, or ASCII control characters (prevents script injection).
+_NAME_RE = re.compile(r"^[^<>&\"\x00-\x1f]{1,100}$")
+# Timezone: optional free-form label, same restrictions as name but max 60 chars.
+_TIMEZONE_RE = re.compile(r"^[^<>&\"\x00-\x1f]{1,60}$")
 # Bounds for the max_mentees field in the mentor form.
 _MENTOR_MIN_MENTEES_CAP = 1
 _MENTOR_MAX_MENTEES_CAP = 10
+
+
+async def _verify_gh_user_exists(username: str, env=None) -> bool:
+    """Return True if the GitHub username exists on GitHub.
+
+    Uses GITHUB_TOKEN from env if available (5,000 req/h); falls back to
+    unauthenticated requests (60 req/h per IP) when no token is set.
+    Returns True on network/API error so a transient outage does not block
+    legitimate submissions (fail-open policy).
+    """
+    token = getattr(env, "GITHUB_TOKEN", "") if env else ""
+    try:
+        resp = await github_api("GET", f"/users/{username}", token)
+        return resp.status == 200
+    except Exception:
+        return True  # Fail open: don't block when GitHub API is temporarily unavailable
 
 
 async def _handle_add_mentor(request, env) -> "Response":
@@ -5130,10 +5337,16 @@ async def _handle_add_mentor(request, env) -> "Response":
 
     if not name:
         return _json({"error": "Field 'name' is required"}, 400)
+    if not _NAME_RE.match(name):
+        return _json({"error": "Display name contains invalid characters (HTML and scripting are not allowed)"}, 400)
     if not github_username:
         return _json({"error": "Field 'github_username' is required"}, 400)
     if not _GH_USERNAME_RE.match(github_username):
-        return _json({"error": "Invalid GitHub username"}, 400)
+        return _json({"error": "Invalid GitHub username format"}, 400)
+
+    # Verify the GitHub username actually exists.
+    if not await _verify_gh_user_exists(github_username, env):
+        return _json({"error": f"GitHub username '{github_username}' was not found on GitHub"}, 400)
 
     # Normalise specialties — accept a list or a comma-separated string.
     if isinstance(specialties_raw, str):
@@ -5152,8 +5365,15 @@ async def _handle_add_mentor(request, env) -> "Response":
     except (TypeError, ValueError):
         max_mentees = 3
 
+    if timezone and not _TIMEZONE_RE.match(timezone):
+        return _json({"error": "Timezone contains invalid characters (HTML and scripting are not allowed)"}, 400)
+
     if referred_by and not _GH_USERNAME_RE.match(referred_by):
-        return _json({"error": "Invalid referred_by username"}, 400)
+        return _json({"error": "Invalid referred_by username format"}, 400)
+
+    # Verify the referrer's GitHub username exists (if provided).
+    if referred_by and not await _verify_gh_user_exists(referred_by, env):
+        return _json({"error": f"Referred-by username '{referred_by}' was not found on GitHub"}, 400)
 
     db = _d1_binding(env)
     if not db:
@@ -5228,6 +5448,7 @@ async def on_fetch(request, env) -> Response:
             console.error(f"[MentorPool] Failed to fetch mentor stats for homepage: {exc}")
         # Fetch active mentor assignments from D1 (best-effort).
         active_assignments: list = []
+        assignment_comment_stats: dict = {}
         db = _d1_binding(env)
         if db:
             try:
@@ -5235,7 +5456,18 @@ async def on_fetch(request, env) -> Response:
                 active_assignments = await _d1_get_active_assignments(db, org)
             except Exception as exc:
                 console.error(f"[MentorPool] Failed to fetch active assignments for homepage: {exc}")
-        return _html(_index_html(mentors, mentor_stats, active_assignments))
+            if active_assignments:
+                try:
+                    all_logins = list({
+                        login
+                        for a in active_assignments
+                        for login in (a["mentor_login"], a.get("mentee_login", ""))
+                        if login
+                    })
+                    assignment_comment_stats = await _d1_get_user_comment_totals(db, org, all_logins)
+                except Exception as exc:
+                    console.error(f"[MentorPool] Failed to fetch assignment comment stats: {exc}")
+        return _html(_index_html(mentors, mentor_stats, active_assignments, assignment_comment_stats))
 
     if method == "GET" and path == "/github-app":
         app_slug = getattr(env, "GITHUB_APP_SLUG", "")
