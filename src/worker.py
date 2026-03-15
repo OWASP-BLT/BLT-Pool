@@ -5403,10 +5403,6 @@ _OAUTH_STATE_MAX_AGE = 600    # 10 minutes — state cookie TTL
 # read:user lets us retrieve the authenticated user's profile.
 _OAUTH_SCOPE = "read:org read:user"
 
-# Repo used for the "is maintainer" check (owner and repo name).
-_ADMIN_REPO_OWNER = "OWASP-BLT"
-_ADMIN_REPO_NAME = "BLT-Pool"
-
 
 def _parse_cookies(request) -> dict:
     """Parse the Cookie header from an HTTP request into a plain dict."""
@@ -5491,243 +5487,6 @@ async def _get_session(request, env) -> Optional[Tuple[str, str]]:
     if not cookie_val:
         return None
     return _parse_session_value(cookie_val, secret)
-
-
-async def _is_org_admin(org: str, login: str, token: str) -> bool:
-    """Return True if *login* is an active owner/admin of the GitHub org.
-
-    Uses ``GET /user/memberships/orgs/{org}`` (requires ``read:org`` scope).
-    Fails closed — returns False on any API error.
-    """
-    try:
-        resp = await github_api("GET", f"/user/memberships/orgs/{org}", token)
-        if resp.status != 200:
-            return False
-        data = json.loads(await resp.text())
-        return (
-            data.get("role") == "admin"
-            and data.get("state") == "active"
-        )
-    except Exception:
-        return False
-
-
-async def _check_admin_access(login: str, token: str) -> bool:
-    """Return True if *login* is authorised to use the admin panel.
-
-    The user qualifies if they are an admin of the OWASP-BLT GitHub
-    organisation *or* have admin/maintain permission in the BLT-Pool repo.
-    """
-    if await _is_org_admin(_ADMIN_REPO_OWNER, login, token):
-        return True
-    return await _is_maintainer(_ADMIN_REPO_OWNER, _ADMIN_REPO_NAME, login, token)
-
-
-# ---------------------------------------------------------------------------
-# Admin page HTML
-# ---------------------------------------------------------------------------
-
-
-def _admin_html(username: str, avatar_url: str, mentors: list) -> str:
-    """Return the HTML for the admin panel (mentor management page)."""
-    esc = _html_mod.escape
-
-    mentor_rows = ""
-    for m in mentors:
-        gh = esc(m.get("github_username") or "")
-        name = esc(m.get("name") or "")
-        active = bool(m.get("active", True))
-        status_badge = (
-            '<span class="inline-block text-xs bg-green-100 text-green-800 px-2 py-0.5 rounded-full">active</span>'
-            if active
-            else '<span class="inline-block text-xs bg-gray-200 text-gray-600 px-2 py-0.5 rounded-full">paused</span>'
-        )
-        mentor_rows += f"""
-        <tr id="mentor-row-{gh}" class="border-b border-gray-200 hover:bg-gray-50">
-          <td class="py-3 px-4 flex items-center gap-2">
-            <img src="https://github.com/{gh}.png?size=32" alt="" class="w-8 h-8 rounded-full">
-            <div>
-              <div class="font-medium text-gray-900">{name}</div>
-              <a href="https://github.com/{gh}" target="_blank" rel="noopener"
-                 class="text-xs text-blue-600 hover:underline">@{gh}</a>
-            </div>
-          </td>
-          <td class="py-3 px-4">{status_badge}</td>
-          <td class="py-3 px-4 text-right">
-            <button
-              data-username="{gh}"
-              onclick="deleteMentor(this)"
-              class="delete-btn text-xs bg-red-50 text-red-700 border border-red-200 hover:bg-red-100 px-3 py-1 rounded font-medium transition-colors">
-              Delete
-            </button>
-          </td>
-        </tr>"""
-
-    return f'''<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>BLT-Pool Admin</title>
-  <script src="https://cdn.tailwindcss.com"></script>
-</head>
-<body class="bg-gray-50 min-h-screen">
-  <header class="bg-white border-b border-gray-200 shadow-sm">
-    <div class="max-w-5xl mx-auto px-4 sm:px-6 py-4 flex items-center justify-between">
-      <div class="flex items-center gap-3">
-        <a href="/" class="text-red-600 font-bold text-lg hover:underline">BLT-Pool</a>
-        <span class="text-gray-400">/</span>
-        <span class="font-semibold text-gray-800">Admin</span>
-      </div>
-      <div class="flex items-center gap-3">
-        <img src="{esc(avatar_url)}" alt="" class="w-8 h-8 rounded-full border border-gray-200">
-        <span class="text-sm font-medium text-gray-700">@{esc(username)}</span>
-        <a href="/logout"
-           class="text-xs text-red-600 border border-red-200 hover:bg-red-50 px-3 py-1 rounded transition-colors">
-          Logout
-        </a>
-      </div>
-    </div>
-  </header>
-
-  <main class="max-w-5xl mx-auto px-4 sm:px-6 py-8">
-    <div class="flex items-center justify-between mb-6">
-      <h1 class="text-2xl font-bold text-gray-900">Mentor Management</h1>
-      <span class="text-sm text-gray-500">{len(mentors)} mentor(s)</span>
-    </div>
-
-    <div id="alert" class="hidden mb-4 px-4 py-3 rounded text-sm font-medium"></div>
-
-    <div class="bg-white rounded-xl border border-gray-200 overflow-hidden shadow-sm">
-      <table class="w-full text-sm text-left">
-        <thead>
-          <tr class="bg-gray-50 border-b border-gray-200 text-xs uppercase text-gray-500 tracking-wider">
-            <th class="py-3 px-4">Mentor</th>
-            <th class="py-3 px-4">Status</th>
-            <th class="py-3 px-4 text-right">Action</th>
-          </tr>
-        </thead>
-        <tbody id="mentor-tbody">
-          {mentor_rows or '<tr><td colspan="3" class="py-8 text-center text-gray-500">No mentors found.</td></tr>'}
-        </tbody>
-      </table>
-    </div>
-  </main>
-
-  <script>
-    async function deleteMentor(btn) {{
-      const username = btn.dataset.username;
-      if (!confirm('Delete mentor @' + username + '? This cannot be undone.')) return;
-
-      btn.disabled = true;
-      btn.textContent = 'Deleting\u2026';  // horizontal ellipsis
-
-      try {{
-        const res = await fetch('/api/mentors/' + encodeURIComponent(username), {{
-          method: 'DELETE',
-          credentials: 'same-origin',
-        }});
-        const data = await res.json();
-        if (res.ok) {{
-          const row = document.getElementById('mentor-row-' + username);
-          if (row) row.remove();
-          showAlert('Mentor @' + username + ' deleted successfully.', 'success');
-        }} else {{
-          btn.disabled = false;
-          btn.textContent = 'Delete';
-          showAlert(data.error || 'Delete failed.', 'error');
-        }}
-      }} catch (err) {{
-        btn.disabled = false;
-        btn.textContent = 'Delete';
-        showAlert('Network error. Please try again.', 'error');
-      }}
-    }}
-
-    function showAlert(msg, type) {{
-      const el = document.getElementById('alert');
-      el.textContent = msg;
-      el.className = type === 'success'
-        ? 'mb-4 px-4 py-3 rounded text-sm font-medium bg-green-100 text-green-800 border border-green-200'
-        : 'mb-4 px-4 py-3 rounded text-sm font-medium bg-red-100 text-red-800 border border-red-200';
-      el.classList.remove('hidden');
-      setTimeout(() => el.classList.add('hidden'), 5000);
-    }}
-  </script>
-</body>
-</html>'''
-
-
-def _login_required_html(redirect_after: str = "/admin") -> str:
-    """Return an HTML page that prompts the user to login via GitHub."""
-    return f'''<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>BLT-Pool — Login Required</title>
-  <script src="https://cdn.tailwindcss.com"></script>
-</head>
-<body class="bg-gray-50 min-h-screen flex items-center justify-center">
-  <div class="bg-white rounded-2xl shadow-sm border border-gray-200 p-10 max-w-md w-full text-center">
-    <div class="text-4xl mb-4">🔒</div>
-    <h1 class="text-xl font-bold text-gray-900 mb-2">Admin Login Required</h1>
-    <p class="text-gray-600 text-sm mb-6">
-      Sign in with GitHub to access the admin panel. Only organisation
-      admins and repository maintainers are permitted.
-    </p>
-    <a href="/login/github"
-       class="inline-flex items-center gap-2 bg-gray-900 hover:bg-gray-700 text-white text-sm font-medium px-6 py-3 rounded-lg transition-colors">
-      <svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor">
-        <path d="M12 0C5.37 0 0 5.373 0 12c0 5.303 3.438 9.8 8.205 11.387.6.113.82-.258.82-.577
-                 0-.285-.01-1.04-.015-2.04-3.338.724-4.042-1.61-4.042-1.61C4.422 18.07 3.633
-                 17.7 3.633 17.7c-1.087-.744.084-.729.084-.729 1.205.084 1.838 1.236 1.838
-                 1.236 1.07 1.835 2.809 1.305 3.495.998.108-.776.417-1.305.76-1.605-2.665-.3
-                 -5.466-1.332-5.466-5.93 0-1.31.465-2.38 1.235-3.22-.135-.303-.54-1.523.105
-                 -3.176 0 0 1.005-.322 3.3 1.23.96-.267 1.98-.399 3-.405 1.02.006 2.04.138
-                 3 .405 2.28-1.552 3.285-1.23 3.285-1.23.645 1.653.24 2.873.12 3.176.765.84
-                 1.23 1.91 1.23 3.22 0 4.61-2.805 5.625-5.475 5.92.42.36.81 1.096.81 2.22
-                 0 1.606-.015 2.896-.015 3.286 0 .315.21.69.825.57C20.565 21.795 24 17.298
-                 24 12c0-6.627-5.373-12-12-12z"/>
-      </svg>
-      Sign in with GitHub
-    </a>
-    <p class="mt-4 text-xs text-gray-400">
-      <a href="/" class="hover:underline">← Back to homepage</a>
-    </p>
-  </div>
-</body>
-</html>'''
-
-
-def _forbidden_html(username: str) -> str:
-    """Return a 403 page when the user is not a maintainer."""
-    esc = _html_mod.escape
-    return f'''<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>BLT-Pool — Access Denied</title>
-  <script src="https://cdn.tailwindcss.com"></script>
-</head>
-<body class="bg-gray-50 min-h-screen flex items-center justify-center">
-  <div class="bg-white rounded-2xl shadow-sm border border-gray-200 p-10 max-w-md w-full text-center">
-    <div class="text-4xl mb-4">🚫</div>
-    <h1 class="text-xl font-bold text-gray-900 mb-2">Access Denied</h1>
-    <p class="text-gray-600 text-sm mb-6">
-      @{esc(username)}, you need to be an admin of the
-      <strong>OWASP-BLT</strong> organisation or a maintainer of the
-      <strong>BLT-Pool</strong> repository to access this page.
-    </p>
-    <div class="flex gap-3 justify-center">
-      <a href="/" class="text-sm text-gray-600 hover:underline">← Homepage</a>
-      <span class="text-gray-300">|</span>
-      <a href="/logout" class="text-sm text-red-600 hover:underline">Logout</a>
-    </div>
-  </div>
-</body>
-</html>'''
 
 
 # ---------------------------------------------------------------------------
@@ -5877,7 +5636,7 @@ async def _handle_oauth_callback(request, env) -> "Response":
     if not username:
         return _html("<h1>OAuth Error</h1><p>Empty username returned.</p>", 502)
 
-    # Create a signed session cookie and redirect to the admin panel.
+    # Create a signed session cookie and redirect to the homepage.
     secret = _cookie_signing_secret(env)
     session_val = _make_session_value(access_token, username, secret)
     session_cookie = _build_cookie_header(_OAUTH_COOKIE_NAME, session_val)
@@ -5886,7 +5645,7 @@ async def _handle_oauth_callback(request, env) -> "Response":
         "",
         status=302,
         headers=Headers.new({
-            "Location": "/admin",
+            "Location": "/",
             "Set-Cookie": session_cookie,
         }.items()),
     )
@@ -5903,88 +5662,6 @@ async def _handle_logout(request, env) -> "Response":
             "Set-Cookie": clear_cookie,
         }.items()),
     )
-
-
-async def _handle_admin_page(request, env) -> "Response":
-    """GET /admin — render the admin panel for authorised maintainers."""
-    session = await _get_session(request, env)
-    if not session:
-        return _html(_login_required_html(), 200)
-
-    username, token = session
-
-    authorized = await _check_admin_access(username, token)
-    if not authorized:
-        return _html(_forbidden_html(username), 403)
-
-    # Fetch avatar URL for the header.
-    avatar_url = f"https://github.com/{username}.png?size=64"
-    try:
-        user_resp = await github_api("GET", "/user", token)
-        if user_resp.status == 200:
-            user_data = json.loads(await user_resp.text())
-            avatar_url = user_data.get("avatar_url") or avatar_url
-    except Exception:
-        pass  # Fall back to the computed URL.
-
-    # Load mentor list from D1.
-    mentors: list = []
-    db = _d1_binding(env)
-    if db:
-        try:
-            await _ensure_leaderboard_schema(db)
-            mentors = await _load_mentors_from_d1(db)
-        except Exception as exc:
-            console.error(f"[Admin] Failed to load mentors: {exc}")
-
-    return _html(_admin_html(username, avatar_url, mentors))
-
-
-async def _handle_delete_mentor(request, env, username: str) -> "Response":
-    """DELETE /api/mentors/{username} — remove a mentor (admin only).
-
-    Requires a valid session cookie belonging to an authorised maintainer.
-    """
-    session = await _get_session(request, env)
-    if not session:
-        return _json({"error": "Authentication required"}, 401)
-
-    requester, token = session
-
-    authorized = await _check_admin_access(requester, token)
-    if not authorized:
-        return _json({"error": "Forbidden — you are not an authorised maintainer"}, 403)
-
-    # Basic validation of the target username.
-    if not username or not _GH_USERNAME_RE.match(username):
-        return _json({"error": "Invalid GitHub username"}, 400)
-
-    db = _d1_binding(env)
-    if not db:
-        return _json({"error": "Database not available"}, 500)
-
-    try:
-        await _ensure_leaderboard_schema(db)
-        # Check that the mentor actually exists before deleting.
-        rows = await _d1_all(
-            db,
-            "SELECT github_username FROM mentors WHERE github_username = ?",
-            (username,),
-        )
-        if not rows:
-            return _json({"error": f"Mentor '{username}' not found"}, 404)
-
-        await _d1_run(
-            db,
-            "DELETE FROM mentors WHERE github_username = ?",
-            (username,),
-        )
-    except Exception as exc:
-        console.error(f"[Admin] Failed to delete mentor {username}: {exc}")
-        return _json({"error": "Failed to delete mentor"}, 500)
-
-    console.log(f"[Admin] Mentor {username} deleted by {requester}")
-    return _json({"ok": True, "github_username": username})
 
 
 # ---------------------------------------------------------------------------
@@ -6084,15 +5761,6 @@ async def on_fetch(request, env) -> Response:
 
     if method == "GET" and path == "/logout":
         return await _handle_logout(request, env)
-
-    # Admin panel — requires GitHub OAuth session with maintainer role
-    if method == "GET" and path == "/admin":
-        return await _handle_admin_page(request, env)
-
-    # Delete a mentor (admin only)
-    if method == "DELETE" and path.startswith("/api/mentors/"):
-        mentor_username = path[len("/api/mentors/"):]
-        return await _handle_delete_mentor(request, env, mentor_username)
 
     # GitHub redirects here after a successful installation
     if method == "GET" and path == "/callback":

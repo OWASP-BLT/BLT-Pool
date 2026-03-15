@@ -5383,81 +5383,6 @@ class TestBuildCookieHeader(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
-# Admin HTML generators
-# ---------------------------------------------------------------------------
-
-
-class TestAdminHtml(unittest.TestCase):
-    def test_renders_mentor_username(self):
-        mentors = [{"github_username": "alice", "name": "Alice", "active": True}]
-        html = _worker._admin_html("admin", "https://example.com/avatar.png", mentors)
-        self.assertIn("alice", html)
-        self.assertIn("Alice", html)
-
-    def test_renders_multiple_mentors(self):
-        mentors = [
-            {"github_username": "alice", "name": "Alice", "active": True},
-            {"github_username": "bob", "name": "Bob", "active": False},
-        ]
-        html = _worker._admin_html("admin", "", mentors)
-        self.assertIn("alice", html)
-        self.assertIn("bob", html)
-
-    def test_shows_active_badge(self):
-        mentors = [{"github_username": "alice", "name": "Alice", "active": True}]
-        html = _worker._admin_html("admin", "", mentors)
-        self.assertIn("active", html)
-
-    def test_shows_paused_badge(self):
-        mentors = [{"github_username": "bob", "name": "Bob", "active": False}]
-        html = _worker._admin_html("admin", "", mentors)
-        self.assertIn("paused", html)
-
-    def test_shows_empty_message_when_no_mentors(self):
-        html = _worker._admin_html("admin", "", [])
-        self.assertIn("No mentors found", html)
-
-    def test_escapes_html_in_username(self):
-        mentors = [{"github_username": "alice", "name": "<script>xss</script>", "active": True}]
-        html = _worker._admin_html("admin", "", mentors)
-        self.assertNotIn("<script>xss</script>", html)
-        self.assertIn("&lt;script&gt;", html)
-
-    def test_admin_username_in_header(self):
-        html = _worker._admin_html("myadmin", "", [])
-        self.assertIn("myadmin", html)
-
-    def test_delete_button_has_data_username(self):
-        mentors = [{"github_username": "alice", "name": "Alice", "active": True}]
-        html = _worker._admin_html("admin", "", mentors)
-        self.assertIn('data-username="alice"', html)
-
-
-class TestLoginRequiredHtml(unittest.TestCase):
-    def test_contains_login_link(self):
-        html = _worker._login_required_html()
-        self.assertIn("/login/github", html)
-
-    def test_contains_admin_wording(self):
-        html = _worker._login_required_html()
-        self.assertIn("Admin", html)
-
-
-class TestForbiddenHtml(unittest.TestCase):
-    def test_contains_username(self):
-        html = _worker._forbidden_html("alice")
-        self.assertIn("alice", html)
-
-    def test_escapes_html_in_username(self):
-        html = _worker._forbidden_html("<script>xss</script>")
-        self.assertNotIn("<script>", html)
-
-    def test_contains_logout_link(self):
-        html = _worker._forbidden_html("alice")
-        self.assertIn("/logout", html)
-
-
-# ---------------------------------------------------------------------------
 # _handle_login_github
 # ---------------------------------------------------------------------------
 
@@ -5555,12 +5480,12 @@ class TestHandleOAuthCallback(unittest.TestCase):
 
         return _run(_inner())
 
-    def test_valid_callback_redirects_to_admin(self):
+    def test_valid_callback_redirects_to_homepage(self):
         env = self._make_env()
         req = self._make_request(env)
         resp = self._run_callback(env, req)
         self.assertEqual(resp.status, 302)
-        self.assertEqual(resp.headers.get("Location"), "/admin")
+        self.assertEqual(resp.headers.get("Location"), "/")
 
     def test_valid_callback_sets_session_cookie(self):
         env = self._make_env()
@@ -5647,204 +5572,12 @@ class TestHandleLogout(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
-# _handle_admin_page
-# ---------------------------------------------------------------------------
-
-
-class TestHandleAdminPage(unittest.TestCase):
-    def _make_env(self, webhook_secret="whsec"):
-        return types.SimpleNamespace(WEBHOOK_SECRET=webhook_secret)
-
-    def _make_request_with_session(self, env, username="alice", token="ghp_tok"):
-        secret = _worker._cookie_signing_secret(env)
-        session_val = _worker._make_session_value(token, username, secret)
-        cookie_str = f"{_worker._OAUTH_COOKIE_NAME}={session_val}"
-        return types.SimpleNamespace(
-            method="GET",
-            url="http://localhost/admin",
-            headers=types.SimpleNamespace(
-                get=lambda k, d=None: cookie_str if k == "Cookie" else d
-            ),
-        )
-
-    def _make_request_no_session(self):
-        return types.SimpleNamespace(
-            method="GET",
-            url="http://localhost/admin",
-            headers=types.SimpleNamespace(get=lambda k, d=None: d),
-        )
-
-    def test_no_session_returns_login_page(self):
-        env = self._make_env()
-        req = self._make_request_no_session()
-
-        async def _inner():
-            return await _worker._handle_admin_page(req, env)
-
-        resp = _run(_inner())
-        self.assertEqual(resp.status, 200)
-        self.assertIn("Login", resp.body)
-
-    def test_unauthorized_user_returns_403(self):
-        env = self._make_env()
-        req = self._make_request_with_session(env)
-        user_resp = types.SimpleNamespace(
-            status=200,
-            text=AsyncMock(return_value=json.dumps({"login": "alice", "avatar_url": ""})),
-        )
-        mentors = [{"github_username": "bob", "name": "Bob", "active": True}]
-
-        async def _inner():
-            with patch.object(_worker, "_check_admin_access", new=AsyncMock(return_value=False)):
-                with patch.object(_worker, "github_api", new=AsyncMock(return_value=user_resp)):
-                    with patch.object(_worker, "_d1_binding", return_value=None):
-                        return await _worker._handle_admin_page(req, env)
-
-        resp = _run(_inner())
-        self.assertEqual(resp.status, 403)
-        self.assertIn("Access Denied", resp.body)
-
-    def test_authorized_user_sees_admin_page(self):
-        env = self._make_env()
-        req = self._make_request_with_session(env)
-        user_resp = types.SimpleNamespace(
-            status=200,
-            text=AsyncMock(return_value=json.dumps({"login": "alice", "avatar_url": "https://example.com/avatar.png"})),
-        )
-        mentors = [{"github_username": "bob", "name": "Bob", "active": True}]
-
-        async def _inner():
-            with patch.object(_worker, "_check_admin_access", new=AsyncMock(return_value=True)):
-                with patch.object(_worker, "github_api", new=AsyncMock(return_value=user_resp)):
-                    with patch.object(_worker, "_d1_binding", return_value=MagicMock()):
-                        with patch.object(_worker, "_ensure_leaderboard_schema", new=AsyncMock()):
-                            with patch.object(_worker, "_load_mentors_from_d1", new=AsyncMock(return_value=mentors)):
-                                return await _worker._handle_admin_page(req, env)
-
-        resp = _run(_inner())
-        self.assertEqual(resp.status, 200)
-        self.assertIn("bob", resp.body)
-        self.assertIn("Mentor Management", resp.body)
-
-
-# ---------------------------------------------------------------------------
-# _handle_delete_mentor
-# ---------------------------------------------------------------------------
-
-
-class TestHandleDeleteMentor(unittest.TestCase):
-    def _make_env(self, webhook_secret="whsec"):
-        return types.SimpleNamespace(WEBHOOK_SECRET=webhook_secret)
-
-    def _make_request(self, env, username_in_session="admin", token="ghp_tok"):
-        secret = _worker._cookie_signing_secret(env)
-        session_val = _worker._make_session_value(token, username_in_session, secret)
-        cookie_str = f"{_worker._OAUTH_COOKIE_NAME}={session_val}"
-        return types.SimpleNamespace(
-            method="DELETE",
-            url=f"http://localhost/api/mentors/alice",
-            headers=types.SimpleNamespace(
-                get=lambda k, d=None: cookie_str if k == "Cookie" else d
-            ),
-        )
-
-    def _make_request_no_session(self):
-        return types.SimpleNamespace(
-            method="DELETE",
-            url="http://localhost/api/mentors/alice",
-            headers=types.SimpleNamespace(get=lambda k, d=None: d),
-        )
-
-    def test_no_session_returns_401(self):
-        env = self._make_env()
-        req = self._make_request_no_session()
-
-        async def _inner():
-            return await _worker._handle_delete_mentor(req, env, "alice")
-
-        resp = _run(_inner())
-        self.assertEqual(resp.status, 401)
-
-    def test_non_maintainer_returns_403(self):
-        env = self._make_env()
-        req = self._make_request(env)
-
-        async def _inner():
-            with patch.object(_worker, "_check_admin_access", new=AsyncMock(return_value=False)):
-                return await _worker._handle_delete_mentor(req, env, "alice")
-
-        resp = _run(_inner())
-        self.assertEqual(resp.status, 403)
-
-    def test_invalid_username_returns_400(self):
-        env = self._make_env()
-        req = self._make_request(env)
-
-        async def _inner():
-            with patch.object(_worker, "_check_admin_access", new=AsyncMock(return_value=True)):
-                return await _worker._handle_delete_mentor(req, env, "bad username!")
-
-        resp = _run(_inner())
-        self.assertEqual(resp.status, 400)
-
-    def test_nonexistent_mentor_returns_404(self):
-        env = self._make_env()
-        req = self._make_request(env)
-        mock_db = MagicMock()
-
-        async def _inner():
-            with patch.object(_worker, "_check_admin_access", new=AsyncMock(return_value=True)):
-                with patch.object(_worker, "_d1_binding", return_value=mock_db):
-                    with patch.object(_worker, "_ensure_leaderboard_schema", new=AsyncMock()):
-                        with patch.object(_worker, "_d1_all", new=AsyncMock(return_value=[])):
-                            return await _worker._handle_delete_mentor(req, env, "alice")
-
-        resp = _run(_inner())
-        self.assertEqual(resp.status, 404)
-        data = json.loads(resp.body)
-        self.assertIn("not found", data["error"].lower())
-
-    def test_valid_delete_returns_200(self):
-        env = self._make_env()
-        req = self._make_request(env)
-        mock_db = MagicMock()
-        existing_rows = [{"github_username": "alice"}]
-
-        async def _inner():
-            with patch.object(_worker, "_check_admin_access", new=AsyncMock(return_value=True)):
-                with patch.object(_worker, "_d1_binding", return_value=mock_db):
-                    with patch.object(_worker, "_ensure_leaderboard_schema", new=AsyncMock()):
-                        with patch.object(_worker, "_d1_all", new=AsyncMock(return_value=existing_rows)):
-                            with patch.object(_worker, "_d1_run", new=AsyncMock()):
-                                with patch.object(_worker, "console", new=types.SimpleNamespace(error=lambda *a: None, log=lambda *a: None)):
-                                    return await _worker._handle_delete_mentor(req, env, "alice")
-
-        resp = _run(_inner())
-        self.assertEqual(resp.status, 200)
-        data = json.loads(resp.body)
-        self.assertTrue(data["ok"])
-        self.assertEqual(data["github_username"], "alice")
-
-    def test_no_db_returns_500(self):
-        env = self._make_env()
-        req = self._make_request(env)
-
-        async def _inner():
-            with patch.object(_worker, "_check_admin_access", new=AsyncMock(return_value=True)):
-                with patch.object(_worker, "_d1_binding", return_value=None):
-                    return await _worker._handle_delete_mentor(req, env, "alice")
-
-        resp = _run(_inner())
-        self.assertEqual(resp.status, 500)
-
-
-# ---------------------------------------------------------------------------
 # on_fetch routing for new endpoints
 # ---------------------------------------------------------------------------
 
 
 class TestOnFetchNewRoutes(unittest.TestCase):
-    """Verify the new OAuth / admin routes are wired up in on_fetch."""
+    """Verify the OAuth routes are wired up in on_fetch."""
 
     def _run_fetch(self, method, path, env=None, cookies=""):
         if env is None:
@@ -5871,17 +5604,6 @@ class TestOnFetchNewRoutes(unittest.TestCase):
         resp = self._run_fetch("GET", "/logout", env)
         self.assertEqual(resp.status, 302)
         self.assertEqual(resp.headers.get("Location"), "/")
-
-    def test_get_admin_no_db_returns_503_or_500(self):
-        # Without LEADERBOARD_DB, AdminService returns 500 "Admin unavailable".
-        env = types.SimpleNamespace(WEBHOOK_SECRET="sec")
-        resp = self._run_fetch("GET", "/admin", env)
-        self.assertIn(resp.status, (500, 503))
-
-    def test_delete_mentor_no_session_returns_401(self):
-        env = types.SimpleNamespace(WEBHOOK_SECRET="sec")
-        resp = self._run_fetch("DELETE", "/api/mentors/alice", env)
-        self.assertEqual(resp.status, 401)
 
     def test_get_oauth_callback_no_client_id_returns_503(self):
         resp = self._run_fetch("GET", "/oauth/callback?code=x&state=y", types.SimpleNamespace())
