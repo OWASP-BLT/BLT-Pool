@@ -4658,7 +4658,7 @@ def _generate_mentor_row(mentor: dict, stats: Optional[dict] = None) -> str:
         <div class="sm:hidden">
           <div class="flex items-start justify-between gap-2">
             <p class="truncate font-semibold text-[#111827] text-sm">{name}</p>
-            <div class="shrink-0 flex items-center gap-2">{github_link}{edit_link}</div>
+            <div class="shrink-0 flex items-center gap-2" role="group" aria-label="Mentor actions for {name}">{github_link}{edit_link}</div>
           </div>
           <div class="mt-0.5 flex flex-wrap gap-1">{specialty_chips}</div>
           <div class="mt-1.5 flex flex-wrap items-center gap-x-2 gap-y-1">
