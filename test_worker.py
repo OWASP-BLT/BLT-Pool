@@ -5302,5 +5302,381 @@ class TestTimeAgo(unittest.TestCase):
         self.assertIn("year", result)
 
 
+# ---------------------------------------------------------------------------
+# MentorAuthService tests
+# ---------------------------------------------------------------------------
+
+# Import the service directly so tests don't depend on the Cloudflare runtime.
+import importlib.util as _ilu
+_mentor_auth_spec = _ilu.spec_from_file_location(
+    "mentor_auth_service",
+    _src_path / "services" / "mentor_auth" / "service.py",
+)
+_mentor_auth_mod = _ilu.module_from_spec(_mentor_auth_spec)
+_mentor_auth_spec.loader.exec_module(_mentor_auth_mod)
+MentorAuthService = _mentor_auth_mod.MentorAuthService
+_cookie_value = _mentor_auth_mod._cookie_value
+_session_hash = _mentor_auth_mod._session_hash
+
+
+def _make_mock_db_for_mentor_auth():
+    """Return a MagicMock D1 db that stubs prepare/bind/run/all."""
+    db = MagicMock()
+    stmt = AsyncMock()
+    stmt.bind = MagicMock(return_value=stmt)
+    stmt.run = AsyncMock(return_value={"results": []})
+    stmt.all = AsyncMock(return_value={"results": []})
+    db.prepare = MagicMock(return_value=stmt)
+    return db, stmt
+
+
+class TestMentorAuthCookieHelper(unittest.TestCase):
+    """_cookie_value — parse cookie header."""
+
+    def test_extracts_value(self):
+        self.assertEqual(_cookie_value("blt_mentor_session=abc123; other=x", "blt_mentor_session"), "abc123")
+
+    def test_missing_name_returns_empty(self):
+        self.assertEqual(_cookie_value("foo=bar", "blt_mentor_session"), "")
+
+    def test_empty_header_returns_empty(self):
+        self.assertEqual(_cookie_value("", "blt_mentor_session"), "")
+
+    def test_none_header_returns_empty(self):
+        self.assertEqual(_cookie_value(None, "blt_mentor_session"), "")
+
+
+class TestMentorAuthSessionHash(unittest.TestCase):
+    """_session_hash — deterministic SHA-256 hash of token."""
+
+    def test_returns_hex_string(self):
+        h = _session_hash("mytoken")
+        self.assertIsInstance(h, str)
+        self.assertEqual(len(h), 64)
+
+    def test_consistent(self):
+        self.assertEqual(_session_hash("abc"), _session_hash("abc"))
+
+    def test_different_tokens_differ(self):
+        self.assertNotEqual(_session_hash("tok1"), _session_hash("tok2"))
+
+
+class TestMentorAuthServiceHandle(unittest.TestCase):
+    """MentorAuthService.handle — route dispatching."""
+
+    def _make_env(self, **attrs):
+        return types.SimpleNamespace(**attrs)
+
+    def _make_request(self, method="GET", path="/mentor/login", cookie=""):
+        headers = _HeadersStub({"Cookie": cookie} if cookie else {})
+        return types.SimpleNamespace(
+            method=method,
+            url=f"https://example.com{path}",
+            headers=headers,
+            text=AsyncMock(return_value=""),
+        )
+
+    def test_non_mentor_path_returns_none(self):
+        async def _inner():
+            env = self._make_env()
+            db, stmt = _make_mock_db_for_mentor_auth()
+            env.LEADERBOARD_DB = db
+            svc = MentorAuthService(env)
+            req = self._make_request(path="/api/mentors")
+            return await svc.handle(req)
+        result = _run(_inner())
+        self.assertIsNone(result)
+
+    def test_root_path_returns_none(self):
+        async def _inner():
+            env = self._make_env()
+            db, stmt = _make_mock_db_for_mentor_auth()
+            env.LEADERBOARD_DB = db
+            svc = MentorAuthService(env)
+            req = self._make_request(path="/")
+            return await svc.handle(req)
+        result = _run(_inner())
+        self.assertIsNone(result)
+
+    def test_no_db_returns_503(self):
+        async def _inner():
+            env = self._make_env()
+            # No LEADERBOARD_DB attribute
+            svc = MentorAuthService(env)
+            req = self._make_request(path="/mentor/login")
+            return await svc.handle(req)
+        resp = _run(_inner())
+        self.assertIsNotNone(resp)
+        self.assertEqual(resp.status, 500)
+
+    def test_login_no_client_id_returns_503(self):
+        async def _inner():
+            env = self._make_env()
+            db, stmt = _make_mock_db_for_mentor_auth()
+            env.LEADERBOARD_DB = db
+            # No GITHUB_CLIENT_ID
+            svc = MentorAuthService(env)
+            req = self._make_request(path="/mentor/login")
+            return await svc.handle(req)
+        resp = _run(_inner())
+        self.assertIsNotNone(resp)
+        self.assertEqual(resp.status, 503)
+
+    def test_login_redirects_to_github_when_client_id_set(self):
+        async def _inner():
+            env = self._make_env(GITHUB_CLIENT_ID="test-client-id")
+            db, stmt = _make_mock_db_for_mentor_auth()
+            env.LEADERBOARD_DB = db
+            svc = MentorAuthService(env)
+            req = self._make_request(path="/mentor/login")
+            return await svc.handle(req)
+        resp = _run(_inner())
+        self.assertIsNotNone(resp)
+        self.assertEqual(resp.status, 302)
+        location = resp.headers.get("Location") or ""
+        self.assertIn("github.com/login/oauth/authorize", location)
+        self.assertIn("test-client-id", location)
+        self.assertIn("read", location)  # "read:user" or URL-encoded "read%3Auser"
+
+    def test_callback_missing_code_returns_400(self):
+        async def _inner():
+            env = self._make_env(
+                GITHUB_CLIENT_ID="cid", GITHUB_CLIENT_SECRET="csec"
+            )
+            db, stmt = _make_mock_db_for_mentor_auth()
+            env.LEADERBOARD_DB = db
+            svc = MentorAuthService(env)
+            req = self._make_request(path="/mentor/callback")
+            return await svc.handle(req)
+        resp = _run(_inner())
+        self.assertIsNotNone(resp)
+        self.assertEqual(resp.status, 400)
+
+    def test_callback_invalid_state_returns_400(self):
+        async def _inner():
+            env = self._make_env(
+                GITHUB_CLIENT_ID="cid", GITHUB_CLIENT_SECRET="csec"
+            )
+            db, stmt = _make_mock_db_for_mentor_auth()
+            env.LEADERBOARD_DB = db
+            svc = MentorAuthService(env)
+            req = self._make_request(
+                path="/mentor/callback?code=abc&state=badstate"
+            )
+            return await svc.handle(req)
+        resp = _run(_inner())
+        self.assertIsNotNone(resp)
+        self.assertEqual(resp.status, 400)
+
+    def test_logout_redirects_to_homepage(self):
+        async def _inner():
+            env = self._make_env()
+            db, stmt = _make_mock_db_for_mentor_auth()
+            env.LEADERBOARD_DB = db
+            svc = MentorAuthService(env)
+            req = self._make_request(path="/mentor/logout")
+            return await svc.handle(req)
+        resp = _run(_inner())
+        self.assertIsNotNone(resp)
+        self.assertEqual(resp.status, 302)
+        self.assertEqual(resp.headers.get("Location"), "/")
+
+    def test_settings_get_unauthenticated_redirects_to_login(self):
+        async def _inner():
+            env = self._make_env()
+            db, stmt = _make_mock_db_for_mentor_auth()
+            env.LEADERBOARD_DB = db
+            svc = MentorAuthService(env)
+            req = self._make_request(path="/mentor/settings")
+            return await svc.handle(req)
+        resp = _run(_inner())
+        self.assertIsNotNone(resp)
+        self.assertEqual(resp.status, 302)
+        self.assertEqual(resp.headers.get("Location"), "/mentor/login")
+
+    def test_delete_post_unauthenticated_redirects_to_login(self):
+        async def _inner():
+            env = self._make_env()
+            db, stmt = _make_mock_db_for_mentor_auth()
+            env.LEADERBOARD_DB = db
+            svc = MentorAuthService(env)
+            req = self._make_request(method="POST", path="/mentor/delete")
+            return await svc.handle(req)
+        resp = _run(_inner())
+        self.assertIsNotNone(resp)
+        self.assertEqual(resp.status, 302)
+        self.assertEqual(resp.headers.get("Location"), "/mentor/login")
+
+
+class TestMentorAuthSettingsForm(unittest.TestCase):
+    """MentorAuthService._settings_form — HTML rendering."""
+
+    def _make_svc(self):
+        env = types.SimpleNamespace()
+        db, _ = _make_mock_db_for_mentor_auth()
+        env.LEADERBOARD_DB = db
+        return MentorAuthService(env)
+
+    def test_form_contains_username(self):
+        svc = self._make_svc()
+        html = svc._settings_form(
+            username="alice",
+            name="Alice",
+            specialties=["python"],
+            max_mentees=3,
+            timezone="UTC",
+            active=True,
+        )
+        self.assertIn("@alice", html)
+
+    def test_form_shows_specialties_comma_joined(self):
+        svc = self._make_svc()
+        html = svc._settings_form(
+            username="alice",
+            name="Alice",
+            specialties=["python", "security"],
+            max_mentees=3,
+            timezone="",
+            active=True,
+        )
+        self.assertIn("python, security", html)
+
+    def test_form_escapes_xss_in_name(self):
+        svc = self._make_svc()
+        html = svc._settings_form(
+            username="alice",
+            name='<script>xss</script>',
+            specialties=[],
+            max_mentees=3,
+            timezone="",
+            active=True,
+        )
+        self.assertNotIn("<script>xss</script>", html)
+        self.assertIn("&lt;script&gt;", html)
+
+    def test_form_shows_error_message(self):
+        svc = self._make_svc()
+        html = svc._settings_form(
+            username="alice",
+            name="Alice",
+            specialties=[],
+            max_mentees=3,
+            timezone="",
+            active=True,
+            error="Something went wrong",
+        )
+        self.assertIn("Something went wrong", html)
+
+    def test_form_shows_success_message(self):
+        svc = self._make_svc()
+        html = svc._settings_form(
+            username="alice",
+            name="Alice",
+            specialties=[],
+            max_mentees=3,
+            timezone="",
+            active=True,
+            success="Profile saved!",
+        )
+        self.assertIn("Profile saved!", html)
+
+    def test_delete_section_present(self):
+        svc = self._make_svc()
+        html = svc._settings_form(
+            username="bob",
+            name="Bob",
+            specialties=[],
+            max_mentees=2,
+            timezone="",
+            active=False,
+        )
+        self.assertIn("Danger zone", html)
+        self.assertIn("Permanently delete my profile", html)
+
+
+class TestMentorAuthShell(unittest.TestCase):
+    """MentorAuthService._shell — page layout rendering."""
+
+    def _make_svc(self):
+        env = types.SimpleNamespace()
+        db, _ = _make_mock_db_for_mentor_auth()
+        env.LEADERBOARD_DB = db
+        return MentorAuthService(env)
+
+    def test_shell_contains_doctype(self):
+        svc = self._make_svc()
+        html = svc._shell("Test Title", "<p>content</p>")
+        self.assertIn("<!DOCTYPE html>", html)
+
+    def test_shell_escapes_title(self):
+        svc = self._make_svc()
+        html = svc._shell('<script>bad</script>', "<p>ok</p>")
+        self.assertNotIn("<script>bad</script>", html)
+
+    def test_shell_shows_user_chip_when_logged_in(self):
+        svc = self._make_svc()
+        html = svc._shell("Title", "<p>content</p>", user="alice")
+        self.assertIn("@alice", html)
+        self.assertIn("/mentor/logout", html)
+
+    def test_shell_no_logout_when_anonymous(self):
+        svc = self._make_svc()
+        html = svc._shell("Title", "<p>content</p>")
+        self.assertNotIn("/mentor/logout", html)
+
+
+class TestMentorAuthSessionCookie(unittest.TestCase):
+    """MentorAuthService session cookie helpers."""
+
+    def _make_svc(self):
+        env = types.SimpleNamespace()
+        db, _ = _make_mock_db_for_mentor_auth()
+        env.LEADERBOARD_DB = db
+        return MentorAuthService(env)
+
+    def test_session_cookie_contains_token(self):
+        svc = self._make_svc()
+        cookie = svc._session_cookie("mytok")
+        self.assertIn("mytok", cookie)
+        self.assertIn("HttpOnly", cookie)
+        self.assertIn("SameSite=Lax", cookie)
+
+    def test_clear_session_cookie_sets_max_age_zero(self):
+        svc = self._make_svc()
+        cookie = svc._clear_session_cookie()
+        self.assertIn("Max-Age=0", cookie)
+
+    def test_clear_session_cookie_clears_value(self):
+        svc = self._make_svc()
+        cookie = svc._clear_session_cookie()
+        self.assertIn("blt_mentor_session=;", cookie)
+
+
+class TestGenerateMentorRowEditLink(unittest.TestCase):
+    """_generate_mentor_row — edit link is included in the rendered HTML."""
+
+    def _make_mentor(self, **kwargs):
+        base = {
+            "name": "Alice",
+            "github_username": "alice",
+            "specialties": ["python"],
+            "max_mentees": 3,
+            "timezone": "UTC",
+            "status": "available",
+            "active": True,
+        }
+        base.update(kwargs)
+        return base
+
+    def test_edit_link_present_when_github_username_set(self):
+        html = _worker._generate_mentor_row(self._make_mentor(github_username="alice"))
+        self.assertIn("/mentor/login", html)
+        self.assertIn("Edit", html)
+
+    def test_edit_link_absent_when_github_username_empty(self):
+        html = _worker._generate_mentor_row(self._make_mentor(github_username=""))
+        self.assertNotIn("/mentor/login", html)
+
+
 if __name__ == "__main__":
     unittest.main()
