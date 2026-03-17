@@ -32,7 +32,7 @@ import os
 import re
 import time
 from typing import Optional, Tuple
-from urllib.parse import quote, urlparse
+from urllib.parse import parse_qs, quote, urlparse
 
 from js import Headers, Response, console, fetch  # Cloudflare Workers JS bindings
 from index_template import GITHUB_PAGE_HTML  # Landing page HTML template
@@ -5403,6 +5403,280 @@ async def _handle_add_mentor(request, env) -> "Response":
 
 
 # ---------------------------------------------------------------------------
+# GitHub OAuth / session-cookie helpers
+# ---------------------------------------------------------------------------
+
+_OAUTH_COOKIE_NAME = "blt_session"
+_OAUTH_STATE_COOKIE = "blt_oauth_state"
+_SESSION_MAX_AGE = 86400 * 7  # 7 days
+_OAUTH_STATE_MAX_AGE = 600    # 10 minutes — state cookie TTL
+
+# Scope requested from GitHub OAuth — read:org lets us check org membership,
+# read:user lets us retrieve the authenticated user's profile.
+_OAUTH_SCOPE = "read:org read:user"
+
+
+def _parse_cookies(request) -> dict:
+    """Parse the Cookie header from an HTTP request into a plain dict."""
+    cookie_header = (request.headers.get("Cookie") or "")
+    cookies: dict = {}
+    for part in cookie_header.split(";"):
+        part = part.strip()
+        if "=" in part:
+            k, _, v = part.partition("=")
+            cookies[k.strip()] = v.strip()
+    return cookies
+
+
+def _cookie_signing_secret(env) -> str:
+    """Derive a signing secret for session cookies from WEBHOOK_SECRET."""
+    raw = getattr(env, "WEBHOOK_SECRET", "") or ""
+    # Domain-separate the cookie secret from the webhook verification secret.
+    return hashlib.sha256(f"blt-session:{raw}".encode()).hexdigest()
+
+
+def _hmac_sign(value: str, secret: str) -> str:
+    """Return an HMAC-SHA256 hex digest of *value* using *secret*."""
+    return _hmac.new(secret.encode(), value.encode(), hashlib.sha256).hexdigest()
+
+
+def _make_session_value(token: str, username: str, secret: str) -> str:
+    """Create a tamper-evident session cookie value.
+
+    Format: ``base64(username|token).hmac``
+    """
+    payload = base64.b64encode(f"{username}|{token}".encode()).decode()
+    sig = _hmac_sign(payload, secret)
+    return f"{payload}.{sig}"
+
+
+def _parse_session_value(
+    cookie_value: str, secret: str
+) -> Optional[Tuple[str, str]]:
+    """Verify and decode a session cookie.
+
+    Returns ``(username, token)`` on success or ``None`` if invalid.
+    """
+    try:
+        payload, _, sig = cookie_value.rpartition(".")
+        if not payload or not sig:
+            return None
+        expected = _hmac_sign(payload, secret)
+        if not _hmac.compare_digest(sig, expected):
+            return None
+        decoded = base64.b64decode(payload.encode()).decode()
+        username, _, token = decoded.partition("|")
+        if not username or not token:
+            return None
+        return username, token
+    except Exception:
+        return None
+
+
+def _build_cookie_header(
+    name: str,
+    value: str,
+    max_age: int = _SESSION_MAX_AGE,
+    http_only: bool = True,
+    same_site: str = "Lax",
+    secure: bool = True,
+) -> str:
+    """Return a ``Set-Cookie`` header value string."""
+    parts = [f"{name}={value}", f"Max-Age={max_age}", "Path=/"]
+    if http_only:
+        parts.append("HttpOnly")
+    if same_site:
+        parts.append(f"SameSite={same_site}")
+    if secure:
+        parts.append("Secure")
+    return "; ".join(parts)
+
+
+async def _get_session(request, env) -> Optional[Tuple[str, str]]:
+    """Return ``(username, token)`` from the session cookie, or ``None``."""
+    secret = _cookie_signing_secret(env)
+    cookie_val = _parse_cookies(request).get(_OAUTH_COOKIE_NAME, "")
+    if not cookie_val:
+        return None
+    return _parse_session_value(cookie_val, secret)
+
+
+# ---------------------------------------------------------------------------
+# OAuth route handlers
+# ---------------------------------------------------------------------------
+
+
+async def _handle_login_github(request, env) -> "Response":
+    """GET /login/github — initiate the GitHub OAuth flow.
+
+    Generates a random CSRF state token, stores it in a short-lived cookie,
+    then redirects the browser to GitHub's authorization endpoint.
+    """
+    client_id = getattr(env, "GITHUB_CLIENT_ID", "")
+    if not client_id:
+        return _html(
+            "<h1>GitHub OAuth is not configured.</h1>"
+            "<p>Set the <code>GITHUB_CLIENT_ID</code> and "
+            "<code>GITHUB_CLIENT_SECRET</code> environment variables.</p>",
+            503,
+        )
+
+    # Build the redirect_uri from APP_BASE_URL env var, falling back to the
+    # origin of the incoming request so the callback always points back here.
+    app_base_url = (getattr(env, "APP_BASE_URL", "") or "").rstrip("/")
+    if not app_base_url:
+        parsed = urlparse(str(request.url))
+        app_base_url = f"{parsed.scheme}://{parsed.netloc}"
+    redirect_uri = f"{app_base_url}/oauth/callback"
+
+    # Generate a random, HMAC-signed state token (256-bit random base).
+    raw_state = base64.b64encode(os.urandom(32)).decode().rstrip("=")
+    secret = _cookie_signing_secret(env)
+    signed_state = f"{raw_state}.{_hmac_sign(raw_state, secret)}"
+
+    github_auth_url = (
+        "https://github.com/login/oauth/authorize"
+        f"?client_id={quote(client_id)}"
+        f"&redirect_uri={quote(redirect_uri)}"
+        f"&state={quote(signed_state)}"
+        f"&scope={quote(_OAUTH_SCOPE)}"
+    )
+
+    state_cookie = _build_cookie_header(
+        _OAUTH_STATE_COOKIE, signed_state, max_age=_OAUTH_STATE_MAX_AGE
+    )
+
+    return Response.new(
+        "",
+        status=302,
+        headers=Headers.new({
+            "Location": github_auth_url,
+            "Set-Cookie": state_cookie,
+        }.items()),
+    )
+
+
+async def _handle_oauth_callback(request, env) -> "Response":
+    """GET /oauth/callback — exchange the GitHub OAuth code for a session.
+
+    1. Validates the CSRF state cookie.
+    2. Exchanges the ``code`` parameter for an access token.
+    3. Fetches the authenticated user's profile.
+    4. Sets a signed session cookie and redirects to ``/admin``.
+    """
+    client_id = getattr(env, "GITHUB_CLIENT_ID", "")
+    client_secret = getattr(env, "GITHUB_CLIENT_SECRET", "")
+    if not client_id or not client_secret:
+        return _html("<h1>GitHub OAuth is not configured.</h1>", 503)
+
+    url_parts = urlparse(str(request.url))
+    params = {k: v[0] for k, v in parse_qs(url_parts.query).items()}
+
+    code = params.get("code", "")
+    state = params.get("state", "")
+
+    if not code:
+        return _html("<h1>Bad Request</h1><p>Missing OAuth code.</p>", 400)
+
+    # Verify the CSRF state:
+    # 1. The signed_state cookie must match the URL parameter (cookie-to-param binding).
+    # 2. The HMAC signature embedded in the state must be authentic (server-generated).
+    cookies = _parse_cookies(request)
+    stored_state = cookies.get(_OAUTH_STATE_COOKIE, "")
+    if not stored_state or not _hmac.compare_digest(stored_state, state):
+        return _html(
+            "<h1>Bad Request</h1>"
+            "<p>OAuth state mismatch — possible CSRF. Please try again.</p>",
+            400,
+        )
+    # Validate the HMAC signature embedded in the state token itself.
+    raw_state_part, _, state_sig = state.rpartition(".")
+    if not raw_state_part or not state_sig:
+        return _html("<h1>Bad Request</h1><p>Malformed OAuth state.</p>", 400)
+    secret = _cookie_signing_secret(env)
+    if not _hmac.compare_digest(state_sig, _hmac_sign(raw_state_part, secret)):
+        return _html(
+            "<h1>Bad Request</h1>"
+            "<p>OAuth state signature invalid — possible CSRF. Please try again.</p>",
+            400,
+        )
+
+    # Exchange the code for an access token.
+    # Include redirect_uri to satisfy GitHub's strict matching requirement.
+    app_base_url = (getattr(env, "APP_BASE_URL", "") or "").rstrip("/")
+    if not app_base_url:
+        parsed_cb = urlparse(str(request.url))
+        app_base_url = f"{parsed_cb.scheme}://{parsed_cb.netloc}"
+    redirect_uri = f"{app_base_url}/oauth/callback"
+
+    token_resp = await fetch(
+        "https://github.com/login/oauth/access_token",
+        method="POST",
+        headers=Headers.new({
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+            "User-Agent": "BLT-GitHub-App/1.0",
+        }.items()),
+        body=json.dumps({
+            "client_id": client_id,
+            "client_secret": client_secret,
+            "code": code,
+            "redirect_uri": redirect_uri,
+        }),
+    )
+
+    if token_resp.status != 200:
+        return _html("<h1>OAuth Error</h1><p>Failed to exchange code.</p>", 502)
+
+    token_data = json.loads(await token_resp.text())
+    access_token = token_data.get("access_token", "")
+    if not access_token:
+        err = _html_mod.escape(
+            token_data.get("error_description")
+            or token_data.get("error")
+            or "Unknown OAuth error"
+        )
+        return _html(f"<h1>OAuth Error</h1><p>{err}</p>", 400)
+
+    # Fetch the authenticated user's profile.
+    user_resp = await github_api("GET", "/user", access_token)
+    if user_resp.status != 200:
+        return _html("<h1>OAuth Error</h1><p>Failed to fetch user profile.</p>", 502)
+
+    user = json.loads(await user_resp.text())
+    username = (user.get("login") or "").strip()
+    if not username:
+        return _html("<h1>OAuth Error</h1><p>Empty username returned.</p>", 502)
+
+    # Create a signed session cookie and redirect to the homepage.
+    secret = _cookie_signing_secret(env)
+    session_val = _make_session_value(access_token, username, secret)
+    session_cookie = _build_cookie_header(_OAUTH_COOKIE_NAME, session_val)
+
+    return Response.new(
+        "",
+        status=302,
+        headers=Headers.new({
+            "Location": "/",
+            "Set-Cookie": session_cookie,
+        }.items()),
+    )
+
+
+async def _handle_logout(request, env) -> "Response":
+    """GET /logout — clear the session cookie and redirect to the homepage."""
+    clear_cookie = _build_cookie_header(_OAUTH_COOKIE_NAME, "", max_age=0)
+    return Response.new(
+        "",
+        status=302,
+        headers=Headers.new({
+            "Location": "/",
+            "Set-Cookie": clear_cookie,
+        }.items()),
+    )
+
+
+# ---------------------------------------------------------------------------
 # Response helpers
 # ---------------------------------------------------------------------------
 
@@ -5489,6 +5763,16 @@ async def on_fetch(request, env) -> Response:
 
     if method == "POST" and path == "/api/github/webhooks":
         return await handle_webhook(request, env)
+
+    # GitHub OAuth login / logout / callback
+    if method == "GET" and path == "/login/github":
+        return await _handle_login_github(request, env)
+
+    if method == "GET" and path == "/oauth/callback":
+        return await _handle_oauth_callback(request, env)
+
+    if method == "GET" and path == "/logout":
+        return await _handle_logout(request, env)
 
     # GitHub redirects here after a successful installation
     if method == "GET" and path == "/callback":

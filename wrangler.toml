@@ -21,6 +21,10 @@ directory = "./public"
 # BLT API base URL
 BLT_API_URL = "https://github-app.owaspblt.org"
 
+# Public base URL of this Worker — used to build the OAuth redirect_uri.
+# Must match the "Authorization callback URL" configured in the GitHub OAuth App.
+APP_BASE_URL = "https://a3768ef6-blt-github-app.della-cloudflare-4a1.workers.dev"
+
 # GitHub organization — used for D1 leaderboard and mentor stats queries.
 GITHUB_ORG = "OWASP-BLT"
 
@@ -35,8 +39,8 @@ GITHUB_APP_SLUG = "blt-github-app"
 # APP_ID               — GitHub App numeric ID
 # PRIVATE_KEY          — GitHub App private key (full PEM, PKCS#1 or PKCS#8)
 # WEBHOOK_SECRET       — GitHub App webhook secret
-# GITHUB_CLIENT_ID     — OAuth client ID     (optional)
-# GITHUB_CLIENT_SECRET — OAuth client secret (optional)
+# GITHUB_CLIENT_ID     — OAuth client ID     (required for /admin login)
+# GITHUB_CLIENT_SECRET — OAuth client secret (required for /admin login)
 # ADMIN_SECRET         — Bearer token for POST /admin/reset-leaderboard-month (optional)
 
 

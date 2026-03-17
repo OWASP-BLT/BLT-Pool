@@ -5267,6 +5267,355 @@ class TestHandleAddMentor(unittest.TestCase):
         self.assertEqual(resp.status, 400)
 
 
+# ---------------------------------------------------------------------------
+# GitHub OAuth / session-cookie helper tests
+# ---------------------------------------------------------------------------
+
+
+class TestParseCookies(unittest.TestCase):
+    def test_empty_header_returns_empty_dict(self):
+        req = types.SimpleNamespace(headers=types.SimpleNamespace(get=lambda k, d=None: d))
+        self.assertEqual(_worker._parse_cookies(req), {})
+
+    def test_single_cookie(self):
+        req = types.SimpleNamespace(
+            headers=types.SimpleNamespace(get=lambda k, d=None: "blt_session=abc123" if k == "Cookie" else d)
+        )
+        self.assertEqual(_worker._parse_cookies(req), {"blt_session": "abc123"})
+
+    def test_multiple_cookies(self):
+        req = types.SimpleNamespace(
+            headers=types.SimpleNamespace(
+                get=lambda k, d=None: "a=1; b=2; c=3" if k == "Cookie" else d
+            )
+        )
+        self.assertEqual(_worker._parse_cookies(req), {"a": "1", "b": "2", "c": "3"})
+
+    def test_cookie_with_equals_in_value(self):
+        req = types.SimpleNamespace(
+            headers=types.SimpleNamespace(
+                get=lambda k, d=None: "token=abc=def" if k == "Cookie" else d
+            )
+        )
+        result = _worker._parse_cookies(req)
+        self.assertEqual(result["token"], "abc=def")
+
+
+class TestHmacSign(unittest.TestCase):
+    def test_returns_hex_string(self):
+        sig = _worker._hmac_sign("hello", "secret")
+        self.assertIsInstance(sig, str)
+        self.assertTrue(all(c in "0123456789abcdef" for c in sig))
+
+    def test_different_values_give_different_sigs(self):
+        sig1 = _worker._hmac_sign("value1", "secret")
+        sig2 = _worker._hmac_sign("value2", "secret")
+        self.assertNotEqual(sig1, sig2)
+
+    def test_different_secrets_give_different_sigs(self):
+        sig1 = _worker._hmac_sign("value", "secret1")
+        sig2 = _worker._hmac_sign("value", "secret2")
+        self.assertNotEqual(sig1, sig2)
+
+
+class TestSessionCookie(unittest.TestCase):
+    def _env(self, webhook_secret="test-webhook-secret"):
+        return types.SimpleNamespace(WEBHOOK_SECRET=webhook_secret)
+
+    def test_make_and_parse_round_trip(self):
+        secret = _worker._cookie_signing_secret(self._env())
+        val = _worker._make_session_value("mytoken", "alice", secret)
+        result = _worker._parse_session_value(val, secret)
+        self.assertEqual(result, ("alice", "mytoken"))
+
+    def test_tampered_payload_returns_none(self):
+        secret = _worker._cookie_signing_secret(self._env())
+        val = _worker._make_session_value("token", "alice", secret)
+        # Corrupt the payload part
+        parts = val.split(".")
+        tampered = "XXXX" + parts[0][4:] + "." + parts[1]
+        self.assertIsNone(_worker._parse_session_value(tampered, secret))
+
+    def test_tampered_signature_returns_none(self):
+        secret = _worker._cookie_signing_secret(self._env())
+        val = _worker._make_session_value("token", "alice", secret)
+        payload, _, _ = val.rpartition(".")
+        bad = payload + ".badhexsig"
+        self.assertIsNone(_worker._parse_session_value(bad, secret))
+
+    def test_missing_separator_returns_none(self):
+        self.assertIsNone(_worker._parse_session_value("nodothere", "secret"))
+
+    def test_wrong_secret_returns_none(self):
+        secret = _worker._cookie_signing_secret(self._env("secret-a"))
+        val = _worker._make_session_value("token", "alice", secret)
+        wrong_secret = _worker._cookie_signing_secret(self._env("secret-b"))
+        self.assertIsNone(_worker._parse_session_value(val, wrong_secret))
+
+    def test_cookie_signing_secret_is_deterministic(self):
+        env = self._env()
+        s1 = _worker._cookie_signing_secret(env)
+        s2 = _worker._cookie_signing_secret(env)
+        self.assertEqual(s1, s2)
+
+    def test_cookie_signing_secret_changes_with_webhook_secret(self):
+        s1 = _worker._cookie_signing_secret(self._env("secretA"))
+        s2 = _worker._cookie_signing_secret(self._env("secretB"))
+        self.assertNotEqual(s1, s2)
+
+
+class TestBuildCookieHeader(unittest.TestCase):
+    def test_contains_name_and_value(self):
+        hdr = _worker._build_cookie_header("blt_session", "myvalue")
+        self.assertIn("blt_session=myvalue", hdr)
+
+    def test_contains_max_age(self):
+        hdr = _worker._build_cookie_header("x", "y", max_age=3600)
+        self.assertIn("Max-Age=3600", hdr)
+
+    def test_contains_httponly(self):
+        hdr = _worker._build_cookie_header("x", "y", http_only=True)
+        self.assertIn("HttpOnly", hdr)
+
+    def test_contains_samesite(self):
+        hdr = _worker._build_cookie_header("x", "y", same_site="Lax")
+        self.assertIn("SameSite=Lax", hdr)
+
+    def test_contains_secure(self):
+        hdr = _worker._build_cookie_header("x", "y", secure=True)
+        self.assertIn("Secure", hdr)
+
+    def test_expire_cookie_has_zero_max_age(self):
+        hdr = _worker._build_cookie_header("blt_session", "", max_age=0)
+        self.assertIn("Max-Age=0", hdr)
+
+
+# ---------------------------------------------------------------------------
+# _handle_login_github
+# ---------------------------------------------------------------------------
+
+
+class TestHandleLoginGithub(unittest.TestCase):
+    def _make_env(self, client_id="my-client-id", webhook_secret="whsec"):
+        return types.SimpleNamespace(
+            GITHUB_CLIENT_ID=client_id,
+            WEBHOOK_SECRET=webhook_secret,
+        )
+
+    def _run_handler(self, env):
+        req = types.SimpleNamespace(
+            method="GET",
+            url="http://localhost/login/github",
+            headers=types.SimpleNamespace(get=lambda k, d=None: d),
+        )
+
+        async def _inner():
+            return await _worker._handle_login_github(req, env)
+
+        return _run(_inner())
+
+    def test_redirects_to_github(self):
+        resp = self._run_handler(self._make_env())
+        self.assertEqual(resp.status, 302)
+        self.assertIn("github.com/login/oauth/authorize", resp.headers.get("Location", ""))
+
+    def test_includes_client_id_in_redirect(self):
+        resp = self._run_handler(self._make_env(client_id="test-client-id"))
+        loc = resp.headers.get("Location", "")
+        self.assertIn("test-client-id", loc)
+
+    def test_includes_scope_in_redirect(self):
+        resp = self._run_handler(self._make_env())
+        loc = resp.headers.get("Location", "")
+        self.assertIn("read", loc)
+
+    def test_sets_state_cookie(self):
+        resp = self._run_handler(self._make_env())
+        cookie = resp.headers.get("Set-Cookie", "")
+        self.assertIn(_worker._OAUTH_STATE_COOKIE, cookie)
+
+    def test_no_client_id_returns_503(self):
+        resp = self._run_handler(self._make_env(client_id=""))
+        self.assertEqual(resp.status, 503)
+
+
+# ---------------------------------------------------------------------------
+# _handle_oauth_callback
+# ---------------------------------------------------------------------------
+
+
+class TestHandleOAuthCallback(unittest.TestCase):
+    def _make_env(self, client_id="cid", client_secret="csec", webhook_secret="whsec"):
+        return types.SimpleNamespace(
+            GITHUB_CLIENT_ID=client_id,
+            GITHUB_CLIENT_SECRET=client_secret,
+            WEBHOOK_SECRET=webhook_secret,
+        )
+
+    def _signed_state(self, env, raw="teststate"):
+        secret = _worker._cookie_signing_secret(env)
+        return f"{raw}.{_worker._hmac_sign(raw, secret)}"
+
+    def _make_request(self, env, code="mycode", state=None, cookie_state=None):
+        if state is None:
+            state = self._signed_state(env)
+        if cookie_state is None:
+            cookie_state = state
+        cookie_str = f"{_worker._OAUTH_STATE_COOKIE}={cookie_state}"
+        req = types.SimpleNamespace(
+            method="GET",
+            url=f"http://localhost/oauth/callback?code={code}&state={urllib.parse.quote(state)}",
+            headers=types.SimpleNamespace(
+                get=lambda k, d=None: cookie_str if k == "Cookie" else d
+            ),
+        )
+        return req
+
+    def _run_callback(self, env, req, gh_token="ghp_token", gh_user="alice"):
+        token_resp = types.SimpleNamespace(
+            status=200,
+            text=AsyncMock(return_value=json.dumps({"access_token": gh_token})),
+        )
+        user_resp = types.SimpleNamespace(
+            status=200,
+            text=AsyncMock(return_value=json.dumps({"login": gh_user, "avatar_url": "https://example.com/avatar.png"})),
+        )
+
+        async def _inner():
+            with patch.object(_worker, "fetch", new=AsyncMock(return_value=token_resp)):
+                with patch.object(_worker, "github_api", new=AsyncMock(return_value=user_resp)):
+                    return await _worker._handle_oauth_callback(req, env)
+
+        return _run(_inner())
+
+    def test_valid_callback_redirects_to_homepage(self):
+        env = self._make_env()
+        req = self._make_request(env)
+        resp = self._run_callback(env, req)
+        self.assertEqual(resp.status, 302)
+        self.assertEqual(resp.headers.get("Location"), "/")
+
+    def test_valid_callback_sets_session_cookie(self):
+        env = self._make_env()
+        req = self._make_request(env)
+        resp = self._run_callback(env, req)
+        cookie = resp.headers.get("Set-Cookie", "")
+        self.assertIn(_worker._OAUTH_COOKIE_NAME, cookie)
+
+    def test_missing_code_returns_400(self):
+        env = self._make_env()
+        req = self._make_request(env, code="")
+        req.url = "http://localhost/oauth/callback?state=x"
+
+        async def _inner():
+            return await _worker._handle_oauth_callback(req, env)
+
+        resp = _run(_inner())
+        self.assertEqual(resp.status, 400)
+
+    def test_state_mismatch_returns_400(self):
+        env = self._make_env()
+        req = self._make_request(env, state="wrongstate", cookie_state="differentstate")
+        resp = self._run_callback(env, req)
+        self.assertEqual(resp.status, 400)
+
+    def test_invalid_state_hmac_returns_400(self):
+        """State whose HMAC signature was forged must be rejected."""
+        env = self._make_env()
+        # Build a state where cookie and URL param match but signature is wrong.
+        bad_state = "somepayload.badsignature0000000000000000000000000000000000000000000"
+        req = self._make_request(env, state=bad_state, cookie_state=bad_state)
+        resp = self._run_callback(env, req)
+        self.assertEqual(resp.status, 400)
+
+    def test_missing_client_credentials_returns_503(self):
+        env = self._make_env(client_id="", client_secret="")
+        req = self._make_request(env)
+
+        async def _inner():
+            return await _worker._handle_oauth_callback(req, env)
+
+        resp = _run(_inner())
+        self.assertEqual(resp.status, 503)
+
+    def test_github_token_error_returns_400(self):
+        env = self._make_env()
+        req = self._make_request(env)
+        token_resp = types.SimpleNamespace(
+            status=200,
+            text=AsyncMock(return_value=json.dumps({"error": "bad_verification_code", "error_description": "Code has expired."})),
+        )
+
+        async def _inner():
+            with patch.object(_worker, "fetch", new=AsyncMock(return_value=token_resp)):
+                return await _worker._handle_oauth_callback(req, env)
+
+        resp = _run(_inner())
+        self.assertEqual(resp.status, 400)
+
+
+# ---------------------------------------------------------------------------
+# _handle_logout
+# ---------------------------------------------------------------------------
+
+
+class TestHandleLogout(unittest.TestCase):
+    def test_clears_session_cookie_and_redirects(self):
+        env = types.SimpleNamespace(WEBHOOK_SECRET="secret")
+        req = types.SimpleNamespace(
+            method="GET",
+            url="http://localhost/logout",
+            headers=types.SimpleNamespace(get=lambda k, d=None: d),
+        )
+
+        async def _inner():
+            return await _worker._handle_logout(req, env)
+
+        resp = _run(_inner())
+        self.assertEqual(resp.status, 302)
+        self.assertEqual(resp.headers.get("Location"), "/")
+        cookie = resp.headers.get("Set-Cookie", "")
+        self.assertIn("Max-Age=0", cookie)
+        self.assertIn(_worker._OAUTH_COOKIE_NAME, cookie)
+
+
+# ---------------------------------------------------------------------------
+# on_fetch routing for new endpoints
+# ---------------------------------------------------------------------------
+
+
+class TestOnFetchNewRoutes(unittest.TestCase):
+    """Verify the OAuth routes are wired up in on_fetch."""
+
+    def _run_fetch(self, method, path, env=None, cookies=""):
+        if env is None:
+            env = types.SimpleNamespace()
+        req = types.SimpleNamespace(
+            method=method,
+            url=f"http://localhost{path}",
+            headers=types.SimpleNamespace(
+                get=lambda k, d=None: cookies if k == "Cookie" else d
+            ),
+        )
+
+        async def _inner():
+            return await _worker.on_fetch(req, env)
+
+        return _run(_inner())
+
+    def test_get_login_github_no_client_id_returns_503(self):
+        resp = self._run_fetch("GET", "/login/github", types.SimpleNamespace())
+        self.assertEqual(resp.status, 503)
+
+    def test_get_logout_redirects(self):
+        env = types.SimpleNamespace(WEBHOOK_SECRET="sec")
+        resp = self._run_fetch("GET", "/logout", env)
+        self.assertEqual(resp.status, 302)
+        self.assertEqual(resp.headers.get("Location"), "/")
+
+    def test_get_oauth_callback_no_client_id_returns_503(self):
+        resp = self._run_fetch("GET", "/oauth/callback?code=x&state=y", types.SimpleNamespace())
+        self.assertEqual(resp.status, 503)
 class TestTimeAgo(unittest.TestCase):
     """Tests for _time_ago helper function."""
 
