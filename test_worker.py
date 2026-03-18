@@ -2354,6 +2354,348 @@ class TestD1MentorAssignments(unittest.TestCase):
         result = _run(_inner())
         self.assertEqual(result, [])
 
+    def test_increment_mentor_misses_calls_d1(self):
+        """_d1_increment_mentor_misses issues an UPDATE to the mentors table."""
+        mock_db, stmt = self._make_mock_db()
+
+        async def _inner():
+            with patch.object(
+                _worker, "console",
+                new=types.SimpleNamespace(log=lambda *a: None, error=lambda *a: None),
+            ):
+                await _worker._d1_increment_mentor_misses(mock_db, "alice")
+        _run(_inner())
+        mock_db.prepare.assert_called()
+        sql_called = mock_db.prepare.call_args[0][0]
+        self.assertIn("UPDATE mentors", sql_called)
+        self.assertIn("misses", sql_called)
+
+
+class TestMentorHasResponded(unittest.TestCase):
+    """_mentor_has_responded — checks whether a mentor has commented since assignment."""
+
+    def _api(self, comments):
+        return AsyncMock(return_value=types.SimpleNamespace(
+            status=200,
+            text=AsyncMock(return_value=json.dumps(comments)),
+        ))
+
+    def test_returns_true_when_mentor_has_commented(self):
+        since_ts = 1000.0
+        comments = [
+            {
+                "user": {"login": "alice", "type": "User"},
+                "created_at": "2024-06-01T00:00:00Z",
+            }
+        ]
+        # Ensure the created_at parses to > since_ts.
+        parsed_ts = _worker._parse_github_timestamp("2024-06-01T00:00:00Z")
+
+        async def _inner():
+            with patch.object(_worker, "github_api", new=self._api(comments)):
+                with patch.object(
+                    _worker, "console",
+                    new=types.SimpleNamespace(log=lambda *a: None, error=lambda *a: None),
+                ):
+                    return await _worker._mentor_has_responded(
+                        "owner", "repo", 1, "alice", since_ts, "tok"
+                    )
+        self.assertTrue(_run(_inner()))
+
+    def test_returns_false_when_mentor_has_not_commented(self):
+        since_ts = 9999999999.0  # Far in the future — no comment can be newer.
+        comments = [
+            {
+                "user": {"login": "bob", "type": "User"},
+                "created_at": "2024-06-01T00:00:00Z",
+            }
+        ]
+
+        async def _inner():
+            with patch.object(_worker, "github_api", new=self._api(comments)):
+                with patch.object(
+                    _worker, "console",
+                    new=types.SimpleNamespace(log=lambda *a: None, error=lambda *a: None),
+                ):
+                    return await _worker._mentor_has_responded(
+                        "owner", "repo", 1, "alice", since_ts, "tok"
+                    )
+        self.assertFalse(_run(_inner()))
+
+    def test_returns_true_when_api_fails(self):
+        """Fail-open: treat API errors as 'responded' to avoid spurious reassignment."""
+        async def _inner():
+            with patch.object(
+                _worker, "github_api",
+                new=AsyncMock(return_value=types.SimpleNamespace(
+                    status=500,
+                    text=AsyncMock(return_value="error"),
+                )),
+            ):
+                with patch.object(
+                    _worker, "console",
+                    new=types.SimpleNamespace(log=lambda *a: None, error=lambda *a: None),
+                ):
+                    return await _worker._mentor_has_responded(
+                        "owner", "repo", 1, "alice", 0.0, "tok"
+                    )
+        self.assertTrue(_run(_inner()))
+
+    def test_case_insensitive_username_match(self):
+        since_ts = 1000.0
+        comments = [
+            {
+                "user": {"login": "Alice", "type": "User"},
+                "created_at": "2024-06-01T00:00:00Z",
+            }
+        ]
+
+        async def _inner():
+            with patch.object(_worker, "github_api", new=self._api(comments)):
+                with patch.object(
+                    _worker, "console",
+                    new=types.SimpleNamespace(log=lambda *a: None, error=lambda *a: None),
+                ):
+                    return await _worker._mentor_has_responded(
+                        "owner", "repo", 1, "alice", since_ts, "tok"
+                    )
+        self.assertTrue(_run(_inner()))
+
+
+class TestCheckMentorNoResponse(unittest.TestCase):
+    """_check_mentor_no_response — reassigns unresponsive mentors and records a miss."""
+
+    def _make_mock_db(self, assignment_rows=None):
+        mock_db = MagicMock()
+        stmt = AsyncMock()
+        stmt.bind = MagicMock(return_value=stmt)
+        stmt.run = AsyncMock(return_value={"results": []})
+        stmt.all = AsyncMock(return_value={"results": assignment_rows or []})
+        mock_db.prepare = MagicMock(return_value=stmt)
+        return mock_db, stmt
+
+    def test_skips_when_no_d1_binding(self):
+        """Does nothing when D1 is not configured."""
+        called = {"github_api": False}
+
+        async def _fake_github_api(*a, **kw):
+            called["github_api"] = True
+
+        async def _inner():
+            with patch.object(_worker, "github_api", new=_fake_github_api):
+                await _worker._check_mentor_no_response("owner", "repo", "tok", env=None)
+        _run(_inner())
+        self.assertFalse(called["github_api"])
+
+    def test_skips_when_no_overdue_assignments(self):
+        """Does nothing when D1 returns no overdue rows."""
+        mock_db, stmt = self._make_mock_db(assignment_rows=[])
+        env = types.SimpleNamespace(LEADERBOARD_DB=mock_db)
+
+        api_calls = []
+
+        async def _fake_github_api(method, path, token, body=None):
+            api_calls.append(path)
+            return types.SimpleNamespace(status=200, text=AsyncMock(return_value="[]"))
+
+        async def _inner():
+            with patch.object(_worker, "_d1_binding", return_value=mock_db):
+                with patch.object(_worker, "_ensure_leaderboard_schema", new=AsyncMock()):
+                    with patch.object(_worker, "_d1_all", new=AsyncMock(return_value=[])):
+                        with patch.object(_worker, "github_api", new=_fake_github_api):
+                            with patch.object(
+                                _worker, "console",
+                                new=types.SimpleNamespace(log=lambda *a: None, error=lambda *a: None),
+                            ):
+                                await _worker._check_mentor_no_response(
+                                    "owner", "repo", "tok", env=env
+                                )
+        _run(_inner())
+        # No GitHub API calls should have been made.
+        self.assertEqual(api_calls, [])
+
+    def test_reassigns_and_increments_miss_when_no_response(self):
+        """Increments miss count and calls _assign_mentor_to_issue when mentor did not respond."""
+        import time as _time
+        mock_db, stmt = self._make_mock_db()
+        env = types.SimpleNamespace(LEADERBOARD_DB=mock_db)
+
+        overdue_ts = int(_time.time()) - _worker.MENTOR_NO_RESPONSE_HOURS * 3600 - 60
+        overdue_rows = [
+            {
+                "mentor_login": "alice",
+                "mentee_login": "contributor",
+                "issue_number": 42,
+                "assigned_at": overdue_ts,
+            }
+        ]
+
+        issue_json = json.dumps({
+            "number": 42,
+            "state": "open",
+            "labels": [{"name": "mentor-assigned"}],
+            "created_at": "2024-01-01T00:00:00Z",
+        })
+
+        api_responses = {
+            "GET /repos/owner/repo/issues/42": types.SimpleNamespace(
+                status=200, text=AsyncMock(return_value=issue_json)
+            ),
+            "DELETE /repos/owner/repo/issues/42/labels/mentor-assigned": types.SimpleNamespace(
+                status=200, text=AsyncMock(return_value="{}")
+            ),
+        }
+
+        api_calls = []
+
+        async def _fake_github_api(method, path, token, body=None):
+            api_calls.append(f"{method} {path}")
+            key = f"{method} {path}"
+            if key in api_responses:
+                return api_responses[key]
+            return types.SimpleNamespace(status=200, text=AsyncMock(return_value="[]"))
+
+        increment_calls = []
+        assign_calls = []
+        comment_calls = []
+
+        async def _fake_increment(db, username):
+            increment_calls.append(username)
+
+        async def _fake_assign(*a, **kw):
+            assign_calls.append(kw.get("exclude"))
+            return True
+
+        async def _fake_create_comment(owner, repo, issue_number, body, token):
+            comment_calls.append(body)
+
+        async def _inner():
+            with patch.object(_worker, "_d1_binding", return_value=mock_db):
+                with patch.object(_worker, "_ensure_leaderboard_schema", new=AsyncMock()):
+                    with patch.object(_worker, "_d1_all", new=AsyncMock(return_value=overdue_rows)):
+                        with patch.object(_worker, "_mentor_has_responded", new=AsyncMock(return_value=False)):
+                            with patch.object(_worker, "github_api", new=_fake_github_api):
+                                with patch.object(_worker, "_d1_increment_mentor_misses", new=_fake_increment):
+                                    with patch.object(_worker, "_assign_mentor_to_issue", new=_fake_assign):
+                                        with patch.object(_worker, "create_comment", new=_fake_create_comment):
+                                            with patch.object(_worker, "_fetch_mentors_config", new=AsyncMock(return_value=[])):
+                                                with patch.object(
+                                                    _worker, "console",
+                                                    new=types.SimpleNamespace(log=lambda *a: None, error=lambda *a: None),
+                                                ):
+                                                    await _worker._check_mentor_no_response(
+                                                        "owner", "repo", "tok", env=env
+                                                    )
+        _run(_inner())
+        # Miss counter should have been incremented for alice.
+        self.assertIn("alice", increment_calls)
+        # _assign_mentor_to_issue should have been called with exclude=alice.
+        self.assertIn("alice", assign_calls)
+        # A notice comment should have been posted.
+        self.assertTrue(any("alice" in c for c in comment_calls))
+
+    def test_skips_when_mentor_has_responded(self):
+        """Does not reassign or increment miss when mentor has already commented."""
+        import time as _time
+        mock_db, stmt = self._make_mock_db()
+        env = types.SimpleNamespace(LEADERBOARD_DB=mock_db)
+
+        overdue_ts = int(_time.time()) - _worker.MENTOR_NO_RESPONSE_HOURS * 3600 - 60
+        overdue_rows = [
+            {
+                "mentor_login": "alice",
+                "mentee_login": "contributor",
+                "issue_number": 7,
+                "assigned_at": overdue_ts,
+            }
+        ]
+
+        increment_calls = []
+        assign_calls = []
+
+        async def _fake_increment(db, username):
+            increment_calls.append(username)
+
+        async def _fake_assign(*a, **kw):
+            assign_calls.append(True)
+            return True
+
+        async def _inner():
+            with patch.object(_worker, "_d1_binding", return_value=mock_db):
+                with patch.object(_worker, "_ensure_leaderboard_schema", new=AsyncMock()):
+                    with patch.object(_worker, "_d1_all", new=AsyncMock(return_value=overdue_rows)):
+                        with patch.object(_worker, "_mentor_has_responded", new=AsyncMock(return_value=True)):
+                            with patch.object(_worker, "_d1_increment_mentor_misses", new=_fake_increment):
+                                with patch.object(_worker, "_assign_mentor_to_issue", new=_fake_assign):
+                                    with patch.object(_worker, "_fetch_mentors_config", new=AsyncMock(return_value=[])):
+                                        with patch.object(
+                                            _worker, "console",
+                                            new=types.SimpleNamespace(log=lambda *a: None, error=lambda *a: None),
+                                        ):
+                                            await _worker._check_mentor_no_response(
+                                                "owner", "repo", "tok", env=env
+                                            )
+        _run(_inner())
+        self.assertEqual(increment_calls, [])
+        self.assertEqual(assign_calls, [])
+
+    def test_cleans_up_d1_for_closed_issues(self):
+        """Removes the D1 record when the issue is already closed."""
+        import time as _time
+        mock_db, stmt = self._make_mock_db()
+        env = types.SimpleNamespace(LEADERBOARD_DB=mock_db)
+
+        overdue_ts = int(_time.time()) - _worker.MENTOR_NO_RESPONSE_HOURS * 3600 - 60
+        overdue_rows = [
+            {
+                "mentor_login": "carol",
+                "mentee_login": "",
+                "issue_number": 99,
+                "assigned_at": overdue_ts,
+            }
+        ]
+
+        closed_issue_json = json.dumps({
+            "number": 99,
+            "state": "closed",
+            "labels": [],
+            "created_at": "2024-01-01T00:00:00Z",
+        })
+
+        async def _fake_github_api(method, path, token, body=None):
+            return types.SimpleNamespace(status=200, text=AsyncMock(return_value=closed_issue_json))
+
+        remove_calls = []
+
+        async def _fake_remove(db, org, repo, issue_number):
+            remove_calls.append(issue_number)
+
+        assign_calls = []
+
+        async def _fake_assign(*a, **kw):
+            assign_calls.append(True)
+            return True
+
+        async def _inner():
+            with patch.object(_worker, "_d1_binding", return_value=mock_db):
+                with patch.object(_worker, "_ensure_leaderboard_schema", new=AsyncMock()):
+                    with patch.object(_worker, "_d1_all", new=AsyncMock(return_value=overdue_rows)):
+                        with patch.object(_worker, "_mentor_has_responded", new=AsyncMock(return_value=False)):
+                            with patch.object(_worker, "github_api", new=_fake_github_api):
+                                with patch.object(_worker, "_d1_remove_mentor_assignment", new=_fake_remove):
+                                    with patch.object(_worker, "_assign_mentor_to_issue", new=_fake_assign):
+                                        with patch.object(_worker, "_fetch_mentors_config", new=AsyncMock(return_value=[])):
+                                            with patch.object(
+                                                _worker, "console",
+                                                new=types.SimpleNamespace(log=lambda *a: None, error=lambda *a: None),
+                                            ):
+                                                await _worker._check_mentor_no_response(
+                                                    "owner", "repo", "tok", env=env
+                                                )
+        _run(_inner())
+        self.assertIn(99, remove_calls)
+        self.assertEqual(assign_calls, [])
+
 
 class TestBackfillRepoMonthIdempotency(unittest.TestCase):
     """Test that _backfill_repo_month_if_needed skips PRs already tracked via webhooks."""

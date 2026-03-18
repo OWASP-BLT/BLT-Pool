@@ -73,6 +73,8 @@ MENTOR_ASSIGNED_LABEL_COLOR = "0075ca"
 SECURITY_BYPASS_LABELS = {"security", "vulnerability", "security-sensitive", "private-security"}
 # Seconds in a day — used for stale-assignment threshold calculations.
 _SECONDS_PER_DAY = 86400
+# Hours a mentor has to respond before being replaced and penalised with a miss.
+MENTOR_NO_RESPONSE_HOURS = 24
 # TTL for cached GitHub-sourced all-time mentor stats in D1 (24 hours).
 _MENTOR_STATS_CACHE_TTL = 86400
 # When True, one active mentor is auto-requested as a reviewer on every newly
@@ -643,10 +645,19 @@ async def _ensure_leaderboard_schema(db) -> None:
             max_mentees INTEGER NOT NULL DEFAULT 3,
             active INTEGER NOT NULL DEFAULT 1,
             timezone TEXT NOT NULL DEFAULT '',
-            referred_by TEXT NOT NULL DEFAULT ''
+            referred_by TEXT NOT NULL DEFAULT '',
+            misses INTEGER NOT NULL DEFAULT 0
         )
         """,
     )
+    # Migration: add misses column to existing mentors tables that pre-date this field.
+    try:
+        await _d1_run(
+            db,
+            "ALTER TABLE mentors ADD COLUMN misses INTEGER NOT NULL DEFAULT 0",
+        )
+    except Exception:
+        pass  # Column already exists — ignore the error.
     await _d1_run(
         db,
         """
@@ -801,6 +812,19 @@ async def _d1_remove_mentor_assignment(db, org: str, repo: str, issue_number: in
         console.log(f"[D1] Removed mentor assignment: {org}/{repo}#{issue_number}")
     except Exception as exc:
         console.error(f"[D1] Failed to remove mentor assignment: {exc}")
+
+
+async def _d1_increment_mentor_misses(db, github_username: str) -> None:
+    """Increment the no-response miss counter for a mentor in D1."""
+    try:
+        await _d1_run(
+            db,
+            "UPDATE mentors SET misses = misses + 1 WHERE github_username = ?",
+            (github_username,),
+        )
+        console.log(f"[D1] Incremented miss count for @{github_username}")
+    except Exception as exc:
+        console.error(f"[D1] Failed to increment mentor misses for @{github_username}: {exc}")
 
 
 async def _d1_get_mentor_loads(db, org: str) -> dict:
@@ -3400,6 +3424,180 @@ async def _check_stale_mentor_assignments(owner: str, repo: str, token: str) -> 
         console.error(f"[MentorPool] Error checking stale mentors in {owner}/{repo}: {exc}")
 
 
+async def _mentor_has_responded(
+    owner: str,
+    repo: str,
+    issue_number: int,
+    mentor_login: str,
+    since_ts: float,
+    token: str,
+) -> bool:
+    """Return ``True`` if the mentor has posted a comment on the issue after ``since_ts``.
+
+    Fetches issue comments in ascending order and checks whether the assigned
+    mentor has replied since the assignment timestamp.  Returns ``True`` (fail-open)
+    when the GitHub API is unavailable so that a transient error never causes an
+    unwarranted reassignment.
+    """
+    try:
+        per_page = 100
+        page = 1
+        while True:
+            resp = await github_api(
+                "GET",
+                f"/repos/{owner}/{repo}/issues/{issue_number}/comments"
+                f"?sort=created&direction=asc&per_page={per_page}&page={page}",
+                token,
+            )
+            if resp.status != 200:
+                return True  # Fail open: assume responded when API is unavailable.
+            comments = json.loads(await resp.text())
+            if not comments:
+                break
+            for comment in comments:
+                user = comment.get("user") or {}
+                login = user.get("login", "")
+                created_at = _parse_github_timestamp(comment.get("created_at", ""))
+                if login.lower() == mentor_login.lower() and created_at and created_at > since_ts:
+                    return True
+            if len(comments) < per_page:
+                break
+            page += 1
+        return False
+    except Exception:
+        return True  # Fail open on unexpected errors.
+
+
+async def _check_mentor_no_response(
+    owner: str,
+    repo: str,
+    token: str,
+    env=None,
+) -> None:
+    """Reassign and penalise mentors who have not responded within ``MENTOR_NO_RESPONSE_HOURS``.
+
+    For every active mentor assignment in D1 that is older than
+    ``MENTOR_NO_RESPONSE_HOURS`` hours, checks whether the assigned mentor has
+    posted at least one comment on the issue since the assignment.  When no
+    response is found the mentor's miss counter is incremented, the
+    ``mentor-assigned`` label is removed, and the next available mentor in the
+    round-robin pool is assigned via ``_assign_mentor_to_issue``.
+
+    D1 is required for this check; if no binding is present the function returns
+    immediately without making any GitHub API calls.
+    """
+    db = _d1_binding(env)
+    if not db:
+        return  # D1 required to track assignment timestamps.
+
+    try:
+        await _ensure_leaderboard_schema(db)
+        deadline = int(time.time()) - MENTOR_NO_RESPONSE_HOURS * 3600
+
+        # Fetch overdue assignments for this org/repo from D1.
+        rows = await _d1_all(
+            db,
+            """
+            SELECT mentor_login, mentee_login, issue_number, assigned_at
+            FROM mentor_assignments
+            WHERE org = ? AND issue_repo = ? AND assigned_at <= ?
+            """,
+            (owner, repo, deadline),
+        )
+        if not rows:
+            return
+
+        mentors_config = await _fetch_mentors_config(env=env)
+
+        for row in rows:
+            mentor_login = row.get("mentor_login", "")
+            issue_number = int(row.get("issue_number") or 0)
+            assigned_at = float(row.get("assigned_at") or 0)
+            mentee_login = row.get("mentee_login", "")
+
+            if not mentor_login or not issue_number:
+                continue
+
+            # Check whether the mentor has already responded.
+            has_responded = await _mentor_has_responded(
+                owner, repo, issue_number, mentor_login, assigned_at, token
+            )
+            if has_responded:
+                continue
+
+            # Fetch the current issue state from GitHub.
+            issue_resp = await github_api(
+                "GET",
+                f"/repos/{owner}/{repo}/issues/{issue_number}",
+                token,
+            )
+            if issue_resp.status != 200:
+                continue
+            issue = json.loads(await issue_resp.text())
+
+            # Skip closed issues — clean up the stale D1 record.
+            if issue.get("state") == "closed":
+                await _d1_remove_mentor_assignment(db, owner, repo, issue_number)
+                continue
+
+            # Skip if the mentor-assigned label is no longer present.
+            current_labels = {lb.get("name", "").lower() for lb in issue.get("labels", [])}
+            if MENTOR_ASSIGNED_LABEL.lower() not in current_labels:
+                await _d1_remove_mentor_assignment(db, owner, repo, issue_number)
+                continue
+
+            # Post a notice about the no-response reassignment.
+            await create_comment(
+                owner,
+                repo,
+                issue_number,
+                f"⏰ @{mentor_login} was assigned as mentor but did not respond within "
+                f"{MENTOR_NO_RESPONSE_HOURS} hours. Reassigning to the next available mentor.\n\n"
+                "— [OWASP BLT-Pool](https://pool.owaspblt.org)",
+                token,
+            )
+
+            # Increment the mentor's miss counter.
+            await _d1_increment_mentor_misses(db, mentor_login)
+
+            # Remove the mentor-assigned label before reassigning so that
+            # _assign_mentor_to_issue does not abort the early-return guard.
+            await github_api(
+                "DELETE",
+                f"/repos/{owner}/{repo}/issues/{issue_number}/labels/{MENTOR_ASSIGNED_LABEL}",
+                token,
+            )
+
+            # Build a view of the issue without the mentor-assigned label.
+            updated_issue = {
+                **issue,
+                "labels": [
+                    lb for lb in issue.get("labels", [])
+                    if lb.get("name", "").lower() != MENTOR_ASSIGNED_LABEL.lower()
+                ],
+            }
+
+            # Assign the next mentor in the round-robin sequence.
+            await _assign_mentor_to_issue(
+                owner,
+                repo,
+                updated_issue,
+                mentee_login,
+                token,
+                mentors_config,
+                exclude=mentor_login,
+                env=env,
+            )
+
+            console.log(
+                f"[MentorPool] No-response reassignment on {owner}/{repo}#{issue_number}: "
+                f"@{mentor_login} replaced (miss count incremented)"
+            )
+
+    except Exception as exc:
+        console.error(f"[MentorPool] Error checking no-response mentors in {owner}/{repo}: {exc}")
+
+
 # ---------------------------------------------------------------------------
 # Event handlers — mirror the Node.js handler logic exactly
 # ---------------------------------------------------------------------------
@@ -5744,6 +5942,7 @@ async def _run_scheduled(env):
                 
                 await _check_stale_assignments(owner, repo_name, token)
                 await _check_stale_mentor_assignments(owner, repo_name, token)
+                await _check_mentor_no_response(owner, repo_name, token, env=env)
         
         console.log("[CRON] Stale assignment check complete")
         
