@@ -28,8 +28,8 @@ import hashlib
 import hmac as _hmac
 import html as _html_mod
 import json
+import os
 import re
-import secrets
 import time
 import types as _types
 from typing import Optional, Tuple
@@ -435,7 +435,7 @@ async def _check_stale_assignments(owner: str, repo: str, token: str):
                 
                 # Post a comment explaining the unassignment
                 assignee_mentions = ", ".join(f"@{login}" for login in assignee_logins)
-                await _create_comment_best_effort(
+                await create_comment(
                     owner, repo, issue_number,
                     f"{assignee_mentions} This issue has been automatically unassigned because "
                     f"the {ASSIGNMENT_DURATION_HOURS}-hour deadline has passed without a linked pull request.\n\n"
