@@ -2157,21 +2157,33 @@ class TestD1MentorAssignments(unittest.TestCase):
         env = types.SimpleNamespace(LEADERBOARD_DB=mock_db)
         mentors = [{"github_username": "alice"}, {"github_username": "bob"}]
 
-        # GitHub API responses: merged PRs then reviews for each mentor.
+        # GitHub API responses: merged PRs, reviews, commits, comments for each mentor.
         pr_alice = MagicMock()
         pr_alice.status = 200
         pr_alice.text = AsyncMock(return_value=json.dumps({"total_count": 42}))
         rev_alice = MagicMock()
         rev_alice.status = 200
         rev_alice.text = AsyncMock(return_value=json.dumps({"total_count": 7}))
+        commit_alice = MagicMock()
+        commit_alice.status = 200
+        commit_alice.text = AsyncMock(return_value=json.dumps({"total_count": 100}))
+        comment_alice = MagicMock()
+        comment_alice.status = 200
+        comment_alice.text = AsyncMock(return_value=json.dumps({"total_count": 20}))
         pr_bob = MagicMock()
         pr_bob.status = 200
         pr_bob.text = AsyncMock(return_value=json.dumps({"total_count": 15}))
         rev_bob = MagicMock()
         rev_bob.status = 200
         rev_bob.text = AsyncMock(return_value=json.dumps({"total_count": 3}))
+        commit_bob = MagicMock()
+        commit_bob.status = 200
+        commit_bob.text = AsyncMock(return_value=json.dumps({"total_count": 50}))
+        comment_bob = MagicMock()
+        comment_bob.status = 200
+        comment_bob.text = AsyncMock(return_value=json.dumps({"total_count": 8}))
 
-        api_responses = [pr_alice, rev_alice, pr_bob, rev_bob]
+        api_responses = [pr_alice, rev_alice, commit_alice, comment_alice, pr_bob, rev_bob, commit_bob, comment_bob]
         call_index = {"i": 0}
 
         async def _fake_github_api(method, path, token, body=None):
@@ -2194,8 +2206,12 @@ class TestD1MentorAssignments(unittest.TestCase):
         result = _run(_inner())
         self.assertEqual(result["alice"]["merged_prs"], 42)
         self.assertEqual(result["alice"]["reviews"], 7)
+        self.assertEqual(result["alice"]["commits"], 100)
+        self.assertEqual(result["alice"]["comments"], 20)
         self.assertEqual(result["bob"]["merged_prs"], 15)
         self.assertEqual(result["bob"]["reviews"], 3)
+        self.assertEqual(result["bob"]["commits"], 50)
+        self.assertEqual(result["bob"]["comments"], 8)
 
     def test_fetch_mentor_stats_uses_cache_when_fresh(self):
         """_fetch_mentor_stats_from_d1 returns cached values when they are still fresh."""
@@ -5080,26 +5096,39 @@ class TestGenerateMentorRow(unittest.TestCase):
 
     def test_stats_prs_shown_when_provided(self):
         html = _worker._generate_mentor_row(
-            self._make_mentor(), stats={"merged_prs": 42, "reviews": 7}
+            self._make_mentor(), stats={"merged_prs": 42, "reviews": 7, "commits": 100, "comments": 20}
         )
         self.assertIn("42", html)
         self.assertIn("7", html)
         self.assertIn("PRs", html)
         self.assertIn("Reviews", html)
+        self.assertIn("Commits", html)
+        self.assertIn("Comments", html)
 
     def test_stats_not_shown_when_none(self):
         html = _worker._generate_mentor_row(self._make_mentor(), stats=None)
         # Should not contain PR/review stat headings when stats are absent
         self.assertNotIn("Reviews", html)
         self.assertNotIn("PRs", html)
+        self.assertNotIn("Commits", html)
+        self.assertNotIn("Comments", html)
 
     def test_stats_zero_values_shown(self):
         html = _worker._generate_mentor_row(
-            self._make_mentor(), stats={"merged_prs": 0, "reviews": 0}
+            self._make_mentor(), stats={"merged_prs": 0, "reviews": 0, "commits": 0, "comments": 0}
         )
         # Zero stats are still displayed when the stats dict is provided
         self.assertIn("PRs", html)
         self.assertIn("Reviews", html)
+        self.assertIn("Commits", html)
+        self.assertIn("Comments", html)
+
+    def test_stats_commits_and_comments_shown(self):
+        html = _worker._generate_mentor_row(
+            self._make_mentor(), stats={"merged_prs": 5, "reviews": 2, "commits": 88, "comments": 33}
+        )
+        self.assertIn("88", html)
+        self.assertIn("33", html)
 
 
 class TestIndexHtml(unittest.TestCase):
@@ -5152,8 +5181,11 @@ class TestIndexHtml(unittest.TestCase):
     def test_mentor_stats_not_shown_when_empty(self):
         mentors = [{"name": "Alice", "github_username": "alice", "active": True, "status": "available"}]
         html = _worker._index_html(mentors, mentor_stats={})
-        # Stats headings should not appear when no stats are provided
-        self.assertNotIn("Reviews", html)
+        # When no per-mentor stats are available, individual mentor cards should
+        # not render stat value cells (the header row column labels are still shown).
+        self.assertNotIn("PRs</p>", html)
+        self.assertNotIn("Commits</p>", html)
+        self.assertNotIn("Comments</p>", html)
 
     def test_active_assignments_section_shown(self):
         """Active assignments section appears when assignments are provided."""
@@ -5574,6 +5606,77 @@ class TestHandleAddMentor(unittest.TestCase):
     def test_invalid_referred_by_format_returns_400(self):
         resp, _ = self._run_add({"name": "Jane Doe", "github_username": "janedoe", "referred_by": "bad user!"})
         self.assertEqual(resp.status, 400)
+
+
+class TestHandleRefreshMentorStats(unittest.TestCase):
+    """_handle_refresh_mentor_stats — POST /api/refresh-mentor-stats endpoint."""
+
+    def _make_post_request(self):
+        return types.SimpleNamespace(
+            method="POST",
+            url="http://localhost/api/refresh-mentor-stats",
+            headers=types.SimpleNamespace(get=lambda k, d=None: d),
+        )
+
+    def _run_refresh(self, token="fake-token", mentors=None, stats=None):
+        if mentors is None:
+            mentors = [{"github_username": "alice"}, {"github_username": "bob"}]
+        if stats is None:
+            stats = {"alice": {"merged_prs": 5, "reviews": 2, "commits": 10, "comments": 3},
+                     "bob": {"merged_prs": 1, "reviews": 0, "commits": 4, "comments": 1}}
+        env = types.SimpleNamespace(GITHUB_TOKEN=token, GITHUB_ORG="OWASP-BLT")
+
+        async def _inner():
+            req = self._make_post_request()
+            with patch.object(_worker, "_load_mentors_local", new=AsyncMock(return_value=mentors)):
+                with patch.object(_worker, "_fetch_mentor_stats_from_d1", new=AsyncMock(return_value=stats)):
+                    with patch.object(_worker, "_d1_binding", return_value=object()):
+                        with patch.object(
+                            _worker, "console",
+                            new=types.SimpleNamespace(log=lambda *a: None, error=lambda *a: None),
+                        ):
+                            return await _worker._handle_refresh_mentor_stats(req, env)
+
+        return _run(_inner())
+
+    def test_returns_ok_with_refreshed_count(self):
+        resp = self._run_refresh()
+        import json as _json
+        data = _json.loads(resp.body)
+        self.assertTrue(data.get("ok"))
+        self.assertEqual(data.get("refreshed"), 2)
+        self.assertEqual(resp.status, 200)
+
+    def test_returns_503_when_no_token(self):
+        resp = self._run_refresh(token="")
+        import json as _json
+        data = _json.loads(resp.body)
+        self.assertIn("error", data)
+        self.assertEqual(resp.status, 503)
+
+    def test_force_refresh_passed_to_fetch(self):
+        """Refresh endpoint calls _fetch_mentor_stats_from_d1 with force_refresh=True."""
+        env = types.SimpleNamespace(GITHUB_TOKEN="tok", GITHUB_ORG="OWASP-BLT")
+        calls = []
+
+        async def _fake_fetch(env_, org, mentors=None, token="", force_refresh=False):
+            calls.append({"force_refresh": force_refresh})
+            return {"alice": {"merged_prs": 1, "reviews": 0, "commits": 0, "comments": 0}}
+
+        async def _inner():
+            req = self._make_post_request()
+            with patch.object(_worker, "_load_mentors_local", new=AsyncMock(return_value=[{"github_username": "alice"}])):
+                with patch.object(_worker, "_fetch_mentor_stats_from_d1", side_effect=_fake_fetch):
+                    with patch.object(_worker, "_d1_binding", return_value=object()):
+                        with patch.object(
+                            _worker, "console",
+                            new=types.SimpleNamespace(log=lambda *a: None, error=lambda *a: None),
+                        ):
+                            return await _worker._handle_refresh_mentor_stats(req, env)
+
+        _run(_inner())
+        self.assertEqual(len(calls), 1)
+        self.assertTrue(calls[0]["force_refresh"])
 
 
 class TestTimeAgo(unittest.TestCase):
