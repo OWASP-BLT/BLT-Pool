@@ -70,8 +70,7 @@ for _mod in [constants, crypto, github_client, db, leaderboard, mentor_pool, eve
             if obj_mod in _STDLIB_MODULES or obj_mod.split('.')[0] in _STDLIB_MODULES:
                 # It's from stdlib - but check if it's a constant/pattern that was created in our module
                 # Functions and classes have their defining module set, but instances don't
-                import types
-                if isinstance(_obj, (types.FunctionType, type)):
+                if isinstance(_obj, (_types.FunctionType, type)):
                     # It's a function or class from stdlib, skip it
                     should_import = False
                 else:
