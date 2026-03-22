@@ -37,6 +37,7 @@ from urllib.parse import quote, urlparse
 from js import Headers, Response, console, fetch  # Cloudflare Workers JS bindings
 from index_template import GITHUB_PAGE_HTML  # Landing page HTML template
 from services.admin import AdminService, has_merged_pr_in_org
+from services.mentor_auth import MentorAuthService
 from services.mentor_seed import INITIAL_MENTORS
 
 # ---------------------------------------------------------------------------
@@ -4936,6 +4937,16 @@ def _generate_mentor_row(mentor: dict, stats: Optional[dict] = None) -> str:
         else '<span class="text-gray-300"><i class="fa-brands fa-github" aria-hidden="true"></i></span>'
     )
 
+    edit_link = (
+        f'<a href="/mentor/login" '
+        f'class="inline-flex items-center gap-1 rounded-md border border-[#E5E5E5] px-2 py-1 '
+        f'text-xs font-semibold text-gray-600 transition hover:border-[#E10101] hover:text-[#E10101]" '
+        f'aria-label="Edit profile for {name}">'
+        '<i class="fa-solid fa-pen-to-square text-[0.65rem]" aria-hidden="true"></i>'
+        'Edit</a>'
+        if github else ""
+    )
+
     tz_cell = f'<span class="text-xs text-gray-500">{_html_mod.escape(timezone)}</span>' if timezone else '<span class="text-xs text-gray-400">—</span>'
 
     # Stats cells — shown when D1 data is available.
@@ -4958,11 +4969,11 @@ def _generate_mentor_row(mentor: dict, stats: Optional[dict] = None) -> str:
             f'<span class="text-xs text-gray-500">'
             f'<i class="fa-solid fa-magnifying-glass-chart text-gray-400" aria-hidden="true"></i> {reviews} reviews</span>'
         )
-        desktop_cols = "sm:grid-cols-[1fr_auto_auto_auto_auto_auto_auto]"
+        desktop_cols = "sm:grid-cols-[1fr_auto_auto_auto_auto_auto_auto_auto]"
     else:
         stats_desktop = ""
         stats_mobile = ""
-        desktop_cols = "sm:grid-cols-[1fr_auto_auto_auto_auto]"
+        desktop_cols = "sm:grid-cols-[1fr_auto_auto_auto_auto_auto]"
 
     return f'''
     <li class="flex items-start gap-3 rounded-xl border border-[#E5E5E5] bg-white px-4 py-3 transition hover:shadow-sm sm:items-center sm:gap-4">
@@ -4982,12 +4993,13 @@ def _generate_mentor_row(mentor: dict, stats: Optional[dict] = None) -> str:
           {stats_desktop}
           <div>{tz_cell}</div>
           <div>{github_link}</div>
+          <div>{edit_link}</div>
         </div>
         <!-- Mobile: compact card layout -->
         <div class="sm:hidden">
           <div class="flex items-start justify-between gap-2">
             <p class="truncate font-semibold text-[#111827] text-sm">{name}</p>
-            <div class="shrink-0">{github_link}</div>
+            <div class="shrink-0 flex items-center gap-2" role="group" aria-label="Mentor actions for {name}">{github_link}{edit_link}</div>
           </div>
           <div class="mt-0.5 flex flex-wrap gap-1">{specialty_chips}</div>
           <div class="mt-1.5 flex flex-wrap items-center gap-x-2 gap-y-1">
@@ -5779,6 +5791,10 @@ async def on_fetch(request, env) -> Response:
     admin_response = await AdminService(env).handle(request)
     if admin_response is not None:
         return admin_response
+
+    mentor_auth_response = await MentorAuthService(env).handle(request)
+    if mentor_auth_response is not None:
+        return mentor_auth_response
 
     if method == "GET" and path == "/":
         # Load mentors from D1.
