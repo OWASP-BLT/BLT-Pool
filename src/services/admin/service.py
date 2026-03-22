@@ -56,14 +56,14 @@ def _session_hash(session_token: str) -> str:
 
 
 def _github_headers(token: str = "") -> Headers:
-    headers = {
-        "Accept": "application/vnd.github+json",
-        "User-Agent": "BLT-Pool/1.0",
-        "X-GitHub-Api-Version": "2022-11-28",
-    }
+    pairs = [
+        ["Accept", "application/vnd.github+json"],
+        ["User-Agent", "BLT-Pool/1.0"],
+        ["X-GitHub-Api-Version", "2022-11-28"],
+    ]
     if token:
-        headers["Authorization"] = f"Bearer {token}"
-    return Headers.new(headers.items())
+        pairs.append(["Authorization", f"Bearer {token}"])
+    return Headers.new(pairs)
 
 
 async def has_merged_pr_in_org(env, github_username: str, org: str = "OWASP-BLT") -> bool:
@@ -282,20 +282,20 @@ class AdminService:
         return Response.new(
             json.dumps(payload),
             status=status,
-            headers=Headers.new({"Content-Type": "application/json"}.items()),
+            headers=Headers.new([["Content-Type", "application/json"]]),
         )
 
     def _html(self, body: str, status: int = 200, set_cookie: str = ""):
-        headers = {"Content-Type": "text/html; charset=utf-8"}
+        pairs = [["Content-Type", "text/html; charset=utf-8"]]
         if set_cookie:
-            headers["Set-Cookie"] = set_cookie
-        return Response.new(body, status=status, headers=Headers.new(headers.items()))
+            pairs.append(["Set-Cookie", set_cookie])
+        return Response.new(body, status=status, headers=Headers.new(pairs))
 
     def _redirect(self, location: str, set_cookie: str = ""):
-        headers = {"Location": location}
+        pairs = [["Location", location]]
         if set_cookie:
-            headers["Set-Cookie"] = set_cookie
-        return Response.new("", status=302, headers=Headers.new(headers.items()))
+            pairs.append(["Set-Cookie", set_cookie])
+        return Response.new("", status=302, headers=Headers.new(pairs))
 
     def _session_cookie(self, token: str) -> str:
         return (
