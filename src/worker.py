@@ -186,4 +186,4 @@ async def _run_scheduled(env) -> None:
         if token:
             # Check a few core repositories (this could be expanded or made dynamic)
             for repo in ["owasp.github.io", "BLT", "blt-extension"]:
-                await _check_stale_mentor_assignments("OWASP", repo, token)
+                await _check_stale_mentor_assignments("OWASP", repo, token, env=env)

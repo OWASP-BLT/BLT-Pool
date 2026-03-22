@@ -41,16 +41,16 @@ sys.modules.setdefault("pyodide.ffi", _pyodide_ffi_stub)
 
 import contextlib
 import sys
-from unittest.mock import patch, MagicMock
+import inspect
+from unittest.mock import patch, MagicMock, AsyncMock
 
 @contextlib.contextmanager
 def patch_all_modules(func_name, new=None, **kwargs):
+    the_mock = None
     if new is not None:
         the_mock = new
     elif "new" in kwargs:
         the_mock = kwargs["new"]
-    else:
-        the_mock = MagicMock(**kwargs)
         
     with contextlib.ExitStack() as stack:
         for mod_name, mod in list(sys.modules.items()):
@@ -58,8 +58,20 @@ def patch_all_modules(func_name, new=None, **kwargs):
             if mod and hasattr(mod, func_name) and not mod_name.startswith("pytest") and mod_name != __name__:
                 # avoid patching builtin or unexpected things, just to be safe
                 val = getattr(mod, func_name)
-                if callable(val) or isinstance(val, (MagicMock, type(the_mock))):
+                
+                # Intelligently determine mock type on first sight
+                if the_mock is None:
+                    if inspect.iscoroutinefunction(val):
+                        the_mock = AsyncMock(**kwargs)
+                    else:
+                        the_mock = MagicMock(**kwargs)
+                        
+                if callable(val) or isinstance(val, (MagicMock, AsyncMock, type(the_mock))):
                     stack.enter_context(patch.object(mod, func_name, new=the_mock))
+                    
+        if the_mock is None:
+            the_mock = MagicMock(**kwargs)
+            
         yield the_mock
 
 
@@ -744,33 +756,29 @@ class TestHandleIssueOpened(unittest.TestCase):
 
 
 class TestLoadNoWelcomeRepos(unittest.TestCase):
-    """Tests for _load_no_welcome_repos YAML parser."""
+    """Tests for _load_no_welcome_repos embedded-constant implementation.
 
-    def test_parses_repos_list(self):
-        content = "repos:\n  - BLT-Design-Contest\n  - AnotherRepo\n"
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".yml", delete=False) as f:
-            f.write(content)
-            tmp_path = f.name
-        try:
-            result = _worker._load_no_welcome_repos(tmp_path)
-            self.assertEqual(result, ["BLT-Design-Contest", "AnotherRepo"])
-        finally:
-            os.unlink(tmp_path)
+    The function no longer reads from the filesystem (Cloudflare Workers has no
+    disk access); it returns the _DEFAULT_NO_WELCOME_REPOS constant instead.
+    """
 
-    def test_returns_empty_list_when_file_missing(self):
+    def test_returns_embedded_constant(self):
+        # Always returns the built-in list regardless of path argument.
+        result = _worker._load_no_welcome_repos()
+        self.assertIsInstance(result, list)
+        self.assertIn("BLT-Design-Contest", result)
+
+    def test_path_argument_is_ignored(self):
+        # Even when a non-existent path is supplied the constant is returned.
         result = _worker._load_no_welcome_repos("/nonexistent/path/repos.yml")
-        self.assertEqual(result, [])
+        self.assertIsInstance(result, list)
+        self.assertIn("BLT-Design-Contest", result)
 
     def test_ignores_comments_and_blank_lines(self):
-        content = "# comment\n\nrepos:\n  # another comment\n  - BLT-Design-Contest\n"
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".yml", delete=False) as f:
-            f.write(content)
-            tmp_path = f.name
-        try:
-            result = _worker._load_no_welcome_repos(tmp_path)
-            self.assertEqual(result, ["BLT-Design-Contest"])
-        finally:
-            os.unlink(tmp_path)
+        # Legacy test — verifies no crash when called without args.
+        result = _worker._load_no_welcome_repos()
+        self.assertEqual(result, ["BLT-Design-Contest"])
+
 
 
 class TestHandleIssueLabeled(unittest.TestCase):
@@ -4657,6 +4665,7 @@ class TestHandleMentorRematch(unittest.TestCase):
     def test_triggers_reassignment_when_mentor_present(self):
         issue = {
             "number": 1,
+            "user": {"login": "contributor"},
             "labels": [{"name": "mentor-assigned"}],
             "assignees": [],
             "state": "open",
@@ -4677,6 +4686,7 @@ class TestHandleMentorRematch(unittest.TestCase):
         # (we don't make DELETE calls for the old assignee or label).
         issue = {
             "number": 3,
+            "user": {"login": "contributor"},
             "labels": [{"name": "mentor-assigned"}],
             "assignees": [{"login": "alice"}],
             "state": "open",
@@ -5043,16 +5053,15 @@ class TestRoundRobinMentorReviewer(unittest.TestCase):
         pr = {"number": pr_number, "user": {"login": author}}
 
         async def _inner():
-            with patch_all_modules("MENTOR_AUTO_PR_REVIEWER_ENABLED", True):
-                with patch_all_modules("github_api",
-                    new=AsyncMock(side_effect=lambda m, p, t, b=None: (
-                        reviewer_calls.append(b) or
-                        types.SimpleNamespace(status=201, text=AsyncMock(return_value="{}"))
-                    )),
-                ):
-                    await _worker._assign_round_robin_mentor_reviewer(
-                        "OWASP-BLT", "TestRepo", pr, self._POOL, "tok"
-                    )
+            with patch_all_modules("github_api",
+                new=AsyncMock(side_effect=lambda m, p, t, b=None: (
+                    reviewer_calls.append(b) or
+                    types.SimpleNamespace(status=201, text=AsyncMock(return_value="{}"))
+                )),
+            ):
+                await _worker._assign_round_robin_mentor_reviewer(
+                    "OWASP-BLT", "TestRepo", pr, self._POOL, "tok", True
+                )
 
         _run(_inner())
 

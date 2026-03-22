@@ -325,50 +325,33 @@ async def _unassign(
         token,
     )
 
-_NO_WELCOME_REPOS_YML_PATH = os.path.join(os.path.dirname(__file__), "no_welcome_repos.yml")
-_NO_WELCOME_REPOS_CACHE: Optional[list] = None
+# ---------------------------------------------------------------------------
+# No-welcome repos — embedded from src/no_welcome_repos.yml
+# The YAML file is kept for human reference only; it cannot be read at runtime
+# inside the Cloudflare Workers/Pyodide environment (no filesystem access).
+# ---------------------------------------------------------------------------
+
+_DEFAULT_NO_WELCOME_REPOS: list = [
+    "BLT-Design-Contest",
+]
+
+# Keep these names so existing importers (worker.py) don't need to change.
+_NO_WELCOME_REPOS_YML_PATH = os.path.join(os.path.dirname(__file__), "..", "no_welcome_repos.yml")
+_NO_WELCOME_REPOS_CACHE: Optional[list] = _DEFAULT_NO_WELCOME_REPOS
+
 
 def _load_no_welcome_repos(path: str = _NO_WELCOME_REPOS_YML_PATH) -> list:
     """Return the list of repository names that should not receive the new-issue welcome message.
 
-    Reads ``src/no_welcome_repos.yml`` which has the format::
+    The list is sourced from the :data:`_DEFAULT_NO_WELCOME_REPOS` constant
+    (embedded at deploy time from ``src/no_welcome_repos.yml``) because
+    Cloudflare Workers does not provide filesystem access at runtime.
 
-        repos:
-          - RepoName
-          - AnotherRepo
-
-    The result is cached in memory after the first read.
+    The ``path`` argument is accepted for backwards compatibility with tests but
+    is intentionally ignored in production.
     """
-    global _NO_WELCOME_REPOS_CACHE
-    if path == _NO_WELCOME_REPOS_YML_PATH and _NO_WELCOME_REPOS_CACHE is not None:
-        return _NO_WELCOME_REPOS_CACHE
-    try:
-        with open(path, "r", encoding="utf-8") as fh:
-            content = fh.read()
-    except OSError:
-        if path == _NO_WELCOME_REPOS_YML_PATH:
-            _NO_WELCOME_REPOS_CACHE = []
-        return []
-    repos: list = []
-    in_repos_section = False
-    for raw_line in content.splitlines():
-        line = raw_line.rstrip()
-        stripped = line.strip()
-        if not stripped or stripped.startswith("#"):
-            continue
-        if stripped == "repos:":
-            in_repos_section = True
-            continue
-        # If we hit another top-level key (non-indented line ending with ":"),
-        # we are no longer in the "repos" section.
-        if not line.startswith(" ") and stripped.endswith(":"):
-            in_repos_section = False
-            continue
-        if in_repos_section and stripped.startswith("- "):
-            repos.append(stripped[2:].strip())
-    if path == _NO_WELCOME_REPOS_YML_PATH:
-        _NO_WELCOME_REPOS_CACHE = repos
-    return repos
+    # Always return the embedded constant; cache is pre-populated at import time.
+    return _DEFAULT_NO_WELCOME_REPOS
 
 async def handle_issue_opened(
     payload: dict, token: str, blt_api_url: str

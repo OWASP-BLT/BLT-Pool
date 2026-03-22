@@ -4,7 +4,7 @@ from typing import Optional
 
 from js import console
 from core.github_client import github_api, create_comment, _is_maintainer, _ensure_label_exists
-from core.db import _d1_binding
+from core.db import _d1_binding, _d1_run
 from models.mentor import _find_assigned_mentor_from_comments, _select_mentor, _get_last_human_activity_ts, _is_security_issue, _fetch_mentors_config, MENTOR_ASSIGNED_LABEL, MENTOR_STALE_DAYS, _SECONDS_PER_DAY, NEEDS_MENTOR_LABEL, MENTOR_LABEL_COLOR, MENTOR_ASSIGNED_LABEL_COLOR
 from models.assignment import _d1_record_mentor_assignment, _d1_remove_mentor_assignment
 
@@ -281,6 +281,20 @@ async def handle_mentor_pause(
         "Contact a maintainer if you need to resume your availability.",
         token,
     )
+    # Persist the pause to D1 so _select_mentor() respects it immediately.
+    db = _d1_binding(env)
+    if db:
+        try:
+            await _d1_run(
+                db,
+                "UPDATE mentors SET active = 0 WHERE lower(github_username) = lower(?)",
+                (login,),
+            )
+            console.log(f"[MentorPool] Paused mentor @{login} in D1")
+        except Exception as exc:
+            console.error(f"[MentorPool] Failed to persist pause for @{login} in D1 (best-effort): {exc}")
+    else:
+        console.error("[MentorPool] No D1 binding available; pause for @{login} was not persisted.")
 
 async def handle_mentor_handoff(
     owner: str,
@@ -408,6 +422,25 @@ async def handle_mentor_rematch(
         owner, repo, issue_number, token
     )
 
+    # Authorization gate: only the issue author, the assigned mentor, or a repo
+    # maintainer may force a rematch (mirrors the check in handle_mentor_unassign).
+    issue_author = (issue.get("user") or {}).get("login", "")
+    is_issue_author = login.lower() == issue_author.lower()
+    is_assigned_mentor = current_mentor and login.lower() == current_mentor.lower()
+    if not is_issue_author and not is_assigned_mentor:
+        is_repo_maintainer = await _is_maintainer(owner, repo, login, token)
+        if not is_repo_maintainer:
+            await create_comment(
+                owner,
+                repo,
+                issue_number,
+                f"@{login} Only the issue author, the assigned mentor, or a repo maintainer "
+                "can request a rematch.\n\n"
+                "— [OWASP BLT-Pool](https://pool.owaspblt.org)",
+                token,
+            )
+            return
+
     # Build a temporary issue view with the mentor-assigned label stripped so the
     # assignment check inside _assign_mentor_to_issue does not abort early.
     updated_issue = {
@@ -444,7 +477,7 @@ async def handle_mentor_rematch(
         f"[MentorPool] Rematch completed for @{login} on {owner}/{repo}#{issue_number}"
     )
 
-async def _check_stale_mentor_assignments(owner: str, repo: str, token: str) -> None:
+async def _check_stale_mentor_assignments(owner: str, repo: str, token: str, env=None) -> None:
     """Unassign mentors from issues that have been inactive for MENTOR_STALE_DAYS days.
 
     Iterates over open issues that carry the ``mentor-assigned`` label.  When the
@@ -499,6 +532,17 @@ async def _check_stale_mentor_assignments(owner: str, repo: str, token: str) -> 
                     f"/repos/{owner}/{repo}/issues/{issue_number}/labels/{MENTOR_ASSIGNED_LABEL}",
                     token,
                 )
+
+                # Free the mentor's capacity slot in D1 (best-effort).
+                db = _d1_binding(env)
+                if db:
+                    try:
+                        await _d1_remove_mentor_assignment(db, owner, repo, issue_number)
+                    except Exception as exc:
+                        console.error(
+                            f"[MentorPool] Failed to remove stale D1 assignment for "
+                            f"{owner}/{repo}#{issue_number} (best-effort): {exc}"
+                        )
 
                 days_elapsed = int((current_time - last_human_ts) / _SECONDS_PER_DAY)
                 mentor_mention = f"@{current_mentor} " if current_mentor else ""

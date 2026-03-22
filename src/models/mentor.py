@@ -583,6 +583,3 @@ def _is_security_issue(issue: dict) -> bool:
     labels = {lb.get("name", "").lower() for lb in issue.get("labels", [])}
     return bool(labels & SECURITY_BYPASS_LABELS)
 
-_GH_USERNAME_RE = re.compile(r"^[a-zA-Z0-9](?:[a-zA-Z0-9\-]{0,37}[a-zA-Z0-9])?$")
-
-_SPECIALTY_RE = re.compile(r"^[a-z0-9][a-z0-9+#.\-]{0,29}$")

@@ -15,15 +15,14 @@ async def _verify_gh_user_exists(username: str, env=None) -> bool:
 
     Uses GITHUB_TOKEN from env if available (5,000 req/h); falls back to
     unauthenticated requests (60 req/h per IP) when no token is set.
-    Returns True on network/API error so a transient outage does not block
-    legitimate submissions (fail-open policy).
     """
     token = getattr(env, "GITHUB_TOKEN", "") if env else ""
     try:
         resp = await github_api("GET", f"/users/{username}", token)
         return resp.status == 200
-    except Exception:
-        return True  # Fail open: don't block when GitHub API is temporarily unavailable
+    except Exception as exc:
+        console.error(f"[API] Error verifying GitHub user {username}: {exc}")
+        raise
 
 async def _handle_add_mentor(request, env) -> "Response":
     """POST /api/mentors — insert a new mentor into the D1 mentors table.
@@ -45,6 +44,9 @@ async def _handle_add_mentor(request, env) -> "Response":
         body = json.loads(await request.text())
     except Exception:
         return _json({"error": "Invalid JSON body"}, 400)
+
+    if not isinstance(body, dict):
+        return _json({"error": "Invalid JSON object"}, 400)
 
     name = (body.get("name") or "").strip()
     github_username = (body.get("github_username") or "").strip().lstrip("@")
@@ -154,6 +156,9 @@ async def _handle_admin_reset(request, env):
         body = json.loads(await request.text())
     except Exception:
         return _json({"error": "Invalid JSON body"}, 400)
+        
+    if not isinstance(body, dict):
+        return _json({"error": "Invalid JSON object"}, 400)
     org = (body.get("org") or "").strip()
     if not org:
         return _json({"error": "Missing required field: org"}, 400)

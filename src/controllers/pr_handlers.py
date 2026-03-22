@@ -61,7 +61,7 @@ async def handle_pull_request_opened(payload: dict, token: str, env=None) -> Non
         except Exception:
             mentors_config = []
         try:
-            await _assign_round_robin_mentor_reviewer(owner, repo, pr, mentors_config, token)
+            await _assign_round_robin_mentor_reviewer(owner, repo, pr, mentors_config, token, auto_reviewer_enabled)
         except Exception as exc:
             console.error(f"[MentorPool] Round-robin reviewer failed (best-effort): {exc}")
 
@@ -147,6 +147,7 @@ async def _assign_round_robin_mentor_reviewer(
     pr: dict,
     mentors_config: Optional[list],
     token: str,
+    auto_reviewer_enabled: bool = False,
 ) -> None:
     """Auto-request one mentor as a reviewer on a newly opened PR (round-robin).
 
@@ -155,7 +156,7 @@ async def _assign_round_robin_mentor_reviewer(
     assignment cycles predictably across consecutive PRs.  The PR author is
     never chosen as their own reviewer.
     """
-    if not MENTOR_AUTO_PR_REVIEWER_ENABLED:
+    if not auto_reviewer_enabled:
         return
 
     pool = mentors_config if mentors_config is not None else []
@@ -216,6 +217,8 @@ async def _post_merged_pr_combined_comment(
     # 1. Fetch leaderboard data via shared helper
     # ---------------------------------------------------------------------------
     leaderboard_data, leaderboard_note, _is_org = await _fetch_leaderboard_data(owner, repo, token, env)
+    if leaderboard_data is None:
+        leaderboard_data = {}
 
     # ---------------------------------------------------------------------------
     # 2. Build the combined comment body
@@ -228,11 +231,16 @@ async def _post_merged_pr_combined_comment(
     )
 
     contributor_section = _format_leaderboard_comment(author_login, leaderboard_data, owner, leaderboard_note)
-    # Strip the marker from the inner section — the combined comment has its own marker.
-    contributor_section = contributor_section.replace(LEADERBOARD_MARKER + "\n", "")
+    if isinstance(contributor_section, str):
+        contributor_section = contributor_section.replace(LEADERBOARD_MARKER + "\n", "")
+    else:
+        contributor_section = ""
 
     reviewer_section = _format_reviewer_leaderboard_comment(leaderboard_data, owner, pr_reviewers or [])
-    reviewer_section = reviewer_section.replace(REVIEWER_LEADERBOARD_MARKER + "\n", "")
+    if isinstance(reviewer_section, str):
+        reviewer_section = reviewer_section.replace(REVIEWER_LEADERBOARD_MARKER + "\n", "")
+    else:
+        reviewer_section = ""
 
     combined_body = (
         MERGED_PR_COMMENT_MARKER + "\n"

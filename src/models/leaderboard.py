@@ -7,6 +7,7 @@ Handles:
 - Stats calculation (aggregating counts from D1 or live API)
 """
 
+import calendar
 import json
 import time
 from typing import Optional
@@ -522,191 +523,6 @@ async def _calculate_leaderboard_stats_from_d1(owner: str, env) -> Optional[dict
     }
 
 
-async def _calculate_leaderboard_stats(owner: str, repos: list, token: str, window_months: int = 1) -> dict:
-    """Calculate leaderboard stats across ALL repositories using GitHub Search API."""
-    now_seconds = int(time.time())
-    import time as _t
-    now = _t.gmtime(now_seconds)
-    
-    start_of_month = _t.struct_time((now.tm_year, now.tm_mon, 1, 0, 0, 0, 0, 0, 0))
-    import calendar
-    start_timestamp = int(calendar.timegm(start_of_month))
-    
-    if now.tm_mon == 12:
-        end_month = 1
-        end_year = now.tm_year + 1
-    else:
-        end_month = now.tm_mon + 1
-        end_year = now.tm_year
-    end_of_month = _t.struct_time((end_year, end_month, 1, 0, 0, 0, 0, 0, 0))
-    end_timestamp = int(calendar.timegm(end_of_month)) - 1
-    
-    start_date = _t.strftime("%Y-%m-%d", _t.gmtime(start_timestamp))
-    end_date = _t.strftime("%Y-%m-%d", _t.gmtime(end_timestamp))
-    
-    user_stats = {}
-    def ensure_user(login: str):
-        if login not in user_stats:
-            user_stats[login] = {"openPrs": 0, "mergedPrs": 0, "closedPrs": 0, "reviews": 0, "comments": 0, "total": 0}
-            
-    page = 1
-    while page <= 3:
-        resp = await github_api("GET", f"/search/issues?q=is:pr+is:open+org:{owner}&per_page=100&page={page}", token)
-        if resp.status != 200: break
-        data = json.loads(await resp.text())
-        items = data.get("items", [])
-        if not items: break
-        for pr in items:
-            if pr.get("user") and not _is_bot(pr["user"]):
-                login = pr["user"]["login"]
-                ensure_user(login)
-                user_stats[login]["openPrs"] += 1
-        if len(items) < 100: break
-        page += 1
-    
-    page = 1
-    while page <= 3:
-        resp = await github_api("GET", f"/search/issues?q=is:pr+is:merged+org:{owner}+merged:{start_date}..{end_date}&per_page=100&page={page}", token)
-        if resp.status != 200: break
-        data = json.loads(await resp.text())
-        items = data.get("items", [])
-        if not items: break
-        for pr in items:
-            if pr.get("user") and not _is_bot(pr["user"]):
-                login = pr["user"]["login"]
-                ensure_user(login)
-                user_stats[login]["mergedPrs"] += 1
-        if len(items) < 100: break
-        page += 1
-    
-    page = 1
-    while page <= 3:
-        resp = await github_api("GET", f"/search/issues?q=is:pr+is:closed+is:unmerged+org:{owner}+closed:{start_date}..{end_date}&per_page=100&page={page}", token)
-        if resp.status != 200: break
-        data = json.loads(await resp.text())
-        items = data.get("items", [])
-        if not items: break
-        for pr in items:
-            if pr.get("user") and not _is_bot(pr["user"]):
-                login = pr["user"]["login"]
-                ensure_user(login)
-                user_stats[login]["closedPrs"] += 1
-        if len(items) < 100: break
-        page += 1
-    
-    max_review_calls = 15
-    review_calls_used = 0
-    page = 1
-    sampled_prs = []
-    while page <= 2 and len(sampled_prs) < max_review_calls:
-        resp = await github_api("GET", f"/search/issues?q=is:pr+is:merged+org:{owner}+merged:{start_date}..{end_date}&per_page=50&page={page}&sort=updated", token)
-        if resp.status != 200: break
-        data = json.loads(await resp.text())
-        items = data.get("items", [])
-        if not items: break
-        for pr in items:
-            if len(sampled_prs) >= max_review_calls: break
-            repo_url = pr.get("repository_url", "")
-            if repo_url:
-                parts = repo_url.split("/")
-                if len(parts) >= 2:
-                    repo_name = parts[-1]
-                    pr_number = pr.get("number")
-                    if repo_name and pr_number:
-                        sampled_prs.append((repo_name, pr_number))
-        if len(items) < 50: break
-        page += 1
-    
-    for repo_name, pr_number in sampled_prs:
-        if review_calls_used >= max_review_calls: break
-        resp_reviews = await github_api("GET", f"/repos/{owner}/{repo_name}/pulls/{pr_number}/reviews", token)
-        review_calls_used += 1
-        if resp_reviews.status == 200:
-            reviews = json.loads(await resp_reviews.text())
-            pr_review_count = {}
-            for review in reviews:
-                if review.get("user") and not _is_bot(review["user"]):
-                    submitted_at = review.get("submitted_at")
-                    if submitted_at:
-                        review_ts = _parse_github_timestamp(submitted_at)
-                        if start_timestamp <= review_ts <= end_timestamp:
-                            login = review["user"]["login"]
-                            pr_review_count[login] = pr_review_count.get(login, 0) + 1
-            for login in list(pr_review_count.keys())[:2]:
-                ensure_user(login)
-                user_stats[login]["reviews"] += 1
-    
-    for login in user_stats:
-        s = user_stats[login]
-        s["total"] = (s["openPrs"] * 1) + (s["mergedPrs"] * 10) + (s["closedPrs"] * -2) + (s["reviews"] * 5) + (s["comments"] * 2)
-    
-    sorted_users = sorted(
-        [{"login": login, **stats} for login, stats in user_stats.items()],
-        key=lambda u: (-u["total"], -u["mergedPrs"], -u["reviews"], u["login"].lower())
-    )
-    
-    return {
-        "users": user_stats,
-        "sorted": sorted_users,
-        "start_timestamp": start_timestamp,
-        "end_timestamp": end_timestamp
-    }
-
-
-async def _fetch_leaderboard_data(owner: str, repo: str, token: str, env=None) -> tuple:
-    """Fetch leaderboard data for *owner*, running D1 backfill when available."""
-    leaderboard_note = ""
-    owner_data = None
-    is_org = False
-
-    owner_resp = await github_api("GET", f"/users/{owner}", token)
-    if owner_resp.status == 200:
-        owner_data = json.loads(await owner_resp.text())
-        is_org = owner_data.get("type") == "Organization"
-
-    leaderboard_data = await _calculate_leaderboard_stats_from_d1(owner, env)
-
-    if leaderboard_data is not None and is_org:
-        seeded_current = await _backfill_repo_month_if_needed(owner, repo, token, env)
-        if seeded_current:
-            leaderboard_data = await _calculate_leaderboard_stats_from_d1(owner, env) or leaderboard_data
-
-    if leaderboard_data is not None and is_org:
-        db = _d1_binding(env)
-        if db:
-            month_key = _month_key()
-            state = await _get_backfill_state(db, owner, month_key)
-            if not state.get("completed"):
-                backfill_result = await _run_incremental_backfill(owner, token, env)
-                if backfill_result:
-                    leaderboard_data = await _calculate_leaderboard_stats_from_d1(owner, env) or leaderboard_data
-                    if backfill_result.get("completed"):
-                        leaderboard_note = f"Backfill completed in this request; seeded {backfill_result.get('processed', 0)} repos in the final chunk."
-                    elif backfill_result.get("ran"):
-                        leaderboard_note = f"Backfill in progress: seeded {backfill_result.get('processed', 0)} repos in this run; next page {backfill_result.get('next_page', '?')}. Run `/leaderboard` again to continue filling historical data."
-                    else:
-                        leaderboard_note = "Backfill did not progress this run; leaderboard still updates from new webhook events."
-                else:
-                    leaderboard_note = "Backfill state unavailable; leaderboard still updates from new webhook events."
-
-    if leaderboard_data is None:
-        if owner_data is None:
-            resp = await github_api("GET", f"/users/{owner}", token)
-            if resp.status == 200:
-                owner_data = json.loads(await resp.text())
-                is_org = owner_data.get("type") == "Organization"
-        if is_org:
-            repos_resp = await github_api("GET", f"/orgs/{owner}/repos?sort=pushed&direction=desc&per_page=10", token)
-            if repos_resp.status == 200:
-                repos = json.loads(await repos_resp.text())
-            else:
-                repos = []
-        else:
-            repos = [{"name": repo}]
-        leaderboard_data = await _calculate_leaderboard_stats(owner, repos, token)
-
-    return leaderboard_data, leaderboard_note, is_org
-
 
 # ---------------------------------------------------------------------------
 # Backfill operations
@@ -901,11 +717,13 @@ async def _backfill_repo_month_if_needed(
                 merged_prs_for_review.append((pr_num, author))
                 newly_added.add(pr_num)
 
+    import_failed = False
     for pr_number, pr_author in merged_prs_for_review:
         try:
             reviews_resp = await github_api("GET", f"/repos/{owner}/{repo_name}/pulls/{pr_number}/reviews?per_page=100", token)
             if reviews_resp.status == 429:
                 console.error(f"[LeaderboardBackfill] Exiting early due to rate limit/429 for {owner}/{repo_name}.")
+                import_failed = True
                 break
             if reviews_resp.status != 200:
                 continue
@@ -931,7 +749,11 @@ async def _backfill_repo_month_if_needed(
                 await _d1_inc_monthly(db, owner, mk, reviewer_login, "reviews", 1)
                 already_credited_set.add(reviewer_login)
         except Exception:
+            import_failed = True
             pass
+
+    if import_failed:
+        return False
 
     try:
         await _d1_run(db, """
@@ -960,28 +782,8 @@ async def _reset_leaderboard_month(org: str, month_key: str, db) -> dict:
         except Exception as e:
             deleted[table] = f"error: {e}"
 
-    start_ts, end_ts = _month_window(month_key)
-    try:
-        await _d1_run(
-            db,
-            """
-            DELETE FROM leaderboard_pr_state
-            WHERE org = ? AND (
-                closed_at BETWEEN ? AND ?
-                OR (state = 'open' AND closed_at IS NULL AND updated_at BETWEEN ? AND ?)
-            )
-            """,
-            (org, start_ts, end_ts, start_ts, end_ts),
-        )
-        deleted["leaderboard_pr_state"] = "cleared"
-    except Exception as e:
-        deleted["leaderboard_pr_state"] = f"error: {e}"
-
-    try:
-        await _d1_run(db, "DELETE FROM leaderboard_open_prs WHERE org = ?", (org,))
-        deleted["leaderboard_open_prs"] = "cleared"
-    except Exception as e:
-        deleted["leaderboard_open_prs"] = f"error: {e}"
+    deleted["leaderboard_pr_state"] = "untouched (live state)"
+    deleted["leaderboard_open_prs"] = "untouched (live state)"
 
     return deleted
 
@@ -1021,7 +823,7 @@ async def _calculate_leaderboard_stats(owner: str, repos: list, token: str, wind
     
     # Calculate time window
     start_of_month = time.struct_time((now.tm_year, now.tm_mon, 1, 0, 0, 0, 0, 0, 0))
-    start_timestamp = int(time.mktime(start_of_month))
+    start_timestamp = int(calendar.timegm(start_of_month))
     
     # End of month calculation
     if now.tm_mon == 12:
@@ -1031,7 +833,7 @@ async def _calculate_leaderboard_stats(owner: str, repos: list, token: str, wind
         end_month = now.tm_mon + 1
         end_year = now.tm_year
     end_of_month = time.struct_time((end_year, end_month, 1, 0, 0, 0, 0, 0, 0))
-    end_timestamp = int(time.mktime(end_of_month)) - 1
+    end_timestamp = int(calendar.timegm(end_of_month)) - 1
     
     # Format date range for search API
     start_date = time.strftime("%Y-%m-%d", time.gmtime(start_timestamp))

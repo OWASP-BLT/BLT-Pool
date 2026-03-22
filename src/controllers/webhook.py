@@ -18,30 +18,12 @@ async def handle_webhook(request, env) -> Response:
     delivery_id = request.headers.get("X-GitHub-Delivery", "")
     event = request.headers.get("X-GitHub-Event", "")
 
-    # Parse payload once up front for concise logging fields.
-    payload = {}
-    payload_parse_error = False
-    try:
-        payload = json.loads(body_text)
-    except Exception:
-        payload_parse_error = True
-
-    action = payload.get("action", "") if isinstance(payload, dict) else ""
-    installation_id = ((payload.get("installation") or {}).get("id") if isinstance(payload, dict) else None)
-    repo_full_name = ((payload.get("repository") or {}).get("full_name") if isinstance(payload, dict) else "")
-    sender_login = ((payload.get("sender") or {}).get("login") if isinstance(payload, dict) else "")
-    issue_number = ((payload.get("issue") or {}).get("number") if isinstance(payload, dict) else None)
-    pr_number = ((payload.get("pull_request") or {}).get("number") if isinstance(payload, dict) else None)
-    item_number = issue_number or pr_number or ""
-
     signature = request.headers.get("X-Hub-Signature-256") or ""
     secret = (getattr(env, "WEBHOOK_SECRET", "") or "").strip()
     if not secret:
         console.error(
             "[BLT][webhook] "
-            f"delivery={delivery_id or '-'} event={event or '-'} action={action or '-'} "
-            f"repo={repo_full_name or '-'} sender={sender_login or '-'} item={item_number or '-'} "
-            f"installation={installation_id or '-'} method={request.method} "
+            f"delivery={delivery_id or '-'} event={event or '-'} method={request.method} "
             "status=rejected_missing_webhook_secret"
         )
         return _json(
@@ -51,22 +33,31 @@ async def handle_webhook(request, env) -> Response:
             },
             503,
         )
+
     if not verify_signature(payload_bytes, signature, secret):
         console.log(
             "[BLT][webhook] "
-            f"delivery={delivery_id or '-'} event={event or '-'} action={action or '-'} "
-            f"repo={repo_full_name or '-'} sender={sender_login or '-'} item={item_number or '-'} "
-            f"installation={installation_id or '-'} method={request.method} status=rejected_invalid_signature"
+            f"delivery={delivery_id or '-'} event={event or '-'} method={request.method} status=rejected_invalid_signature"
         )
         return _json({"error": "Invalid signature"}, 401)
 
-    if payload_parse_error:
+    # Parse payload only after signature verification
+    try:
+        payload = json.loads(body_text)
+    except Exception:
         console.log(
             "[BLT][webhook] "
-            f"delivery={delivery_id or '-'} event={event or '-'} action=- repo=- sender=- item=- "
-            f"installation=- method={request.method} status=rejected_invalid_json"
+            f"delivery={delivery_id or '-'} event={event or '-'} method={request.method} status=rejected_invalid_json"
         )
         return _json({"error": "Invalid JSON"}, 400)
+
+    action = payload.get("action", "") if isinstance(payload, dict) else ""
+    installation_id = ((payload.get("installation") or {}).get("id") if isinstance(payload, dict) else None)
+    repo_full_name = ((payload.get("repository") or {}).get("full_name") if isinstance(payload, dict) else "")
+    sender_login = ((payload.get("sender") or {}).get("login") if isinstance(payload, dict) else "")
+    issue_number = ((payload.get("issue") or {}).get("number") if isinstance(payload, dict) else None)
+    pr_number = ((payload.get("pull_request") or {}).get("number") if isinstance(payload, dict) else None)
+    item_number = issue_number or pr_number or ""
 
     console.log(
         "[BLT][webhook] "
@@ -77,6 +68,29 @@ async def handle_webhook(request, env) -> Response:
 
     app_id = getattr(env, "APP_ID", "")
     private_key = getattr(env, "PRIVATE_KEY", "")
+
+    if event == "ping":
+        return _json({"ok": True, "message": "pong"})
+
+    needs_token = False
+    if event == "issue_comment" and action == "created":
+        needs_token = True
+    elif event == "issues" and action in ("opened", "labeled"):
+        needs_token = True
+    elif event == "pull_request" and action in ("opened", "synchronize", "reopened", "closed"):
+        needs_token = True
+    elif event == "pull_request_review" and action in ("submitted", "dismissed"):
+        needs_token = True
+    elif event in ("pull_request_review_comment", "pull_request_review_thread"):
+        needs_token = True
+    elif event == "workflow_run":
+        needs_token = True
+    elif event == "check_run" and action in ("created", "completed"):
+        needs_token = True
+
+    if not needs_token:
+        return _json({"ok": True, "ignored": True})
+
     token = None
     if installation_id and app_id and private_key:
         token = await get_installation_token(installation_id, app_id, private_key)

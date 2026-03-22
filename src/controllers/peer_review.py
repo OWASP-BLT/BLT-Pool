@@ -2,7 +2,7 @@ import json
 from urllib.parse import quote
 
 from js import console
-from core.github_client import github_api, create_comment
+from core.github_client import github_api, create_comment, _is_human
 
 
 def _is_excluded_reviewer(login: str) -> bool:
@@ -195,5 +195,7 @@ async def handle_pull_request_for_review(payload: dict, token: str) -> None:
     
     await check_peer_review_and_comment(owner, repo, pr["number"], pr_author, token)
 
-    # Label PR with number of pending checks (queued/waiting/action_required)
+    # Label PR with number of pending checks (queued/waiting/action_required).
+    # Lazy import to avoid a circular import at module level (peer_review ↔ pr_handlers).
+    from controllers.pr_handlers import _try_label_pending_checks  # noqa: PLC0415
     await _try_label_pending_checks(owner, repo, pr, token)

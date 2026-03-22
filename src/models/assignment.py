@@ -35,6 +35,7 @@ async def _d1_record_mentor_assignment(
         console.log(f"[D1] Recorded mentor assignment: @{mentor_login} → {org}/{repo}#{issue_number}")
     except Exception as exc:
         console.error(f"[D1] Failed to record mentor assignment: {exc}")
+        raise
 
 
 async def _d1_remove_mentor_assignment(db, org: str, repo: str, issue_number: int) -> None:
@@ -48,6 +49,7 @@ async def _d1_remove_mentor_assignment(db, org: str, repo: str, issue_number: in
         console.log(f"[D1] Removed mentor assignment: {org}/{repo}#{issue_number}")
     except Exception as exc:
         console.error(f"[D1] Failed to remove mentor assignment: {exc}")
+        raise
 
 
 async def _d1_get_mentor_loads(db, org: str) -> dict:

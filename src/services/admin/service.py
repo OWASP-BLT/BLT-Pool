@@ -223,10 +223,17 @@ class AdminService:
                 issue_repo TEXT NOT NULL,
                 issue_number INTEGER NOT NULL,
                 assigned_at INTEGER NOT NULL,
+                mentee_login TEXT NOT NULL DEFAULT '',
                 PRIMARY KEY (org, issue_repo, issue_number)
             )
             """
         )
+        try:
+            await self._d1_run(
+                "ALTER TABLE mentor_assignments ADD COLUMN mentee_login TEXT NOT NULL DEFAULT ''"
+            )
+        except Exception:
+            pass
         await self._d1_run(
             "DELETE FROM admin_sessions WHERE expires_at <= ?",
             (int(time.time()),),
