@@ -23,6 +23,8 @@ from core.crypto import create_github_jwt
 
 ASSIGN_COMMAND = "/assign"
 UNASSIGN_COMMAND = "/unassign"
+APPROVE_COMMAND = "/approve"
+DENY_COMMAND = "/deny"
 LEADERBOARD_COMMAND = "/leaderboard"
 MENTOR_COMMAND = "/mentor"
 UNMENTOR_COMMAND = "/unmentor"
@@ -253,6 +255,8 @@ def _extract_command(body: str) -> Optional[str]:
     supported = {
         ASSIGN_COMMAND,
         UNASSIGN_COMMAND,
+        APPROVE_COMMAND,
+        DENY_COMMAND,
         LEADERBOARD_COMMAND,
         MENTOR_COMMAND,
         UNMENTOR_COMMAND,
@@ -275,7 +279,7 @@ async def _ensure_label_exists(
         f"/repos/{owner}/{repo}/labels/{quote(name, safe='')}",
         token,
     )
-    if resp.status == 404:
+    if resp is None or resp.status == 404:
         await github_api(
             "POST",
             f"/repos/{owner}/{repo}/labels",
