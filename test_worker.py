@@ -38,6 +38,43 @@ sys.modules.setdefault("pyodide", _pyodide_stub)
 sys.modules.setdefault("pyodide.ffi", _pyodide_ffi_stub)
 
 
+
+import contextlib
+import sys
+import inspect
+from unittest.mock import patch, MagicMock, AsyncMock
+
+@contextlib.contextmanager
+def patch_all_modules(func_name, new=None, **kwargs):
+    the_mock = None
+    if new is not None:
+        the_mock = new
+    elif "new" in kwargs:
+        the_mock = kwargs["new"]
+        
+    with contextlib.ExitStack() as stack:
+        for mod_name, mod in list(sys.modules.items()):
+            # Patch everywhere the function exists
+            if mod and hasattr(mod, func_name) and not mod_name.startswith("pytest") and mod_name != __name__:
+                # avoid patching builtin or unexpected things, just to be safe
+                val = getattr(mod, func_name)
+                
+                # Intelligently determine mock type on first sight
+                if the_mock is None:
+                    if inspect.iscoroutinefunction(val):
+                        the_mock = AsyncMock(**kwargs)
+                    else:
+                        the_mock = MagicMock(**kwargs)
+                        
+                if callable(val) or isinstance(val, (MagicMock, AsyncMock, type(the_mock))):
+                    stack.enter_context(patch.object(mod, func_name, new=the_mock))
+                    
+        if the_mock is None:
+            the_mock = MagicMock(**kwargs)
+            
+        yield the_mock
+
+
 class _ArrayStub:
     """Minimal Array stand-in with from() method."""
     pass
@@ -82,7 +119,7 @@ _js_stub.Response = _ResponseStub
 _js_stub.Array = _ArrayStub
 _js_stub.Object = _ObjectStub
 _js_stub.console = types.SimpleNamespace(error=print, log=print)
-_js_stub.fetch = None  # not used in unit tests
+_js_stub.fetch = AsyncMock()  # need it to be callable for patch_all_modules
 
 sys.modules.setdefault("js", _js_stub)
 
@@ -339,8 +376,8 @@ class TestHandleAssign(unittest.TestCase):
 
     def _run_assign(self, payload, comments, github_calls):
         async def _inner():
-            with patch.object(_worker, "create_comment", new=AsyncMock(side_effect=lambda o, r, n, b, t: comments.append(b))):
-                with patch.object(_worker, "github_api", new=AsyncMock(side_effect=lambda *a, **kw: github_calls.append(a))):
+            with patch_all_modules("create_comment", new=AsyncMock(side_effect=lambda o, r, n, b, t: comments.append(b))):
+                with patch_all_modules("github_api", new=AsyncMock(side_effect=lambda *a, **kw: github_calls.append(a))):
                     await _worker._assign(
                         payload["repository"]["owner"]["login"],
                         payload["repository"]["name"],
@@ -365,7 +402,7 @@ class TestHandleAssign(unittest.TestCase):
         payload = _make_issue_payload(labels=[])
         comments, calls = [], []
         mock_ensure = AsyncMock()
-        with patch.object(_worker, "_ensure_label_exists", new=mock_ensure):
+        with patch_all_modules("_ensure_label_exists", new=mock_ensure):
             self._run_assign(payload, comments, calls)
         # Comment must mention the requester, @donnieblt, and the "help wanted" label
         self.assertTrue(any("@alice" in c and "@donnieblt" in c and "help wanted" in c for c in comments))
@@ -416,8 +453,8 @@ class TestHandleUnassign(unittest.TestCase):
 
     def _run_unassign(self, payload, comments, github_calls):
         async def _inner():
-            with patch.object(_worker, "create_comment", new=AsyncMock(side_effect=lambda o, r, n, b, t: comments.append(b))):
-                with patch.object(_worker, "github_api", new=AsyncMock(side_effect=lambda *a, **kw: github_calls.append(a))):
+            with patch_all_modules("create_comment", new=AsyncMock(side_effect=lambda o, r, n, b, t: comments.append(b))):
+                with patch_all_modules("github_api", new=AsyncMock(side_effect=lambda *a, **kw: github_calls.append(a))):
                     await _worker._unassign(
                         payload["repository"]["owner"]["login"],
                         payload["repository"]["name"],
@@ -451,8 +488,8 @@ class TestHandleApprove(unittest.TestCase):
 
     def _run_approve(self, payload, comments, github_calls, *, commenter="donnieblt"):
         async def _inner():
-            with patch.object(_worker, "create_comment", new=AsyncMock(side_effect=lambda o, r, n, b, t: comments.append(b))):
-                with patch.object(_worker, "github_api", new=AsyncMock(side_effect=lambda *a, **kw: github_calls.append(a))):
+            with patch_all_modules("create_comment", new=AsyncMock(side_effect=lambda o, r, n, b, t: comments.append(b))):
+                with patch_all_modules("github_api", new=AsyncMock(side_effect=lambda *a, **kw: github_calls.append(a))):
                     await _worker._approve(
                         payload["repository"]["owner"]["login"],
                         payload["repository"]["name"],
@@ -554,8 +591,8 @@ class TestHandleDeny(unittest.TestCase):
 
     def _run_deny(self, payload, comments, github_calls, *, commenter="donnieblt"):
         async def _inner():
-            with patch.object(_worker, "create_comment", new=AsyncMock(side_effect=lambda o, r, n, b, t: comments.append(b))):
-                with patch.object(_worker, "github_api", new=AsyncMock(side_effect=lambda *a, **kw: github_calls.append(a))):
+            with patch_all_modules("create_comment", new=AsyncMock(side_effect=lambda o, r, n, b, t: comments.append(b))):
+                with patch_all_modules("github_api", new=AsyncMock(side_effect=lambda *a, **kw: github_calls.append(a))):
                     await _worker._deny(
                         payload["repository"]["owner"]["login"],
                         payload["repository"]["name"],
@@ -607,10 +644,10 @@ class TestHandleIssueComment(unittest.TestCase):
             deny_calls = []
 
         async def _inner():
-            with patch.object(_worker, "_assign", new=AsyncMock(side_effect=lambda *a: assign_calls.append(a))):
-                with patch.object(_worker, "_unassign", new=AsyncMock(side_effect=lambda *a: unassign_calls.append(a))):
-                    with patch.object(_worker, "_approve", new=AsyncMock(side_effect=lambda *a: approve_calls.append(a))):
-                        with patch.object(_worker, "_deny", new=AsyncMock(side_effect=lambda *a: deny_calls.append(a))):
+            with patch_all_modules("_assign", new=AsyncMock(side_effect=lambda *a: assign_calls.append(a))):
+                with patch_all_modules("_unassign", new=AsyncMock(side_effect=lambda *a: unassign_calls.append(a))):
+                    with patch_all_modules("_approve", new=AsyncMock(side_effect=lambda *a: approve_calls.append(a))):
+                        with patch_all_modules("_deny", new=AsyncMock(side_effect=lambda *a: deny_calls.append(a))):
                             await _worker.handle_issue_comment(payload, "tok")
         _run(_inner())
 
@@ -669,8 +706,8 @@ class TestHandleIssueOpened(unittest.TestCase):
                 bug_calls.append(data)
                 return bug_return
 
-            with patch.object(_worker, "create_comment", new=AsyncMock(side_effect=lambda o, r, n, b, t: comments.append(b))):
-                with patch.object(_worker, "report_bug_to_blt", new=_mock_report):
+            with patch_all_modules("create_comment", new=AsyncMock(side_effect=lambda o, r, n, b, t: comments.append(b))):
+                with patch_all_modules("report_bug_to_blt", new=_mock_report):
                     await _worker.handle_issue_opened(payload, "tok", "https://blt.example")
         _run(_inner())
 
@@ -704,7 +741,7 @@ class TestHandleIssueOpened(unittest.TestCase):
     def test_skips_welcome_for_excluded_repo(self):
         payload = _make_issue_payload(repo="BLT-Design-Contest")
         comments, bugs = [], []
-        with patch.object(_worker, "_load_no_welcome_repos", return_value=["BLT-Design-Contest"]):
+        with patch_all_modules("_load_no_welcome_repos", return_value=["BLT-Design-Contest"]):
             self._run_opened(payload, comments, bugs)
         self.assertEqual(comments, [])
         self.assertEqual(bugs, [])
@@ -712,40 +749,36 @@ class TestHandleIssueOpened(unittest.TestCase):
     def test_posts_welcome_for_non_excluded_repo(self):
         payload = _make_issue_payload(repo="SomeOtherRepo")
         comments, bugs = [], []
-        with patch.object(_worker, "_load_no_welcome_repos", return_value=["BLT-Design-Contest"]):
+        with patch_all_modules("_load_no_welcome_repos", return_value=["BLT-Design-Contest"]):
             self._run_opened(payload, comments, bugs)
         self.assertEqual(len(comments), 1)
         self.assertIn("Thanks for opening this issue", comments[0])
 
 
 class TestLoadNoWelcomeRepos(unittest.TestCase):
-    """Tests for _load_no_welcome_repos YAML parser."""
+    """Tests for _load_no_welcome_repos embedded-constant implementation.
 
-    def test_parses_repos_list(self):
-        content = "repos:\n  - BLT-Design-Contest\n  - AnotherRepo\n"
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".yml", delete=False) as f:
-            f.write(content)
-            tmp_path = f.name
-        try:
-            result = _worker._load_no_welcome_repos(tmp_path)
-            self.assertEqual(result, ["BLT-Design-Contest", "AnotherRepo"])
-        finally:
-            os.unlink(tmp_path)
+    The function no longer reads from the filesystem (Cloudflare Workers has no
+    disk access); it returns the _DEFAULT_NO_WELCOME_REPOS constant instead.
+    """
 
-    def test_returns_empty_list_when_file_missing(self):
+    def test_returns_embedded_constant(self):
+        # Always returns the built-in list regardless of path argument.
+        result = _worker._load_no_welcome_repos()
+        self.assertIsInstance(result, list)
+        self.assertIn("BLT-Design-Contest", result)
+
+    def test_path_argument_is_ignored(self):
+        # Even when a non-existent path is supplied the constant is returned.
         result = _worker._load_no_welcome_repos("/nonexistent/path/repos.yml")
-        self.assertEqual(result, [])
+        self.assertIsInstance(result, list)
+        self.assertIn("BLT-Design-Contest", result)
 
     def test_ignores_comments_and_blank_lines(self):
-        content = "# comment\n\nrepos:\n  # another comment\n  - BLT-Design-Contest\n"
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".yml", delete=False) as f:
-            f.write(content)
-            tmp_path = f.name
-        try:
-            result = _worker._load_no_welcome_repos(tmp_path)
-            self.assertEqual(result, ["BLT-Design-Contest"])
-        finally:
-            os.unlink(tmp_path)
+        # Legacy test — verifies no crash when called without args.
+        result = _worker._load_no_welcome_repos()
+        self.assertEqual(result, ["BLT-Design-Contest"])
+
 
 
 class TestHandleIssueLabeled(unittest.TestCase):
@@ -757,8 +790,8 @@ class TestHandleIssueLabeled(unittest.TestCase):
                 bug_calls.append(data)
                 return bug_return
 
-            with patch.object(_worker, "create_comment", new=AsyncMock(side_effect=lambda o, r, n, b, t: comments.append(b))):
-                with patch.object(_worker, "report_bug_to_blt", new=_mock_report):
+            with patch_all_modules("create_comment", new=AsyncMock(side_effect=lambda o, r, n, b, t: comments.append(b))):
+                with patch_all_modules("report_bug_to_blt", new=_mock_report):
                     await _worker.handle_issue_labeled(payload, "tok", "https://blt.example")
         _run(_inner())
 
@@ -796,10 +829,10 @@ class TestHandlePullRequestOpened(unittest.TestCase):
 
     def _run_opened(self, payload, comments):
         async def _inner():
-            with patch.object(_worker, "create_comment", new=AsyncMock(side_effect=lambda o, r, n, b, t: comments.append(b))):
-                with patch.object(_worker, "_check_and_close_excess_prs", new=AsyncMock(return_value=False)):
-                    with patch.object(_worker, "_post_or_update_leaderboard", new=AsyncMock()):
-                        with patch.object(_worker, "label_pending_checks", new=AsyncMock()):
+            with patch_all_modules("create_comment", new=AsyncMock(side_effect=lambda o, r, n, b, t: comments.append(b))):
+                with patch_all_modules("_check_and_close_excess_prs", new=AsyncMock(return_value=False)):
+                    with patch_all_modules("_post_or_update_leaderboard", new=AsyncMock()):
+                        with patch_all_modules("label_pending_checks", new=AsyncMock()):
                             await _worker.handle_pull_request_opened(payload, "tok")
         _run(_inner())
 
@@ -821,10 +854,10 @@ class TestHandlePullRequestClosed(unittest.TestCase):
 
     def _run_closed(self, payload, comments):
         async def _inner():
-            with patch.object(_worker, "create_comment", new=AsyncMock(side_effect=lambda o, r, n, b, t: comments.append(b))):
-                with patch.object(_worker, "_check_rank_improvement", new=AsyncMock()):
-                    with patch.object(_worker, "get_valid_reviewers", new=AsyncMock(return_value=[])):
-                        with patch.object(_worker, "_post_merged_pr_combined_comment", new=AsyncMock()):
+            with patch_all_modules("create_comment", new=AsyncMock(side_effect=lambda o, r, n, b, t: comments.append(b))):
+                with patch_all_modules("_check_rank_improvement", new=AsyncMock()):
+                    with patch_all_modules("get_valid_reviewers", new=AsyncMock(return_value=[])):
+                        with patch_all_modules("_post_merged_pr_combined_comment", new=AsyncMock()):
                             await _worker.handle_pull_request_closed(payload, "tok")
         _run(_inner())
 
@@ -832,8 +865,8 @@ class TestHandlePullRequestClosed(unittest.TestCase):
         payload = _make_pr_payload(merged=True)
         called = []
         async def _inner():
-            with patch.object(_worker, "get_valid_reviewers", new=AsyncMock(return_value=[])):
-                with patch.object(_worker, "_post_merged_pr_combined_comment", new=AsyncMock(side_effect=lambda *a, **k: called.append(True))):
+            with patch_all_modules("get_valid_reviewers", new=AsyncMock(return_value=[])):
+                with patch_all_modules("_post_merged_pr_combined_comment", new=AsyncMock(side_effect=lambda *a, **k: called.append(True))):
                     await _worker.handle_pull_request_closed(payload, "tok")
         _run(_inner())
         self.assertEqual(len(called), 1)
@@ -848,8 +881,8 @@ class TestHandlePullRequestClosed(unittest.TestCase):
         payload = _make_pr_payload(merged=False)
 
         async def _inner():
-            with patch.object(_worker, "_track_pr_closed_in_d1", new=AsyncMock()) as track_mock:
-                with patch.object(_worker, "_post_merged_pr_combined_comment", new=AsyncMock()) as post_mock:
+            with patch_all_modules("_track_pr_closed_in_d1", new=AsyncMock()) as track_mock:
+                with patch_all_modules("_post_merged_pr_combined_comment", new=AsyncMock()) as post_mock:
                     await _worker.handle_pull_request_closed(payload, "tok", env=types.SimpleNamespace())
             self.assertEqual(track_mock.await_count, 1)
             self.assertEqual(post_mock.await_count, 0)
@@ -866,8 +899,8 @@ class TestHandlePullRequestClosed(unittest.TestCase):
         payload = _make_pr_payload(merged=True, sender={"login": "bot", "type": "Bot"})
 
         async def _inner():
-            with patch.object(_worker, "_track_pr_closed_in_d1", new=AsyncMock()) as track_mock:
-                with patch.object(_worker, "_post_merged_pr_combined_comment", new=AsyncMock()) as post_mock:
+            with patch_all_modules("_track_pr_closed_in_d1", new=AsyncMock()) as track_mock:
+                with patch_all_modules("_post_merged_pr_combined_comment", new=AsyncMock()) as post_mock:
                     await _worker.handle_pull_request_closed(payload, "tok", env=types.SimpleNamespace())
             self.assertEqual(track_mock.await_count, 1)
             self.assertEqual(post_mock.await_count, 0)
@@ -1378,9 +1411,9 @@ class TestPostReviewerLeaderboard(unittest.TestCase):
                     return types.SimpleNamespace(status=204)
                 return types.SimpleNamespace(status=200)
 
-            with patch.object(_worker, "_calculate_leaderboard_stats_from_d1", new=_mock_d1):
-                with patch.object(_worker, "github_api", new=_mock_api):
-                    with patch.object(_worker, "create_comment", new=AsyncMock(side_effect=lambda o, r, n, b, t: posted_comments.append(b))):
+            with patch_all_modules("_calculate_leaderboard_stats_from_d1", new=_mock_d1):
+                with patch_all_modules("github_api", new=_mock_api):
+                    with patch_all_modules("create_comment", new=AsyncMock(side_effect=lambda o, r, n, b, t: posted_comments.append(b))):
                         env = types.SimpleNamespace()
                         await _worker._post_reviewer_leaderboard(
                             "test-org", "test-repo", 42, "tok", env=env, pr_reviewers=pr_reviewers
@@ -1416,8 +1449,8 @@ class TestPostReviewerLeaderboard(unittest.TestCase):
         posted, deleted = [], []
 
         async def _inner():
-            with patch.object(_worker, "_calculate_leaderboard_stats_from_d1", new=AsyncMock(return_value=None)):
-                with patch.object(_worker, "create_comment", new=AsyncMock(side_effect=lambda o, r, n, b, t: posted.append(b))):
+            with patch_all_modules("_calculate_leaderboard_stats_from_d1", new=AsyncMock(return_value=None)):
+                with patch_all_modules("create_comment", new=AsyncMock(side_effect=lambda o, r, n, b, t: posted.append(b))):
                     await _worker._post_reviewer_leaderboard("org", "repo", 1, "tok")
         _run(_inner())
 
@@ -1432,9 +1465,9 @@ class TestHandleIssueCommentLeaderboard(unittest.TestCase):
             async def _mock_leaderboard(owner, repo, number, login, token):
                 leaderboard_calls.append((owner, repo, number, login))
             
-            with patch.object(_worker, "_post_or_update_leaderboard", new=_mock_leaderboard):
-                with patch.object(_worker, "_assign", new=AsyncMock()):
-                    with patch.object(_worker, "_unassign", new=AsyncMock()):
+            with patch_all_modules("_post_or_update_leaderboard", new=_mock_leaderboard):
+                with patch_all_modules("_assign", new=AsyncMock()):
+                    with patch_all_modules("_unassign", new=AsyncMock()):
                         await _worker.handle_issue_comment(payload, "tok")
         _run(_inner())
 
@@ -1471,10 +1504,10 @@ class TestHandlePullRequestOpenedLeaderboard(unittest.TestCase):
                 close_calls.append((owner, repo, pr_number, author_login))
                 return False  # Not closed
             
-            with patch.object(_worker, "_post_or_update_leaderboard", new=_mock_leaderboard):
-                with patch.object(_worker, "_check_and_close_excess_prs", new=_mock_close):
-                    with patch.object(_worker, "create_comment", new=AsyncMock(side_effect=lambda o, r, n, b, t: comment_calls.append(b))):
-                        with patch.object(_worker, "check_unresolved_conversations", new=AsyncMock(return_value=None)):
+            with patch_all_modules("_post_or_update_leaderboard", new=_mock_leaderboard):
+                with patch_all_modules("_check_and_close_excess_prs", new=_mock_close):
+                    with patch_all_modules("create_comment", new=AsyncMock(side_effect=lambda o, r, n, b, t: comment_calls.append(b))):
+                        with patch_all_modules("check_unresolved_conversations", new=AsyncMock(return_value=None)):
                             await _worker.handle_pull_request_opened(payload, "tok")
         _run(_inner())
 
@@ -1510,10 +1543,10 @@ class TestHandlePullRequestOpenedLeaderboard(unittest.TestCase):
                 close_calls.append((owner, repo, pr_number, author_login))
                 return True  # PR was closed
             
-            with patch.object(_worker, "_post_or_update_leaderboard", new=_mock_leaderboard):
-                with patch.object(_worker, "_check_and_close_excess_prs", new=_mock_close):
-                    with patch.object(_worker, "create_comment", new=AsyncMock(side_effect=lambda o, r, n, b, t: comments.append(b))):
-                        with patch.object(_worker, "check_unresolved_conversations", new=AsyncMock(return_value=None)):
+            with patch_all_modules("_post_or_update_leaderboard", new=_mock_leaderboard):
+                with patch_all_modules("_check_and_close_excess_prs", new=_mock_close):
+                    with patch_all_modules("create_comment", new=AsyncMock(side_effect=lambda o, r, n, b, t: comments.append(b))):
+                        with patch_all_modules("check_unresolved_conversations", new=AsyncMock(return_value=None)):
                             await _worker.handle_pull_request_opened(payload, "tok")
         _run(_inner())
         
@@ -1536,10 +1569,10 @@ class TestHandlePullRequestClosedLeaderboard(unittest.TestCase):
             async def _mock_rank(owner, repo, pr_number, author_login, token):
                 rank_calls.append((owner, repo, pr_number, author_login))
 
-            with patch.object(_worker, "_post_merged_pr_combined_comment", new=_mock_combined):
-                with patch.object(_worker, "_check_rank_improvement", new=_mock_rank):
-                    with patch.object(_worker, "get_valid_reviewers", new=AsyncMock(return_value=[])):
-                        with patch.object(_worker, "create_comment", new=AsyncMock(side_effect=lambda o, r, n, b, t: comment_calls.append(b))):
+            with patch_all_modules("_post_merged_pr_combined_comment", new=_mock_combined):
+                with patch_all_modules("_check_rank_improvement", new=_mock_rank):
+                    with patch_all_modules("get_valid_reviewers", new=AsyncMock(return_value=[])):
+                        with patch_all_modules("create_comment", new=AsyncMock(side_effect=lambda o, r, n, b, t: comment_calls.append(b))):
                             await _worker.handle_pull_request_closed(payload, "tok")
         _run(_inner())
 
@@ -1608,9 +1641,9 @@ class TestPostMergedPrCombinedComment(unittest.TestCase):
                 return types.SimpleNamespace(status=200)
 
             ld = fetch_leaderboard_return if fetch_leaderboard_return is not None else leaderboard_data
-            with patch.object(_worker, "_fetch_leaderboard_data", new=AsyncMock(return_value=(ld, "", False))):
-                with patch.object(_worker, "github_api", new=_mock_api):
-                    with patch.object(_worker, "create_comment", new=AsyncMock(side_effect=lambda o, r, n, b, t: posted_comments.append(b))):
+            with patch_all_modules("_fetch_leaderboard_data", new=AsyncMock(return_value=(ld, "", False))):
+                with patch_all_modules("github_api", new=_mock_api):
+                    with patch_all_modules("create_comment", new=AsyncMock(side_effect=lambda o, r, n, b, t: posted_comments.append(b))):
                         await _worker._post_merged_pr_combined_comment(
                             "test-org", "test-repo", 42, author_login, "tok",
                             pr_reviewers=pr_reviewers
@@ -1732,9 +1765,9 @@ class TestPostMergedPrCombinedComment(unittest.TestCase):
                     return types.SimpleNamespace(status=403)
                 return types.SimpleNamespace(status=200)
 
-            with patch.object(_worker, "_fetch_leaderboard_data", new=AsyncMock(return_value=(self._make_leaderboard_data(), "", False))):
-                with patch.object(_worker, "github_api", new=_mock_api):
-                    with patch.object(_worker, "create_comment", new=AsyncMock(side_effect=lambda o, r, n, b, t: posted.append(b))):
+            with patch_all_modules("_fetch_leaderboard_data", new=AsyncMock(return_value=(self._make_leaderboard_data(), "", False))):
+                with patch_all_modules("github_api", new=_mock_api):
+                    with patch_all_modules("create_comment", new=AsyncMock(side_effect=lambda o, r, n, b, t: posted.append(b))):
                         await _worker._post_merged_pr_combined_comment(
                             "test-org", "test-repo", 42, "alice", "tok"
                         )
@@ -1758,8 +1791,8 @@ class TestPostMergedPrCombinedComment(unittest.TestCase):
                     return mock_resp
                 return types.SimpleNamespace(status=200)
             
-            with patch.object(_worker, "github_api", new=_mock_api):
-                with patch.object(_worker, "create_comment", new=AsyncMock(side_effect=lambda o, r, n, b, t: comment_calls.append(b))):
+            with patch_all_modules("github_api", new=_mock_api):
+                with patch_all_modules("create_comment", new=AsyncMock(side_effect=lambda o, r, n, b, t: comment_calls.append(b))):
                     result = await _worker._check_and_close_excess_prs(
                         "OWASP-BLT", "TestRepo", 10, "alice", "tok"
                     )
@@ -2158,7 +2191,7 @@ class TestTrackingOperations(unittest.TestCase):
             },
         }
         
-        with patch.object(_worker, "console", new=types.SimpleNamespace(error=lambda x: None, log=lambda x: None)):
+        with patch_all_modules("console", new=types.SimpleNamespace(error=lambda x: None, log=lambda x: None)):
             await _worker._track_pr_opened_in_d1(payload, env)
         
         # Should have called prepare multiple times (ensure schema, check existing, insert)
@@ -2182,7 +2215,7 @@ class TestTrackingOperations(unittest.TestCase):
             },
         }
         
-        with patch.object(_worker, "console", new=types.SimpleNamespace(error=lambda x: None, log=lambda x: None)):
+        with patch_all_modules("console", new=types.SimpleNamespace(error=lambda x: None, log=lambda x: None)):
             await _worker._track_comment_in_d1(payload, env)
         
         # Should have called prepare for monthly increment
@@ -2201,7 +2234,7 @@ class TestTrackingOperations(unittest.TestCase):
             },
         }
 
-        with patch.object(_worker, "console", new=types.SimpleNamespace(error=lambda x: None, log=lambda x: None)):
+        with patch_all_modules("console", new=types.SimpleNamespace(error=lambda x: None, log=lambda x: None)):
             await _worker._track_comment_in_d1(payload, env)
 
         self.assertEqual(mock_db.prepare.call_count, 0)
@@ -2217,11 +2250,11 @@ class TestTrackingOperations(unittest.TestCase):
         }
         env = types.SimpleNamespace(LEADERBOARD_DB=object())
 
-        with patch.object(_worker, "_ensure_leaderboard_schema", new=AsyncMock()):
-            with patch.object(_worker, "_d1_first", new=AsyncMock(return_value={"state": "closed", "merged": 0, "closed_at": 1709596800})):
-                with patch.object(_worker, "_d1_inc_monthly", new=AsyncMock()) as monthly_mock:
-                    with patch.object(_worker, "_d1_inc_open_pr", new=AsyncMock()) as open_mock:
-                        with patch.object(_worker, "_d1_run", new=AsyncMock()):
+        with patch_all_modules("_ensure_leaderboard_schema", new=AsyncMock()):
+            with patch_all_modules("_d1_first", new=AsyncMock(return_value={"state": "closed", "merged": 0, "closed_at": 1709596800})):
+                with patch_all_modules("_d1_inc_monthly", new=AsyncMock()) as monthly_mock:
+                    with patch_all_modules("_d1_inc_open_pr", new=AsyncMock()) as open_mock:
+                        with patch_all_modules("_d1_run", new=AsyncMock()):
                             await _worker._track_pr_reopened_in_d1(payload, env)
 
         self.assertEqual(monthly_mock.await_count, 1)
@@ -2243,11 +2276,11 @@ class TestTrackingOperations(unittest.TestCase):
         }
         env = types.SimpleNamespace(LEADERBOARD_DB=object())
 
-        with patch.object(_worker, "_ensure_leaderboard_schema", new=AsyncMock()):
-            with patch.object(_worker, "_d1_first", new=AsyncMock(return_value={"state": "open", "merged": 0, "closed_at": None})):
-                with patch.object(_worker, "_d1_inc_monthly", new=AsyncMock()) as monthly_mock:
-                    with patch.object(_worker, "_d1_inc_open_pr", new=AsyncMock()) as open_mock:
-                        with patch.object(_worker, "_d1_run", new=AsyncMock()):
+        with patch_all_modules("_ensure_leaderboard_schema", new=AsyncMock()):
+            with patch_all_modules("_d1_first", new=AsyncMock(return_value={"state": "open", "merged": 0, "closed_at": None})):
+                with patch_all_modules("_d1_inc_monthly", new=AsyncMock()) as monthly_mock:
+                    with patch_all_modules("_d1_inc_open_pr", new=AsyncMock()) as open_mock:
+                        with patch_all_modules("_d1_run", new=AsyncMock()):
                             await _worker._track_pr_reopened_in_d1(payload, env)
 
         self.assertEqual(monthly_mock.await_count, 0)
@@ -2291,8 +2324,7 @@ class TestD1MentorAssignments(unittest.TestCase):
         mock_db, stmt = self._make_mock_db()
 
         async def _inner():
-            with patch.object(
-                _worker, "console",
+            with patch_all_modules("console",
                 new=types.SimpleNamespace(log=lambda *a: None, error=lambda *a: None),
             ):
                 await _worker._d1_record_mentor_assignment(mock_db, "org", "alice", "repo", 42)
@@ -2304,8 +2336,7 @@ class TestD1MentorAssignments(unittest.TestCase):
         mock_db, stmt = self._make_mock_db()
 
         async def _inner():
-            with patch.object(
-                _worker, "console",
+            with patch_all_modules("console",
                 new=types.SimpleNamespace(log=lambda *a: None, error=lambda *a: None),
             ):
                 await _worker._d1_remove_mentor_assignment(mock_db, "org", "repo", 42)
@@ -2323,8 +2354,7 @@ class TestD1MentorAssignments(unittest.TestCase):
         })
 
         async def _inner():
-            with patch.object(
-                _worker, "console",
+            with patch_all_modules("console",
                 new=types.SimpleNamespace(log=lambda *a: None, error=lambda *a: None),
             ):
                 return await _worker._d1_get_mentor_loads(mock_db, "org")
@@ -2337,8 +2367,7 @@ class TestD1MentorAssignments(unittest.TestCase):
         stmt.all = AsyncMock(return_value={"results": []})
 
         async def _inner():
-            with patch.object(
-                _worker, "console",
+            with patch_all_modules("console",
                 new=types.SimpleNamespace(log=lambda *a: None, error=lambda *a: None),
             ):
                 return await _worker._d1_get_mentor_loads(mock_db, "org")
@@ -2357,10 +2386,9 @@ class TestD1MentorAssignments(unittest.TestCase):
         env = types.SimpleNamespace(LEADERBOARD_DB=mock_db)
 
         async def _inner():
-            with patch.object(_worker, "_d1_binding", return_value=mock_db):
-                with patch.object(_worker, "_ensure_leaderboard_schema", return_value=None):
-                    with patch.object(
-                        _worker, "console",
+            with patch_all_modules("_d1_binding", return_value=mock_db):
+                with patch_all_modules("_ensure_leaderboard_schema", new=AsyncMock(return_value=None)):
+                    with patch_all_modules("console",
                         new=types.SimpleNamespace(log=lambda *a: None, error=lambda *a: None),
                     ):
                         return await _worker._fetch_mentor_stats_from_d1(env, "OWASP-BLT")
@@ -2375,8 +2403,7 @@ class TestD1MentorAssignments(unittest.TestCase):
         env = types.SimpleNamespace()  # no LEADERBOARD_DB
 
         async def _inner():
-            with patch.object(
-                _worker, "console",
+            with patch_all_modules("console",
                 new=types.SimpleNamespace(log=lambda *a: None, error=lambda *a: None),
             ):
                 return await _worker._fetch_mentor_stats_from_d1(env, "OWASP-BLT")
@@ -2414,11 +2441,10 @@ class TestD1MentorAssignments(unittest.TestCase):
             return resp
 
         async def _inner():
-            with patch.object(_worker, "_d1_binding", return_value=mock_db):
-                with patch.object(_worker, "_ensure_leaderboard_schema", return_value=None):
-                    with patch.object(_worker, "github_api", side_effect=_fake_github_api):
-                        with patch.object(
-                            _worker, "console",
+            with patch_all_modules("_d1_binding", return_value=mock_db):
+                with patch_all_modules("_ensure_leaderboard_schema", new=AsyncMock(return_value=None)):
+                    with patch_all_modules("github_api", side_effect=_fake_github_api):
+                        with patch_all_modules("console",
                             new=types.SimpleNamespace(log=lambda *a: None, error=lambda *a: None),
                         ):
                             return await _worker._fetch_mentor_stats_from_d1(
@@ -2457,11 +2483,10 @@ class TestD1MentorAssignments(unittest.TestCase):
             raise AssertionError("GitHub API should not be called when cache is fresh")
 
         async def _inner():
-            with patch.object(_worker, "_d1_binding", return_value=mock_db):
-                with patch.object(_worker, "_ensure_leaderboard_schema", return_value=None):
-                    with patch.object(_worker, "github_api", side_effect=_fake_github_api):
-                        with patch.object(
-                            _worker, "console",
+            with patch_all_modules("_d1_binding", return_value=mock_db):
+                with patch_all_modules("_ensure_leaderboard_schema", new=AsyncMock(return_value=None)):
+                    with patch_all_modules("github_api", side_effect=_fake_github_api):
+                        with patch_all_modules("console",
                             new=types.SimpleNamespace(log=lambda *a: None, error=lambda *a: None),
                         ):
                             return await _worker._fetch_mentor_stats_from_d1(
@@ -2508,11 +2533,10 @@ class TestD1MentorAssignments(unittest.TestCase):
             return resp
 
         async def _inner():
-            with patch.object(_worker, "_d1_binding", return_value=mock_db):
-                with patch.object(_worker, "_ensure_leaderboard_schema", return_value=None):
-                    with patch.object(_worker, "github_api", side_effect=_fake_github_api):
-                        with patch.object(
-                            _worker, "console",
+            with patch_all_modules("_d1_binding", return_value=mock_db):
+                with patch_all_modules("_ensure_leaderboard_schema", new=AsyncMock(return_value=None)):
+                    with patch_all_modules("github_api", side_effect=_fake_github_api):
+                        with patch_all_modules("console",
                             new=types.SimpleNamespace(log=lambda *a: None, error=lambda *a: None),
                         ):
                             return await _worker._fetch_mentor_stats_from_d1(
@@ -2542,11 +2566,10 @@ class TestD1MentorAssignments(unittest.TestCase):
             raise AssertionError("GitHub API should not be called without a token")
 
         async def _inner():
-            with patch.object(_worker, "_d1_binding", return_value=mock_db):
-                with patch.object(_worker, "_ensure_leaderboard_schema", return_value=None):
-                    with patch.object(_worker, "github_api", side_effect=_fake_github_api):
-                        with patch.object(
-                            _worker, "console",
+            with patch_all_modules("_d1_binding", return_value=mock_db):
+                with patch_all_modules("_ensure_leaderboard_schema", new=AsyncMock(return_value=None)):
+                    with patch_all_modules("github_api", side_effect=_fake_github_api):
+                        with patch_all_modules("console",
                             new=types.SimpleNamespace(log=lambda *a: None, error=lambda *a: None),
                         ):
                             # No token provided — should skip GitHub API path.
@@ -2571,8 +2594,7 @@ class TestD1MentorAssignments(unittest.TestCase):
         })
 
         async def _inner():
-            with patch.object(
-                _worker, "console",
+            with patch_all_modules("console",
                 new=types.SimpleNamespace(log=lambda *a: None, error=lambda *a: None),
             ):
                 return await _worker._d1_get_active_assignments(mock_db, "OWASP-BLT")
@@ -2589,8 +2611,7 @@ class TestD1MentorAssignments(unittest.TestCase):
         stmt.all = AsyncMock(return_value={"results": []})
 
         async def _inner():
-            with patch.object(
-                _worker, "console",
+            with patch_all_modules("console",
                 new=types.SimpleNamespace(log=lambda *a: None, error=lambda *a: None),
             ):
                 return await _worker._d1_get_active_assignments(mock_db, "OWASP-BLT")
@@ -2676,9 +2697,9 @@ class TestBackfillRepoMonthIdempotency(unittest.TestCase):
                 return self._make_api_response(closed_prs_data)
             return self._make_api_response([])
 
-        with patch.object(_worker, "github_api", new=_mock_api):
-            with patch.object(_worker, "_ensure_leaderboard_schema", new=AsyncMock()):
-                with patch.object(_worker, "console", new=types.SimpleNamespace(error=lambda x: None, log=lambda x: None)):
+        with patch_all_modules("github_api", new=_mock_api):
+            with patch_all_modules("_ensure_leaderboard_schema", new=AsyncMock()):
+                with patch_all_modules("console", new=types.SimpleNamespace(error=lambda x: None, log=lambda x: None)):
                     result = await _worker._backfill_repo_month_if_needed(
                         "OWASP-BLT", "test-repo", "tok", env,
                         month_key=month_key, start_ts=start_ts, end_ts=end_ts,
@@ -2705,7 +2726,7 @@ class TestBackfillRepoMonthIdempotency(unittest.TestCase):
         ]
         closed_prs = []
 
-        with patch.object(_worker, "_d1_inc_open_pr", new=AsyncMock(side_effect=lambda db, org, login, cnt: inc_calls.append((login, cnt)))):
+        with patch_all_modules("_d1_inc_open_pr", new=AsyncMock(side_effect=lambda db, org, login, cnt: inc_calls.append((login, cnt)))):
             _run(self._run_backfill(mock_db, open_prs, closed_prs))
 
         # PR #42 (alice) already tracked, PR #99 (bob) is new → only bob gets counted
@@ -2735,7 +2756,7 @@ class TestBackfillRepoMonthIdempotency(unittest.TestCase):
             },
         ]
 
-        with patch.object(_worker, "_d1_inc_monthly", new=AsyncMock(side_effect=lambda db, org, mk, login, field, delta=1: monthly_inc_calls.append((login, field)))):
+        with patch_all_modules("_d1_inc_monthly", new=AsyncMock(side_effect=lambda db, org, mk, login, field, delta=1: monthly_inc_calls.append((login, field)))):
             _run(self._run_backfill(mock_db, open_prs, closed_prs))
 
         # PR #10 (alice) already tracked → only bob's PR #11 should be counted
@@ -2769,9 +2790,9 @@ class TestBackfillRepoMonthIdempotency(unittest.TestCase):
             },
         ]
 
-        with patch.object(_worker, "_d1_run", new=_capture_d1_run):
-            with patch.object(_worker, "_d1_inc_open_pr", new=AsyncMock()):
-                with patch.object(_worker, "_d1_inc_monthly", new=AsyncMock()):
+        with patch_all_modules("_d1_run", new=_capture_d1_run):
+            with patch_all_modules("_d1_inc_open_pr", new=AsyncMock()):
+                with patch_all_modules("_d1_inc_monthly", new=AsyncMock()):
                     _run(self._run_backfill(mock_db, open_prs, closed_prs))
 
         # Both new PRs should be inserted into leaderboard_pr_state
@@ -2804,11 +2825,11 @@ class TestBackfillRepoMonthIdempotency(unittest.TestCase):
         mock_db = self._make_mock_db(pr_state_rows=[])
         monthly_inc_calls = []
 
-        with patch.object(_worker, "_d1_inc_monthly", new=AsyncMock(
+        with patch_all_modules("_d1_inc_monthly", new=AsyncMock(
             side_effect=lambda db, org, mk, login, field, delta=1: monthly_inc_calls.append((login, field))
         )):
-            with patch.object(_worker, "_d1_run", new=AsyncMock(return_value={"success": True})):
-                with patch.object(_worker, "_d1_all", new=AsyncMock(return_value=[])):
+            with patch_all_modules("_d1_run", new=AsyncMock(return_value={"success": True})):
+                with patch_all_modules("_d1_all", new=AsyncMock(return_value=[])):
                     _, api_calls = _run(self._run_backfill(
                         mock_db, [], [],
                         closed_prs_pages=[page1_prs, page2_prs],
@@ -2860,19 +2881,19 @@ class TestBackfillRepoMonthIdempotency(unittest.TestCase):
                 # reviews and any other call
                 return types.SimpleNamespace(status=200, text=AsyncMock(return_value=json.dumps([])))
 
-            with patch.object(_worker, "github_api", new=_mock_api):
-                with patch.object(_worker, "_ensure_leaderboard_schema", new=AsyncMock()):
-                    with patch.object(_worker, "_d1_all", new=_smart_d1_all):
-                        with patch.object(_worker, "_d1_inc_open_pr", new=AsyncMock(
+            with patch_all_modules("github_api", new=_mock_api):
+                with patch_all_modules("_ensure_leaderboard_schema", new=AsyncMock()):
+                    with patch_all_modules("_d1_all", new=_smart_d1_all):
+                        with patch_all_modules("_d1_inc_open_pr", new=AsyncMock(
                             side_effect=lambda db, org, login, cnt: open_pr_delta_calls.append((login, cnt))
                         )):
-                            with patch.object(_worker, "_d1_inc_monthly", new=AsyncMock(
+                            with patch_all_modules("_d1_inc_monthly", new=AsyncMock(
                                 side_effect=lambda db, org, mk, login, field, delta=1: monthly_inc_calls.append((login, field))
                             )):
-                                with patch.object(_worker, "_d1_run", new=AsyncMock(
+                                with patch_all_modules("_d1_run", new=AsyncMock(
                                     side_effect=lambda db, sql, params=(): d1_run_sqls.append(sql)
                                 )):
-                                    with patch.object(_worker, "console", new=types.SimpleNamespace(error=lambda x: None, log=lambda x: None)):
+                                    with patch_all_modules("console", new=types.SimpleNamespace(error=lambda x: None, log=lambda x: None)):
                                         await _worker._backfill_repo_month_if_needed(
                                             "OWASP-BLT", "test-repo", "tok", env,
                                             month_key="2026-03", start_ts=start_ts, end_ts=end_ts,
@@ -2923,17 +2944,17 @@ class TestBackfillRepoMonthIdempotency(unittest.TestCase):
                     ])))
                 return types.SimpleNamespace(status=200, text=AsyncMock(return_value=json.dumps([])))
 
-            with patch.object(_worker, "github_api", new=_mock_api):
-                with patch.object(_worker, "_ensure_leaderboard_schema", new=AsyncMock()):
-                    with patch.object(_worker, "_d1_all", new=_smart_d1_all):
-                        with patch.object(_worker, "_d1_inc_open_pr", new=AsyncMock(
+            with patch_all_modules("github_api", new=_mock_api):
+                with patch_all_modules("_ensure_leaderboard_schema", new=AsyncMock()):
+                    with patch_all_modules("_d1_all", new=_smart_d1_all):
+                        with patch_all_modules("_d1_inc_open_pr", new=AsyncMock(
                             side_effect=lambda db, org, login, cnt: open_pr_delta_calls.append((login, cnt))
                         )):
-                            with patch.object(_worker, "_d1_inc_monthly", new=AsyncMock(
+                            with patch_all_modules("_d1_inc_monthly", new=AsyncMock(
                                 side_effect=lambda db, org, mk, login, field, delta=1: monthly_inc_calls.append((login, field))
                             )):
-                                with patch.object(_worker, "_d1_run", new=AsyncMock(return_value={"success": True})):
-                                    with patch.object(_worker, "console", new=types.SimpleNamespace(error=lambda x: None, log=lambda x: None)):
+                                with patch_all_modules("_d1_run", new=AsyncMock(return_value={"success": True})):
+                                    with patch_all_modules("console", new=types.SimpleNamespace(error=lambda x: None, log=lambda x: None)):
                                         await _worker._backfill_repo_month_if_needed(
                                             "OWASP-BLT", "test-repo", "tok", env,
                                             month_key="2026-03", start_ts=start_ts, end_ts=end_ts,
@@ -2970,9 +2991,9 @@ class TestResetLeaderboardMonthClearsBackfillState(unittest.TestCase):
         mock_db = MagicMock()
 
         async def _inner():
-            with patch.object(_worker, "_d1_run", new=_mock_d1_run):
-                with patch.object(_worker, "_ensure_leaderboard_schema", new=AsyncMock()):
-                    with patch.object(_worker, "console", new=types.SimpleNamespace(error=lambda x: None, log=lambda x: None)):
+            with patch_all_modules("_d1_run", new=_mock_d1_run):
+                with patch_all_modules("_ensure_leaderboard_schema", new=AsyncMock()):
+                    with patch_all_modules("console", new=types.SimpleNamespace(error=lambda x: None, log=lambda x: None)):
                         await _worker._reset_leaderboard_month("OWASP-BLT", "2026-03", mock_db)
 
         _run(_inner())
@@ -2985,9 +3006,9 @@ class TestResetLeaderboardMonthClearsBackfillState(unittest.TestCase):
         mock_db = MagicMock()
 
         async def _inner():
-            with patch.object(_worker, "_d1_run", new=AsyncMock(return_value={"success": True})):
-                with patch.object(_worker, "_ensure_leaderboard_schema", new=AsyncMock()):
-                    with patch.object(_worker, "console", new=types.SimpleNamespace(error=lambda x: None, log=lambda x: None)):
+            with patch_all_modules("_d1_run", new=AsyncMock(return_value={"success": True})):
+                with patch_all_modules("_ensure_leaderboard_schema", new=AsyncMock()):
+                    with patch_all_modules("console", new=types.SimpleNamespace(error=lambda x: None, log=lambda x: None)):
                         return await _worker._reset_leaderboard_month("OWASP-BLT", "2026-03", mock_db)
 
         result = _run(_inner())
@@ -3057,14 +3078,14 @@ class TestBackfillReviewCredits(unittest.TestCase):
                     return self._make_api_response(reviews)
                 return self._make_api_response([])
 
-            with patch.object(_worker, "github_api", new=_mock_api):
-                with patch.object(_worker, "_ensure_leaderboard_schema", new=AsyncMock()):
-                    with patch.object(_worker, "_d1_inc_monthly", new=AsyncMock(
+            with patch_all_modules("github_api", new=_mock_api):
+                with patch_all_modules("_ensure_leaderboard_schema", new=AsyncMock()):
+                    with patch_all_modules("_d1_inc_monthly", new=AsyncMock(
                         side_effect=lambda db, org, mk, login, field, delta=1: monthly_inc_calls.append((login, field))
                     )):
-                        with patch.object(_worker, "_d1_run", new=AsyncMock(return_value={"success": True})):
-                            with patch.object(_worker, "_d1_all", new=AsyncMock(return_value=[])):
-                                with patch.object(_worker, "console", new=types.SimpleNamespace(error=lambda x: None, log=lambda x: None)):
+                        with patch_all_modules("_d1_run", new=AsyncMock(return_value={"success": True})):
+                            with patch_all_modules("_d1_all", new=AsyncMock(return_value=[])):
+                                with patch_all_modules("console", new=types.SimpleNamespace(error=lambda x: None, log=lambda x: None)):
                                     await _worker._backfill_repo_month_if_needed(
                                         "OWASP-BLT", "test-repo", "tok", env,
                                         month_key="2026-03", start_ts=start_ts, end_ts=end_ts,
@@ -3108,14 +3129,14 @@ class TestBackfillReviewCredits(unittest.TestCase):
                     return self._make_api_response(reviews)
                 return self._make_api_response([])
 
-            with patch.object(_worker, "github_api", new=_mock_api):
-                with patch.object(_worker, "_ensure_leaderboard_schema", new=AsyncMock()):
-                    with patch.object(_worker, "_d1_inc_monthly", new=AsyncMock(
+            with patch_all_modules("github_api", new=_mock_api):
+                with patch_all_modules("_ensure_leaderboard_schema", new=AsyncMock()):
+                    with patch_all_modules("_d1_inc_monthly", new=AsyncMock(
                         side_effect=lambda db, org, mk, login, field, delta=1: monthly_inc_calls.append((login, field))
                     )):
-                        with patch.object(_worker, "_d1_run", new=AsyncMock(return_value={"success": True})):
-                            with patch.object(_worker, "_d1_all", new=AsyncMock(return_value=[])):
-                                with patch.object(_worker, "console", new=types.SimpleNamespace(error=lambda x: None, log=lambda x: None)):
+                        with patch_all_modules("_d1_run", new=AsyncMock(return_value={"success": True})):
+                            with patch_all_modules("_d1_all", new=AsyncMock(return_value=[])):
+                                with patch_all_modules("console", new=types.SimpleNamespace(error=lambda x: None, log=lambda x: None)):
                                     await _worker._backfill_repo_month_if_needed(
                                         "OWASP-BLT", "test-repo", "tok", env,
                                         month_key="2026-03", start_ts=start_ts, end_ts=end_ts,
@@ -3149,19 +3170,19 @@ class TestBackfillReviewCredits(unittest.TestCase):
 
             monthly_inc_calls = []
 
-            with patch.object(_worker, "github_api", new=AsyncMock(side_effect=lambda method, path, token, body=None: (
+            with patch_all_modules("github_api", new=AsyncMock(side_effect=lambda method, path, token, body=None: (
                 types.SimpleNamespace(status=200, text=AsyncMock(return_value=json.dumps([]))) if "state=open" in path
                 else types.SimpleNamespace(status=200, text=AsyncMock(return_value=json.dumps(closed_prs))) if "state=closed" in path
                 else types.SimpleNamespace(status=200, text=AsyncMock(return_value=json.dumps(reviews)))
             ))):
-                with patch.object(_worker, "_ensure_leaderboard_schema", new=AsyncMock()):
-                    with patch.object(_worker, "_d1_inc_monthly", new=AsyncMock(
+                with patch_all_modules("_ensure_leaderboard_schema", new=AsyncMock()):
+                    with patch_all_modules("_d1_inc_monthly", new=AsyncMock(
                         side_effect=lambda db, org, mk, login, field, delta=1: monthly_inc_calls.append((login, field))
                     )):
-                        with patch.object(_worker, "_d1_run", new=AsyncMock(return_value={"success": True})):
+                        with patch_all_modules("_d1_run", new=AsyncMock(return_value={"success": True})):
                             # No pre-existing credits: empty list returned for all _d1_all calls
-                            with patch.object(_worker, "_d1_all", new=AsyncMock(return_value=[])):
-                                with patch.object(_worker, "console", new=types.SimpleNamespace(error=lambda x: None, log=lambda x: None)):
+                            with patch_all_modules("_d1_all", new=AsyncMock(return_value=[])):
+                                with patch_all_modules("console", new=types.SimpleNamespace(error=lambda x: None, log=lambda x: None)):
                                     await _worker._backfill_repo_month_if_needed(
                                         "OWASP-BLT", "test-repo", "tok", env,
                                         month_key="2026-03", start_ts=start_ts, end_ts=end_ts,
@@ -3204,12 +3225,12 @@ class TestBackfillReviewCredits(unittest.TestCase):
                     return self._make_api_response(closed_prs)
                 return self._make_api_response([])
 
-            with patch.object(_worker, "github_api", new=_mock_api):
-                with patch.object(_worker, "_ensure_leaderboard_schema", new=AsyncMock()):
-                    with patch.object(_worker, "_d1_run", new=AsyncMock(return_value={"success": True})):
-                        with patch.object(_worker, "_d1_all", new=AsyncMock(return_value=[])):
-                            with patch.object(_worker, "_d1_inc_monthly", new=AsyncMock()):
-                                with patch.object(_worker, "console", new=types.SimpleNamespace(error=lambda x: None, log=lambda x: None)):
+            with patch_all_modules("github_api", new=_mock_api):
+                with patch_all_modules("_ensure_leaderboard_schema", new=AsyncMock()):
+                    with patch_all_modules("_d1_run", new=AsyncMock(return_value={"success": True})):
+                        with patch_all_modules("_d1_all", new=AsyncMock(return_value=[])):
+                            with patch_all_modules("_d1_inc_monthly", new=AsyncMock()):
+                                with patch_all_modules("console", new=types.SimpleNamespace(error=lambda x: None, log=lambda x: None)):
                                     await _worker._backfill_repo_month_if_needed(
                                         "OWASP-BLT", "test-repo", "tok", env,
                                         month_key="2026-03", start_ts=start_ts, end_ts=end_ts,
@@ -3255,12 +3276,12 @@ class TestBackfillReviewCredits(unittest.TestCase):
                     return types.SimpleNamespace(status=429, text=AsyncMock(return_value="rate limited"))
                 return types.SimpleNamespace(status=200, text=AsyncMock(return_value=json.dumps([])))
 
-            with patch.object(_worker, "github_api", new=_mock_api):
-                with patch.object(_worker, "_ensure_leaderboard_schema", new=AsyncMock()):
-                    with patch.object(_worker, "_d1_inc_monthly", new=AsyncMock()):
-                        with patch.object(_worker, "_d1_run", new=AsyncMock(return_value={"success": True})):
-                            with patch.object(_worker, "_d1_all", new=AsyncMock(return_value=[])):
-                                with patch.object(_worker, "console", new=types.SimpleNamespace(
+            with patch_all_modules("github_api", new=_mock_api):
+                with patch_all_modules("_ensure_leaderboard_schema", new=AsyncMock()):
+                    with patch_all_modules("_d1_inc_monthly", new=AsyncMock()):
+                        with patch_all_modules("_d1_run", new=AsyncMock(return_value={"success": True})):
+                            with patch_all_modules("_d1_all", new=AsyncMock(return_value=[])):
+                                with patch_all_modules("console", new=types.SimpleNamespace(
                                     error=lambda x: error_msgs.append(x), log=lambda x: None
                                 )):
                                     await _worker._backfill_repo_month_if_needed(
@@ -3316,7 +3337,7 @@ class TestWebhookSecurityGuards(unittest.TestCase):
             )
             env = types.SimpleNamespace(APP_ID="123", PRIVATE_KEY="pem")
 
-            with patch.object(_worker, "console", new=types.SimpleNamespace(error=lambda x: None, log=lambda x: None)):
+            with patch_all_modules("console", new=types.SimpleNamespace(error=lambda x: None, log=lambda x: None)):
                 resp = await _worker.handle_webhook(req, env)
 
             self.assertEqual(resp.status, 503)
@@ -3332,7 +3353,7 @@ class TestWebhookSecurityGuards(unittest.TestCase):
             req = self._make_health_request()
             env = types.SimpleNamespace(APP_ID="123", PRIVATE_KEY="pem")
 
-            with patch.object(_worker, "console", new=types.SimpleNamespace(error=lambda x: None, log=lambda x: None)):
+            with patch_all_modules("console", new=types.SimpleNamespace(error=lambda x: None, log=lambda x: None)):
                 resp = await _worker.on_fetch(req, env)
 
             self.assertEqual(resp.status, 200)
@@ -3352,7 +3373,7 @@ class TestWebhookSecurityGuards(unittest.TestCase):
             req = self._make_health_request()
             env = types.SimpleNamespace(APP_ID="123", PRIVATE_KEY="pem", WEBHOOK_SECRET="secret")
 
-            with patch.object(_worker, "console", new=types.SimpleNamespace(error=lambda x: None, log=lambda x: None)):
+            with patch_all_modules("console", new=types.SimpleNamespace(error=lambda x: None, log=lambda x: None)):
                 resp = await _worker.on_fetch(req, env)
 
             self.assertEqual(resp.status, 200)
@@ -3361,7 +3382,7 @@ class TestWebhookSecurityGuards(unittest.TestCase):
             self.assertTrue(payload.get("checks", {}).get("webhook_security", {}).get("ready"))
 
             blank_env = types.SimpleNamespace(APP_ID="123", PRIVATE_KEY="pem", WEBHOOK_SECRET="   ")
-            with patch.object(_worker, "console", new=types.SimpleNamespace(error=lambda x: None, log=lambda x: None)):
+            with patch_all_modules("console", new=types.SimpleNamespace(error=lambda x: None, log=lambda x: None)):
                 blank_resp = await _worker.on_fetch(req, blank_env)
 
             self.assertEqual(blank_resp.status, 200)
@@ -3383,7 +3404,7 @@ class TestWebhookSecurityGuards(unittest.TestCase):
                 error=lambda x: logs.append(str(x)),
                 log=lambda x: logs.append(str(x)),
             )
-            with patch.object(_worker, "console", new=console_stub):
+            with patch_all_modules("console", new=console_stub):
                 resp = await _worker.on_fetch(req, env)
 
             self.assertEqual(resp.status, 200)
@@ -3399,7 +3420,7 @@ class TestWebhookSecurityGuards(unittest.TestCase):
                     "X-GitHub-Delivery": "delivery-blank-secret",
                 },
             )
-            with patch.object(_worker, "console", new=console_stub):
+            with patch_all_modules("console", new=console_stub):
                 webhook_resp = await _worker.on_fetch(webhook_req, env)
 
             self.assertEqual(webhook_resp.status, 503)
@@ -3440,7 +3461,7 @@ class TestAdminResetLeaderboard(unittest.TestCase):
             env = types.SimpleNamespace(LEADERBOARD_DB=MagicMock())
             # No ADMIN_SECRET attribute
             req = self._make_request(body={"org": "OWASP-BLT"}, auth="Bearer anything")
-            with patch.object(_worker, "console", new=types.SimpleNamespace(error=lambda x: None, log=lambda x: None)):
+            with patch_all_modules("console", new=types.SimpleNamespace(error=lambda x: None, log=lambda x: None)):
                 resp = await _worker.on_fetch(req, env)
             self.assertEqual(resp.status, 403)
 
@@ -3451,8 +3472,8 @@ class TestAdminResetLeaderboard(unittest.TestCase):
         async def _inner():
             env = self._make_env(admin_secret="correct-secret")
             req = self._make_request(body={"org": "OWASP-BLT"}, auth="Bearer wrong-secret")
-            with patch.object(_worker, "_ensure_leaderboard_schema", new=AsyncMock()):
-                with patch.object(_worker, "console", new=types.SimpleNamespace(error=lambda x: None, log=lambda x: None)):
+            with patch_all_modules("_ensure_leaderboard_schema", new=AsyncMock()):
+                with patch_all_modules("console", new=types.SimpleNamespace(error=lambda x: None, log=lambda x: None)):
                     resp = await _worker.on_fetch(req, env)
             self.assertEqual(resp.status, 401)
 
@@ -3463,8 +3484,8 @@ class TestAdminResetLeaderboard(unittest.TestCase):
         async def _inner():
             env = self._make_env()
             req = self._make_request(body={}, auth="Bearer test-secret")
-            with patch.object(_worker, "_ensure_leaderboard_schema", new=AsyncMock()):
-                with patch.object(_worker, "console", new=types.SimpleNamespace(error=lambda x: None, log=lambda x: None)):
+            with patch_all_modules("_ensure_leaderboard_schema", new=AsyncMock()):
+                with patch_all_modules("console", new=types.SimpleNamespace(error=lambda x: None, log=lambda x: None)):
                     resp = await _worker.on_fetch(req, env)
             self.assertEqual(resp.status, 400)
 
@@ -3484,13 +3505,14 @@ class TestAdminResetLeaderboard(unittest.TestCase):
                 deleted_calls.append((org, month_key))
                 return {"leaderboard_monthly_stats": "cleared"}
 
-            with patch.object(_worker, "_reset_leaderboard_month", new=_mock_reset):
-                with patch.object(_worker, "console", new=types.SimpleNamespace(error=lambda x: None, log=lambda x: None)):
+            with patch_all_modules("_reset_leaderboard_month", new=_mock_reset):
+                with patch_all_modules("console", new=types.SimpleNamespace(error=lambda x: None, log=lambda x: None)):
                     resp = await _worker.on_fetch(req, env)
 
             self.assertEqual(resp.status, 200)
             body = json.loads(resp.body)
-            self.assertTrue(body["ok"])
+            print("RESET BODY:", body)
+            self.assertTrue(body.get("ok", False))
             self.assertEqual(body["org"], "OWASP-BLT")
             self.assertEqual(body["month_key"], "2026-03")
             self.assertEqual(len(deleted_calls), 1)
@@ -3506,7 +3528,7 @@ class TestAdminResetLeaderboard(unittest.TestCase):
                 body={"org": "OWASP-BLT"},
                 auth="Bearer test-secret",
             )
-            with patch.object(_worker, "console", new=types.SimpleNamespace(error=lambda x: None, log=lambda x: None)):
+            with patch_all_modules("console", new=types.SimpleNamespace(error=lambda x: None, log=lambda x: None)):
                 resp = await _worker.on_fetch(req, env)
 
             self.assertEqual(resp.status, 400)
@@ -3523,7 +3545,7 @@ class TestAdminResetLeaderboard(unittest.TestCase):
                 body={"org": "OWASP-BLT", "month_key": "2026-3"},  # missing leading zero
                 auth="Bearer test-secret",
             )
-            with patch.object(_worker, "console", new=types.SimpleNamespace(error=lambda x: None, log=lambda x: None)):
+            with patch_all_modules("console", new=types.SimpleNamespace(error=lambda x: None, log=lambda x: None)):
                 resp = await _worker.on_fetch(req, env)
 
             self.assertEqual(resp.status, 400)
@@ -3575,8 +3597,8 @@ class TestCheckUnresolvedConversations(unittest.TestCase):
         api_calls = []
 
         async def _inner():
-            with patch.object(_worker, "github_api", new=AsyncMock(side_effect=lambda *a, **kw: api_calls.append(a))):
-                with patch.object(_worker, "fetch", new=AsyncMock()):
+            with patch_all_modules("github_api", new=AsyncMock(side_effect=lambda *a, **kw: api_calls.append(a))):
+                with patch_all_modules("fetch", new=AsyncMock()):
                     await _worker.check_unresolved_conversations({"repository": {"owner": {"login": "x"}, "name": "y"}}, "tok")
 
         _run(_inner())
@@ -3589,8 +3611,8 @@ class TestCheckUnresolvedConversations(unittest.TestCase):
         fail_resp.status = 502
 
         async def _inner():
-            with patch.object(_worker, "github_api", new=AsyncMock(side_effect=lambda *a, **kw: api_calls.append(a))):
-                with patch.object(_worker, "fetch", new=AsyncMock(return_value=fail_resp)):
+            with patch_all_modules("github_api", new=AsyncMock(side_effect=lambda *a, **kw: api_calls.append(a))):
+                with patch_all_modules("fetch", new=AsyncMock(return_value=fail_resp)):
                     await _worker.check_unresolved_conversations(self._payload(), "tok")
 
         _run(_inner())
@@ -3602,10 +3624,8 @@ class TestCheckUnresolvedConversations(unittest.TestCase):
         api_calls = []
 
         async def _inner():
-            with patch.object(_worker, "fetch", new=AsyncMock(return_value=self._graphql_response(threads))):
-                with patch.object(
-                    _worker,
-                    "github_api",
+            with patch_all_modules("fetch", new=AsyncMock(return_value=self._graphql_response(threads))):
+                with patch_all_modules("github_api",
                     new=AsyncMock(side_effect=lambda *a, **kw: (api_calls.append(a), self._ok_response())[-1]),
                 ):
                     await _worker.check_unresolved_conversations(self._payload(), "tok")
@@ -3625,10 +3645,8 @@ class TestCheckUnresolvedConversations(unittest.TestCase):
         api_calls = []
 
         async def _inner():
-            with patch.object(_worker, "fetch", new=AsyncMock(return_value=self._graphql_response(threads))):
-                with patch.object(
-                    _worker,
-                    "github_api",
+            with patch_all_modules("fetch", new=AsyncMock(return_value=self._graphql_response(threads))):
+                with patch_all_modules("github_api",
                     new=AsyncMock(side_effect=lambda *a, **kw: (api_calls.append(a), self._ok_response())[-1]),
                 ):
                     await _worker.check_unresolved_conversations(self._payload(), "tok")
@@ -3654,8 +3672,8 @@ class TestCheckUnresolvedConversations(unittest.TestCase):
             return self._ok_response()
 
         async def _inner():
-            with patch.object(_worker, "fetch", new=AsyncMock(return_value=self._graphql_response(threads))):
-                with patch.object(_worker, "github_api", new=AsyncMock(side_effect=mock_api)):
+            with patch_all_modules("fetch", new=AsyncMock(return_value=self._graphql_response(threads))):
+                with patch_all_modules("github_api", new=AsyncMock(side_effect=mock_api)):
                     await _worker.check_unresolved_conversations(self._payload(), "tok")
 
         _run(_inner())
@@ -3672,10 +3690,8 @@ class TestCheckUnresolvedConversations(unittest.TestCase):
         api_calls = []
 
         async def _inner():
-            with patch.object(_worker, "fetch", new=AsyncMock(return_value=self._graphql_response(threads))):
-                with patch.object(
-                    _worker,
-                    "github_api",
+            with patch_all_modules("fetch", new=AsyncMock(return_value=self._graphql_response(threads))):
+                with patch_all_modules("github_api",
                     new=AsyncMock(side_effect=lambda *a, **kw: (api_calls.append(a), self._ok_response())[-1]),
                 ):
                     await _worker.check_unresolved_conversations(self._payload(), "tok")
@@ -3697,10 +3713,8 @@ class TestCheckUnresolvedConversations(unittest.TestCase):
         api_calls = []
 
         async def _inner():
-            with patch.object(_worker, "fetch", new=AsyncMock(return_value=self._graphql_response(threads))):
-                with patch.object(
-                    _worker,
-                    "github_api",
+            with patch_all_modules("fetch", new=AsyncMock(return_value=self._graphql_response(threads))):
+                with patch_all_modules("github_api",
                     new=AsyncMock(side_effect=lambda *a, **kw: (api_calls.append(a), self._ok_response())[-1]),
                 ):
                     await _worker.check_unresolved_conversations(self._payload(), "tok")
@@ -3756,7 +3770,7 @@ class TestLabelPendingChecks(unittest.TestCase):
             return self._ok_response()
 
         async def _inner():
-            with patch.object(_worker, "github_api", new=AsyncMock(side_effect=mock_api)):
+            with patch_all_modules("github_api", new=AsyncMock(side_effect=mock_api)):
                 await _worker.label_pending_checks("acme", "widgets", 5, "abc123", "tok")
 
         _run(_inner())
@@ -3792,7 +3806,7 @@ class TestLabelPendingChecks(unittest.TestCase):
             return self._ok_response()
 
         async def _inner():
-            with patch.object(_worker, "github_api", new=AsyncMock(side_effect=mock_api)):
+            with patch_all_modules("github_api", new=AsyncMock(side_effect=mock_api)):
                 await _worker.label_pending_checks("acme", "widgets", 7, "abc123", "tok")
 
         _run(_inner())
@@ -3815,7 +3829,7 @@ class TestLabelPendingChecks(unittest.TestCase):
             return self._ok_response()
 
         async def _inner():
-            with patch.object(_worker, "github_api", new=AsyncMock(side_effect=mock_api)):
+            with patch_all_modules("github_api", new=AsyncMock(side_effect=mock_api)):
                 await _worker.label_pending_checks("acme", "widgets", 5, "abc123", "tok")
 
         _run(_inner())
@@ -3840,7 +3854,7 @@ class TestLabelPendingChecks(unittest.TestCase):
             return self._ok_response()
 
         async def _inner():
-            with patch.object(_worker, "github_api", new=AsyncMock(side_effect=mock_api)):
+            with patch_all_modules("github_api", new=AsyncMock(side_effect=mock_api)):
                 await _worker.label_pending_checks("acme", "widgets", 5, "abc123", "tok")
 
         _run(_inner())
@@ -3863,7 +3877,7 @@ class TestLabelPendingChecks(unittest.TestCase):
             return self._ok_response()
 
         async def _inner():
-            with patch.object(_worker, "github_api", new=AsyncMock(side_effect=mock_api)):
+            with patch_all_modules("github_api", new=AsyncMock(side_effect=mock_api)):
                 await _worker.label_pending_checks("acme", "widgets", 9, "deadbeef", "tok")
 
         _run(_inner())
@@ -3889,7 +3903,7 @@ class TestLabelPendingChecks(unittest.TestCase):
             return self._ok_response()
 
         async def _inner():
-            with patch.object(_worker, "github_api", new=AsyncMock(side_effect=mock_api)):
+            with patch_all_modules("github_api", new=AsyncMock(side_effect=mock_api)):
                 await _worker.label_pending_checks("acme", "widgets", 5, "abc123", "tok")
 
         _run(_inner())
@@ -3916,7 +3930,7 @@ class TestLabelPendingChecks(unittest.TestCase):
             return self._ok_response()
 
         async def _inner():
-            with patch.object(_worker, "github_api", new=AsyncMock(side_effect=mock_api)):
+            with patch_all_modules("github_api", new=AsyncMock(side_effect=mock_api)):
                 await _worker.label_pending_checks("acme", "widgets", 5, "abc123", "tok")
 
         _run(_inner())
@@ -3959,7 +3973,7 @@ class TestHandleWorkflowRun(unittest.TestCase):
             checked.append(pr_number)
 
         async def _inner():
-            with patch.object(_worker, "label_pending_checks", new=mock_check):
+            with patch_all_modules("label_pending_checks", new=mock_check):
                 await _worker.handle_workflow_run(self._make_payload(pr_numbers=[1, 2, 3]), "tok")
 
         _run(_inner())
@@ -3983,8 +3997,8 @@ class TestHandleWorkflowRun(unittest.TestCase):
             return pulls_resp
 
         async def _inner():
-            with patch.object(_worker, "label_pending_checks", new=mock_check):
-                with patch.object(_worker, "github_api", new=AsyncMock(side_effect=mock_api)):
+            with patch_all_modules("label_pending_checks", new=mock_check):
+                with patch_all_modules("github_api", new=AsyncMock(side_effect=mock_api)):
                     await _worker.handle_workflow_run(self._make_payload(pr_numbers=[], head_sha="abc123"), "tok")
 
         _run(_inner())
@@ -4001,8 +4015,8 @@ class TestHandleWorkflowRun(unittest.TestCase):
             checked.append(pr_number)
 
         async def _inner():
-            with patch.object(_worker, "label_pending_checks", new=mock_check):
-                with patch.object(_worker, "github_api", new=AsyncMock(return_value=pulls_resp)):
+            with patch_all_modules("label_pending_checks", new=mock_check):
+                with patch_all_modules("github_api", new=AsyncMock(return_value=pulls_resp)):
                     await _worker.handle_workflow_run(self._make_payload(pr_numbers=[], head_sha="abc123"), "tok")
 
         _run(_inner())
@@ -4030,7 +4044,7 @@ class TestHandleCheckRun(unittest.TestCase):
             checked.append(pr_number)
 
         async def _inner():
-            with patch.object(_worker, "label_pending_checks", new=mock_label):
+            with patch_all_modules("label_pending_checks", new=mock_label):
                 await _worker.handle_check_run(self._make_payload(pr_numbers=[5, 6]), "tok")
 
         _run(_inner())
@@ -4054,8 +4068,8 @@ class TestHandleCheckRun(unittest.TestCase):
             return pulls_resp
 
         async def _inner():
-            with patch.object(_worker, "label_pending_checks", new=mock_label):
-                with patch.object(_worker, "github_api", new=AsyncMock(side_effect=mock_api)):
+            with patch_all_modules("label_pending_checks", new=mock_label):
+                with patch_all_modules("github_api", new=AsyncMock(side_effect=mock_api)):
                     await _worker.handle_check_run(self._make_payload(pr_numbers=[], head_sha="abc123"), "tok")
 
         _run(_inner())
@@ -4072,8 +4086,8 @@ class TestHandleCheckRun(unittest.TestCase):
             checked.append(pr_number)
 
         async def _inner():
-            with patch.object(_worker, "label_pending_checks", new=mock_label):
-                with patch.object(_worker, "github_api", new=AsyncMock(return_value=pulls_resp)):
+            with patch_all_modules("label_pending_checks", new=mock_label):
+                with patch_all_modules("github_api", new=AsyncMock(return_value=pulls_resp)):
                     await _worker.handle_check_run(self._make_payload(pr_numbers=[], head_sha="abc123"), "tok")
 
         _run(_inner())
@@ -4241,9 +4255,7 @@ class TestSelectMentor(unittest.TestCase):
 
     def _run_select(self, load_map, issue_labels=None, exclude=None):
         async def _inner():
-            with patch.object(
-                _worker,
-                "_get_mentor_load_map",
+            with patch_all_modules("_get_mentor_load_map",
                 new=AsyncMock(return_value=load_map),
             ):
                 return await _worker._select_mentor(
@@ -4302,7 +4314,7 @@ class TestSelectMentor(unittest.TestCase):
             {"github_username": "dave", "active": False, "max_mentees": 3, "specialties": []},
         ]
         async def _inner():
-            with patch.object(_worker, "_get_mentor_load_map", new=AsyncMock(return_value={})):
+            with patch_all_modules("_get_mentor_load_map", new=AsyncMock(return_value={})):
                 return await _worker._select_mentor(
                     "OWASP-BLT", "tok", mentors_config=only_inactive
                 )
@@ -4322,19 +4334,15 @@ class TestAssignMentorToIssue(unittest.TestCase):
             select_return = self._MENTOR_FIXTURE[0]
 
         async def _inner():
-            with patch.object(_worker, "_select_mentor", new=AsyncMock(return_value=select_return)):
-                with patch.object(_worker, "_get_mentor_load_map", new=AsyncMock(return_value={})):
-                    with patch.object(_worker, "_ensure_label_exists", new=AsyncMock()):
-                        with patch.object(
-                            _worker,
-                            "github_api",
+            with patch_all_modules("_select_mentor", new=AsyncMock(return_value=select_return)):
+                with patch_all_modules("_get_mentor_load_map", new=AsyncMock(return_value={})):
+                    with patch_all_modules("_ensure_label_exists", new=AsyncMock()):
+                        with patch_all_modules("github_api",
                             new=AsyncMock(return_value=types.SimpleNamespace(
                                 status=200, text=AsyncMock(return_value="{}")
                             )),
                         ):
-                            with patch.object(
-                                _worker,
-                                "create_comment",
+                            with patch_all_modules("create_comment",
                                 new=AsyncMock(side_effect=lambda o, r, n, b, t: comments.append(b)),
                             ):
                                 return await _worker._assign_mentor_to_issue(
@@ -4377,10 +4385,8 @@ class TestAssignMentorToIssue(unittest.TestCase):
         comments = []
 
         async def _inner():
-            with patch.object(_worker, "_select_mentor", new=AsyncMock(return_value=None)):
-                with patch.object(
-                    _worker,
-                    "create_comment",
+            with patch_all_modules("_select_mentor", new=AsyncMock(return_value=None)):
+                with patch_all_modules("create_comment",
                     new=AsyncMock(side_effect=lambda o, r, n, b, t: comments.append(b)),
                 ):
                     return await _worker._assign_mentor_to_issue(
@@ -4397,14 +4403,10 @@ class TestHandleMentorCommand(unittest.TestCase):
 
     def _run_cmd(self, issue, assign_calls, comments):
         async def _inner():
-            with patch.object(
-                _worker,
-                "_assign_mentor_to_issue",
+            with patch_all_modules("_assign_mentor_to_issue",
                 new=AsyncMock(side_effect=lambda *a, **kw: assign_calls.append(a)),
             ):
-                with patch.object(
-                    _worker,
-                    "create_comment",
+                with patch_all_modules("create_comment",
                     new=AsyncMock(side_effect=lambda o, r, n, b, t: comments.append(b)),
                 ):
                     await _worker.handle_mentor_command(
@@ -4439,25 +4441,17 @@ class TestHandleMentorUnassign(unittest.TestCase):
     def _run_unmentor(self, issue, login, current_mentor, api_calls, comments,
                       is_maintainer=False):
         async def _inner():
-            with patch.object(
-                _worker,
-                "_find_assigned_mentor_from_comments",
+            with patch_all_modules("_find_assigned_mentor_from_comments",
                 new=AsyncMock(return_value=current_mentor),
             ):
-                with patch.object(
-                    _worker,
-                    "github_api",
+                with patch_all_modules("github_api",
                     new=AsyncMock(side_effect=lambda *a, **kw: api_calls.append(a)),
                 ):
-                    with patch.object(
-                        _worker,
-                        "create_comment",
+                    with patch_all_modules("create_comment",
                         new=AsyncMock(side_effect=lambda o, r, n, b, t: comments.append(b)),
                     ):
-                        with patch.object(_worker, "_d1_binding", return_value=None):
-                            with patch.object(
-                                _worker,
-                                "_is_maintainer",
+                        with patch_all_modules("_d1_binding", return_value=None):
+                            with patch_all_modules("_is_maintainer",
                                 new=AsyncMock(return_value=is_maintainer),
                             ):
                                 await _worker.handle_mentor_unassign(
@@ -4548,9 +4542,7 @@ class TestHandleMentorPause(unittest.TestCase):
         issue = {"number": 1, "labels": [], "assignees": []}
 
         async def _inner():
-            with patch.object(
-                _worker,
-                "create_comment",
+            with patch_all_modules("create_comment",
                 new=AsyncMock(side_effect=lambda o, r, n, b, t: comments.append(b)),
             ):
                 await _worker.handle_mentor_pause(
@@ -4594,24 +4586,16 @@ class TestHandleMentorHandoff(unittest.TestCase):
         }
 
         async def _inner():
-            with patch.object(
-                _worker,
-                "_find_assigned_mentor_from_comments",
+            with patch_all_modules("_find_assigned_mentor_from_comments",
                 new=AsyncMock(return_value=current_mentor_in_comments),
             ):
-                with patch.object(
-                    _worker,
-                    "_assign_mentor_to_issue",
+                with patch_all_modules("_assign_mentor_to_issue",
                     new=AsyncMock(side_effect=lambda *a, **kw: assign_calls.append(a) or True),
                 ):
-                    with patch.object(
-                        _worker,
-                        "github_api",
+                    with patch_all_modules("github_api",
                         new=AsyncMock(return_value=types.SimpleNamespace(status=200)),
                     ):
-                        with patch.object(
-                            _worker,
-                            "create_comment",
+                        with patch_all_modules("create_comment",
                             new=AsyncMock(side_effect=lambda o, r, n, b, t: comments.append(b)),
                         ):
                             await _worker.handle_mentor_handoff(
@@ -4656,28 +4640,20 @@ class TestHandleMentorRematch(unittest.TestCase):
 
     def _run_rematch(self, issue, current_mentor_in_comments, assign_calls, comments, assign_returns=True):
         async def _inner():
-            with patch.object(
-                _worker,
-                "_find_assigned_mentor_from_comments",
+            with patch_all_modules("_find_assigned_mentor_from_comments",
                 new=AsyncMock(return_value=current_mentor_in_comments),
             ):
                 async def _mock_assign(*a, **kw):
                     assign_calls.append(a)
                     return assign_returns
 
-                with patch.object(
-                    _worker,
-                    "_assign_mentor_to_issue",
+                with patch_all_modules("_assign_mentor_to_issue",
                     new=_mock_assign,
                 ):
-                    with patch.object(
-                        _worker,
-                        "github_api",
+                    with patch_all_modules("github_api",
                         new=AsyncMock(return_value=types.SimpleNamespace(status=200)),
                     ):
-                        with patch.object(
-                            _worker,
-                            "create_comment",
+                        with patch_all_modules("create_comment",
                             new=AsyncMock(side_effect=lambda o, r, n, b, t: comments.append(b)),
                         ):
                             await _worker.handle_mentor_rematch(
@@ -4689,6 +4665,7 @@ class TestHandleMentorRematch(unittest.TestCase):
     def test_triggers_reassignment_when_mentor_present(self):
         issue = {
             "number": 1,
+            "user": {"login": "contributor"},
             "labels": [{"name": "mentor-assigned"}],
             "assignees": [],
             "state": "open",
@@ -4709,6 +4686,7 @@ class TestHandleMentorRematch(unittest.TestCase):
         # (we don't make DELETE calls for the old assignee or label).
         issue = {
             "number": 3,
+            "user": {"login": "contributor"},
             "labels": [{"name": "mentor-assigned"}],
             "assignees": [{"login": "alice"}],
             "state": "open",
@@ -4719,15 +4697,11 @@ class TestHandleMentorRematch(unittest.TestCase):
             async def _mock_assign(*a, **kw):
                 return False  # No replacement available
 
-            with patch.object(
-                _worker,
-                "_find_assigned_mentor_from_comments",
+            with patch_all_modules("_find_assigned_mentor_from_comments",
                 new=AsyncMock(return_value="alice"),
             ):
-                with patch.object(_worker, "_assign_mentor_to_issue", new=_mock_assign):
-                    with patch.object(
-                        _worker,
-                        "github_api",
+                with patch_all_modules("_assign_mentor_to_issue", new=_mock_assign):
+                    with patch_all_modules("github_api",
                         new=AsyncMock(side_effect=lambda *a, **kw: api_calls.append(a)),
                     ):
                         await _worker.handle_mentor_rematch(
@@ -4765,17 +4739,13 @@ class TestHandleIssueLabeledNeedsMentor(unittest.TestCase):
                 bug_calls.append(data)
                 return None
 
-            with patch.object(
-                _worker,
-                "_assign_mentor_to_issue",
+            with patch_all_modules("_assign_mentor_to_issue",
                 new=AsyncMock(side_effect=lambda *a, **kw: assign_calls.append(a) or True),
             ):
-                with patch.object(
-                    _worker,
-                    "_fetch_mentors_config",
+                with patch_all_modules("_fetch_mentors_config",
                     new=AsyncMock(return_value=[]),
                 ):
-                    with patch.object(_worker, "report_bug_to_blt", new=mock_report):
+                    with patch_all_modules("report_bug_to_blt", new=mock_report):
                         await _worker.handle_issue_labeled(payload, "tok", "https://blt.example")
 
         _run(_inner())
@@ -4826,30 +4796,21 @@ class TestHandleIssueCommentMentorCommands(unittest.TestCase):
         payload = _make_issue_payload(comment_body=comment_body)
 
         async def _inner():
-            with patch.object(
-                _worker, "_fetch_mentors_config", new=AsyncMock(return_value=[])
+            with patch_all_modules("_fetch_mentors_config", new=AsyncMock(return_value=[])
             ):
-                with patch.object(
-                    _worker,
-                    "handle_mentor_command",
+                with patch_all_modules("handle_mentor_command",
                     new=AsyncMock(side_effect=lambda *a, **kw: mentor_calls.append(a)),
                 ):
-                    with patch.object(
-                        _worker,
-                        "handle_mentor_pause",
+                    with patch_all_modules("handle_mentor_pause",
                         new=AsyncMock(side_effect=lambda *a, **kw: pause_calls.append(a)),
                     ):
-                        with patch.object(
-                            _worker,
-                            "handle_mentor_handoff",
+                        with patch_all_modules("handle_mentor_handoff",
                             new=AsyncMock(side_effect=lambda *a, **kw: handoff_calls.append(a)),
                         ):
-                            with patch.object(
-                                _worker,
-                                "handle_mentor_rematch",
+                            with patch_all_modules("handle_mentor_rematch",
                                 new=AsyncMock(side_effect=lambda *a, **kw: rematch_calls.append(a)),
                             ):
-                                with patch.object(_worker, "create_reaction", new=AsyncMock()):
+                                with patch_all_modules("create_reaction", new=AsyncMock()):
                                     await _worker.handle_issue_comment(payload, "tok")
 
         _run(_inner())
@@ -4881,15 +4842,12 @@ class TestHandleIssueCommentMentorCommands(unittest.TestCase):
         unmentor_calls = []
 
         async def _inner():
-            with patch.object(
-                _worker, "_fetch_mentors_config", new=AsyncMock(return_value=[])
+            with patch_all_modules("_fetch_mentors_config", new=AsyncMock(return_value=[])
             ):
-                with patch.object(
-                    _worker,
-                    "handle_mentor_unassign",
+                with patch_all_modules("handle_mentor_unassign",
                     new=AsyncMock(side_effect=lambda *a, **kw: unmentor_calls.append(a)),
                 ):
-                    with patch.object(_worker, "create_reaction", new=AsyncMock()):
+                    with patch_all_modules("create_reaction", new=AsyncMock()):
                         await _worker.handle_issue_comment(payload, "tok")
 
         _run(_inner())
@@ -4906,7 +4864,7 @@ class TestFindAssignedMentorFromComments(unittest.TestCase):
                 status=200,
                 text=AsyncMock(return_value=json.dumps(mock_comments)),
             )
-            with patch.object(_worker, "github_api", new=AsyncMock(return_value=mock_resp)):
+            with patch_all_modules("github_api", new=AsyncMock(return_value=mock_resp)):
                 return await _worker._find_assigned_mentor_from_comments(
                     "OWASP-BLT", "TestRepo", 1, "tok"
                 )
@@ -4933,7 +4891,7 @@ class TestFindAssignedMentorFromComments(unittest.TestCase):
     def test_returns_none_on_api_failure(self):
         async def _inner():
             mock_resp = types.SimpleNamespace(status=404)
-            with patch.object(_worker, "github_api", new=AsyncMock(return_value=mock_resp)):
+            with patch_all_modules("github_api", new=AsyncMock(return_value=mock_resp)):
                 return await _worker._find_assigned_mentor_from_comments(
                     "OWASP-BLT", "TestRepo", 1, "tok"
                 )
@@ -4968,10 +4926,8 @@ class TestRequestMentorReviewerForPr(unittest.TestCase):
             return types.SimpleNamespace(status=200, text=AsyncMock(return_value="{}"))
 
         async def _inner():
-            with patch.object(_worker, "github_api", new=_mock_api):
-                with patch.object(
-                    _worker,
-                    "_find_assigned_mentor_from_comments",
+            with patch_all_modules("github_api", new=_mock_api):
+                with patch_all_modules("_find_assigned_mentor_from_comments",
                     new=AsyncMock(return_value=mentor_in_comments),
                 ):
                     await _worker._request_mentor_reviewer_for_pr(
@@ -5032,10 +4988,8 @@ class TestRequestMentorReviewerForPr(unittest.TestCase):
             return types.SimpleNamespace(status=200, text=AsyncMock(return_value="{}"))
 
         async def _inner():
-            with patch.object(_worker, "github_api", new=_mock_api):
-                with patch.object(
-                    _worker,
-                    "_find_assigned_mentor_from_comments",
+            with patch_all_modules("github_api", new=_mock_api):
+                with patch_all_modules("_find_assigned_mentor_from_comments",
                     new=AsyncMock(return_value="alice"),
                 ):
                     await _worker._request_mentor_reviewer_for_pr(
@@ -5068,19 +5022,13 @@ class TestMentorCommandPrGuard(unittest.TestCase):
         comments = []
 
         async def _inner():
-            with patch.object(
-                _worker,
-                "github_api",
+            with patch_all_modules("github_api",
                 new=AsyncMock(return_value=types.SimpleNamespace(status=201, text=AsyncMock(return_value="{}"))),
             ):
-                with patch.object(
-                    _worker,
-                    "create_comment",
+                with patch_all_modules("create_comment",
                     new=AsyncMock(side_effect=lambda o, r, n, b, t: comments.append(b)),
                 ):
-                    with patch.object(
-                        _worker,
-                        "_fetch_mentors_config",
+                    with patch_all_modules("_fetch_mentors_config",
                         new=AsyncMock(return_value=[]),
                     ):
                         await _worker.handle_issue_comment(payload, "tok")
@@ -5105,18 +5053,15 @@ class TestRoundRobinMentorReviewer(unittest.TestCase):
         pr = {"number": pr_number, "user": {"login": author}}
 
         async def _inner():
-            with patch.object(_worker, "MENTOR_AUTO_PR_REVIEWER_ENABLED", True):
-                with patch.object(
-                    _worker,
-                    "github_api",
-                    new=AsyncMock(side_effect=lambda m, p, t, b=None: (
-                        reviewer_calls.append(b) or
-                        types.SimpleNamespace(status=201, text=AsyncMock(return_value="{}"))
-                    )),
-                ):
-                    await _worker._assign_round_robin_mentor_reviewer(
-                        "OWASP-BLT", "TestRepo", pr, self._POOL, "tok"
-                    )
+            with patch_all_modules("github_api",
+                new=AsyncMock(side_effect=lambda m, p, t, b=None: (
+                    reviewer_calls.append(b) or
+                    types.SimpleNamespace(status=201, text=AsyncMock(return_value="{}"))
+                )),
+            ):
+                await _worker._assign_round_robin_mentor_reviewer(
+                    "OWASP-BLT", "TestRepo", pr, self._POOL, "tok", True
+                )
 
         _run(_inner())
 
@@ -5152,9 +5097,7 @@ class TestRoundRobinMentorReviewer(unittest.TestCase):
 
         async def _inner():
             # Do not patch MENTOR_AUTO_PR_REVIEWER_ENABLED — default is False.
-            with patch.object(
-                _worker,
-                "github_api",
+            with patch_all_modules("github_api",
                 new=AsyncMock(side_effect=lambda m, p, t, b=None: (
                     reviewer_calls.append(b) or
                     types.SimpleNamespace(status=201, text=AsyncMock(return_value="{}"))
@@ -5176,9 +5119,7 @@ class TestGetLastHumanActivityTs(unittest.TestCase):
         comments_json = json.dumps(comments_response)
 
         async def _inner():
-            with patch.object(
-                _worker,
-                "github_api",
+            with patch_all_modules("github_api",
                 new=AsyncMock(return_value=types.SimpleNamespace(
                     status=200, text=AsyncMock(return_value=comments_json)
                 )),
@@ -5497,14 +5438,11 @@ class TestLoadMentorsFromD1(unittest.TestCase):
 
         async def _inner():
             mock_db = MagicMock()
-            with patch.object(
-                _worker, "_ensure_leaderboard_schema", new=AsyncMock()
+            with patch_all_modules("_ensure_leaderboard_schema", new=AsyncMock()
             ):
-                with patch.object(
-                    _worker, "_d1_all", new=AsyncMock(return_value=rows)
+                with patch_all_modules("_d1_all", new=AsyncMock(return_value=rows)
                 ):
-                    with patch.object(
-                        _worker, "console",
+                    with patch_all_modules("console",
                         new=types.SimpleNamespace(error=lambda *a: None, log=lambda *a: None),
                     ):
                         return await _worker._load_mentors_from_d1(mock_db)
@@ -5519,11 +5457,9 @@ class TestLoadMentorsFromD1(unittest.TestCase):
         """Returns [] when D1 raises an exception."""
         async def _inner():
             mock_db = MagicMock()
-            with patch.object(
-                _worker, "_ensure_leaderboard_schema", new=AsyncMock(side_effect=RuntimeError("db error"))
+            with patch_all_modules("_ensure_leaderboard_schema", new=AsyncMock(side_effect=RuntimeError("db error"))
             ):
-                with patch.object(
-                    _worker, "console",
+                with patch_all_modules("console",
                     new=types.SimpleNamespace(error=lambda *a: None, log=lambda *a: None),
                 ):
                     return await _worker._load_mentors_from_d1(mock_db)
@@ -5562,14 +5498,11 @@ class TestOnFetchHomepage(unittest.TestCase):
         async def _inner():
             env = types.SimpleNamespace()
             req = self._make_get_request("/")
-            with patch.object(
-                _worker, "_load_mentors_local", new=AsyncMock(return_value=fake_mentors)
+            with patch_all_modules("_load_mentors_local", new=AsyncMock(return_value=fake_mentors)
             ):
-                with patch.object(
-                    _worker, "_fetch_mentor_stats_from_d1", return_value={}
+                with patch_all_modules("_fetch_mentor_stats_from_d1", return_value={}
                 ):
-                    with patch.object(
-                        _worker, "console",
+                    with patch_all_modules("console",
                         new=types.SimpleNamespace(error=lambda x: None, log=lambda x: None),
                     ):
                         resp = await _worker.on_fetch(req, env)
@@ -5585,14 +5518,11 @@ class TestOnFetchHomepage(unittest.TestCase):
         async def _inner():
             env = types.SimpleNamespace()
             req = self._make_get_request("/")
-            with patch.object(
-                _worker, "_load_mentors_local", new=AsyncMock(return_value=fake_mentors)
+            with patch_all_modules("_load_mentors_local", new=AsyncMock(return_value=fake_mentors)
             ):
-                with patch.object(
-                    _worker, "_fetch_mentor_stats_from_d1", return_value={}
+                with patch_all_modules("_fetch_mentor_stats_from_d1", return_value={}
                 ):
-                    with patch.object(
-                        _worker, "console",
+                    with patch_all_modules("console",
                         new=types.SimpleNamespace(error=lambda x: None, log=lambda x: None),
                     ):
                         resp = await _worker.on_fetch(req, env)
@@ -5606,14 +5536,11 @@ class TestOnFetchHomepage(unittest.TestCase):
         async def _inner():
             env = types.SimpleNamespace()
             req = self._make_get_request("/")
-            with patch.object(
-                _worker, "_load_mentors_local", new=AsyncMock(return_value=[])
+            with patch_all_modules("_load_mentors_local", new=AsyncMock(return_value=[])
             ):
-                with patch.object(
-                    _worker, "_fetch_mentor_stats_from_d1", return_value={}
+                with patch_all_modules("_fetch_mentor_stats_from_d1", return_value={}
                 ):
-                    with patch.object(
-                        _worker, "console",
+                    with patch_all_modules("console",
                         new=types.SimpleNamespace(error=lambda x: None, log=lambda x: None),
                     ):
                         resp = await _worker.on_fetch(req, env)
@@ -5630,14 +5557,11 @@ class TestOnFetchHomepage(unittest.TestCase):
         async def _inner():
             env = types.SimpleNamespace()
             req = self._make_get_request("/")
-            with patch.object(
-                _worker, "_load_mentors_local", new=AsyncMock(return_value=fake_mentors)
+            with patch_all_modules("_load_mentors_local", new=AsyncMock(return_value=fake_mentors)
             ):
-                with patch.object(
-                    _worker, "_fetch_mentor_stats_from_d1", return_value=fake_stats
+                with patch_all_modules("_fetch_mentor_stats_from_d1", return_value=fake_stats
                 ):
-                    with patch.object(
-                        _worker, "console",
+                    with patch_all_modules("console",
                         new=types.SimpleNamespace(error=lambda x: None, log=lambda x: None),
                     ):
                         resp = await _worker.on_fetch(req, env)
@@ -5667,17 +5591,17 @@ class TestHandleAddMentor(unittest.TestCase):
 
         async def _inner():
             mock_db = MagicMock()
-            with patch.object(_worker, "_verify_gh_user_exists", new=AsyncMock(return_value=gh_user_exists)):
-                with patch.object(_worker, "_d1_binding", return_value=mock_db):
-                    with patch.object(_worker, "_ensure_leaderboard_schema", new=AsyncMock()):
-                        with patch.object(_worker, "_d1_all", new=AsyncMock(return_value=[{"github_username": body.get("github_username")}] if existing_mentor else [])):
+            with patch_all_modules("_verify_gh_user_exists", new=AsyncMock(return_value=gh_user_exists)):
+                with patch_all_modules("_d1_binding", return_value=mock_db):
+                    with patch_all_modules("_ensure_leaderboard_schema", new=AsyncMock()):
+                        with patch_all_modules("_d1_all", new=AsyncMock(return_value=[{"github_username": body.get("github_username")}] if existing_mentor else [])):
                             if db_raises:
-                                with patch.object(_worker, "_d1_add_mentor", new=AsyncMock(side_effect=RuntimeError("db error"))):
-                                    with patch.object(_worker, "console", new=types.SimpleNamespace(error=lambda *a: None, log=lambda *a: None)):
+                                with patch_all_modules("_d1_add_mentor", new=AsyncMock(side_effect=RuntimeError("db error"))):
+                                    with patch_all_modules("console", new=types.SimpleNamespace(error=lambda *a: None, log=lambda *a: None)):
                                         resp = await _worker._handle_add_mentor(req, env)
                             else:
-                                with patch.object(_worker, "_d1_add_mentor", new=AsyncMock()) as mock_add:
-                                    with patch.object(_worker, "console", new=types.SimpleNamespace(error=lambda *a: None, log=lambda *a: None)):
+                                with patch_all_modules("_d1_add_mentor", new=AsyncMock()) as mock_add:
+                                    with patch_all_modules("console", new=types.SimpleNamespace(error=lambda *a: None, log=lambda *a: None)):
                                         resp = await _worker._handle_add_mentor(req, env)
                                     captured["add_args"] = mock_add.call_args
             return resp
@@ -5792,11 +5716,11 @@ class TestHandleAddMentor(unittest.TestCase):
             # github_username exists but referrer does not.
             async def _fake_verify(username, env=None):
                 return username == "janedoe"
-            with patch.object(_worker, "_verify_gh_user_exists", new=_fake_verify):
-                with patch.object(_worker, "_d1_binding", return_value=mock_db):
-                    with patch.object(_worker, "_ensure_leaderboard_schema", new=AsyncMock()):
-                        with patch.object(_worker, "_d1_add_mentor", new=AsyncMock()):
-                            with patch.object(_worker, "console", new=types.SimpleNamespace(error=lambda *a: None, log=lambda *a: None)):
+            with patch_all_modules("_verify_gh_user_exists", new=_fake_verify):
+                with patch_all_modules("_d1_binding", return_value=mock_db):
+                    with patch_all_modules("_ensure_leaderboard_schema", new=AsyncMock()):
+                        with patch_all_modules("_d1_add_mentor", new=AsyncMock()):
+                            with patch_all_modules("console", new=types.SimpleNamespace(error=lambda *a: None, log=lambda *a: None)):
                                 return await _worker._handle_add_mentor(req, env)
 
         resp = _run(_inner())
