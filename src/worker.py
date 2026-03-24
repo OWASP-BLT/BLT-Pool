@@ -6151,12 +6151,14 @@ async def _check_stale_assignments(owner: str, repo: str, token: str):
                         if event_timestamp:
                             assignment_time = event_timestamp
                 
-                # Check for cross-referenced PRs
+                # Check for cross-referenced open PRs only.
+                # Closed or merged PRs should not prevent auto-unassignment.
                 if event_type == "cross-referenced":
                     source = event.get("source", {})
-                    if source.get("type") == "issue" and "pull_request" in source.get("issue", {}):
-                        has_linked_pr = True
-                        break
+                    if source.get("type") == "issue":
+                        source_issue = source.get("issue", {})
+                        if "pull_request" in source_issue and source_issue.get("state") == "open":
+                            has_linked_pr = True
             
             # If no assignment time found in timeline, use updated_at as fallback
             if assignment_time is None:

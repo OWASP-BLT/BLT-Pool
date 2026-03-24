@@ -10,13 +10,16 @@ These tests cover the logic that does NOT require the Cloudflare runtime
 import asyncio
 import base64
 import builtins
+import datetime
 import hashlib
 import hmac as _hmac
 import importlib
 import json
 import os
+import re
 import sys
 import tempfile
+import time
 import types
 import unittest
 import urllib.parse
@@ -6023,6 +6026,130 @@ class TestTimeAgo(unittest.TestCase):
     def test_years(self):
         result = self._ago(86400 * 400)
         self.assertIn("year", result)
+
+
+class TestCheckStaleAssignments(unittest.TestCase):
+    """_check_stale_assignments — verifies auto-unassign after 8h with no open PR."""
+
+    def _make_issue(self, number=42, assignees=None):
+        if assignees is None:
+            assignees = [{"login": "alice"}]
+        return {
+            "number": number,
+            "assignees": assignees,
+            "updated_at": "2020-01-01T00:00:00Z",
+        }
+
+    def _make_assigned_event(self, hours_ago=10):
+        ts = time.time() - hours_ago * 3600
+        dt = datetime.datetime.utcfromtimestamp(ts)
+        return {
+            "event": "assigned",
+            "created_at": dt.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        }
+
+    def _make_xref_event(self, pr_state="open"):
+        return {
+            "event": "cross-referenced",
+            "source": {
+                "type": "issue",
+                "issue": {
+                    "state": pr_state,
+                    "pull_request": {"url": "https://api.github.com/repos/o/r/pulls/9"},
+                    "user": {"login": "alice"},
+                },
+            },
+        }
+
+    def _run(self, issues, timelines):
+        """Execute _check_stale_assignments with mocked GitHub API responses."""
+        deleted_assignees = []
+        posted_comments = []
+
+        async def _inner():
+            issues_page = [list(issues), []]
+            timeline_map = dict(timelines)
+
+            async def fake_github_api(method, path, token, body=None):
+                resp = MagicMock()
+                if method == "GET" and "/issues" in path and "/timeline" not in path:
+                    page_issues = issues_page.pop(0) if issues_page else []
+                    resp.status = 200
+                    resp.text = AsyncMock(return_value=json.dumps(page_issues))
+                elif method == "GET" and "/timeline" in path:
+                    m = re.search(r"/issues/(\d+)/timeline", path)
+                    num = int(m.group(1)) if m else 0
+                    resp.status = 200
+                    resp.text = AsyncMock(return_value=json.dumps(timeline_map.get(num, [])))
+                elif method == "DELETE" and "/assignees" in path:
+                    deleted_assignees.extend(body.get("assignees", []))
+                    resp.status = 200
+                    resp.text = AsyncMock(return_value="{}")
+                else:
+                    resp.status = 200
+                    resp.text = AsyncMock(return_value="[]")
+                return resp
+
+            async def fake_create_comment(owner, repo, num, body, token):
+                posted_comments.append(body)
+
+            with patch.object(_worker, "github_api", new=fake_github_api):
+                with patch.object(_worker, "create_comment", new=fake_create_comment):
+                    await _worker._check_stale_assignments("OWASP-BLT", "TestRepo", "tok")
+
+        asyncio.run(_inner())
+        return deleted_assignees, posted_comments
+
+    def test_unassigns_when_no_pr_after_deadline(self):
+        """Issue with no linked PR and assignment > 8h ago should be unassigned."""
+        issue = self._make_issue()
+        timeline = {42: [self._make_assigned_event(hours_ago=10)]}
+        deleted, comments = self._run([issue], timeline)
+        self.assertIn("alice", deleted)
+        self.assertTrue(any("automatically unassigned" in c for c in comments))
+
+    def test_does_not_unassign_when_open_pr_exists(self):
+        """Issue with an OPEN linked PR should not be unassigned."""
+        issue = self._make_issue()
+        timeline = {42: [
+            self._make_assigned_event(hours_ago=10),
+            self._make_xref_event(pr_state="open"),
+        ]}
+        deleted, comments = self._run([issue], timeline)
+        self.assertNotIn("alice", deleted)
+        self.assertEqual(comments, [])
+
+    def test_unassigns_when_only_closed_pr_exists(self):
+        """Issue with only a CLOSED linked PR should still be unassigned."""
+        issue = self._make_issue()
+        timeline = {42: [
+            self._make_assigned_event(hours_ago=10),
+            self._make_xref_event(pr_state="closed"),
+        ]}
+        deleted, comments = self._run([issue], timeline)
+        self.assertIn("alice", deleted)
+        self.assertTrue(any("automatically unassigned" in c for c in comments))
+
+    def test_does_not_unassign_within_deadline(self):
+        """Issue assigned only 4h ago (within 8h deadline) should not be unassigned."""
+        issue = self._make_issue()
+        timeline = {42: [self._make_assigned_event(hours_ago=4)]}
+        deleted, comments = self._run([issue], timeline)
+        self.assertNotIn("alice", deleted)
+        self.assertEqual(comments, [])
+
+    def test_tracks_most_recent_assignment_after_pr_event(self):
+        """A reassignment that occurs after a closed-PR event should reset the clock."""
+        issue = self._make_issue()
+        timeline = {42: [
+            self._make_assigned_event(hours_ago=20),  # old assignment
+            self._make_xref_event(pr_state="closed"),  # closed PR (should not block)
+            self._make_assigned_event(hours_ago=4),   # recent reassignment (within deadline)
+        ]}
+        deleted, comments = self._run([issue], timeline)
+        # The recent assignment is within the 8h deadline, so should NOT be unassigned
+        self.assertNotIn("alice", deleted)
+        self.assertEqual(comments, [])
 
 
 if __name__ == "__main__":
