@@ -43,6 +43,16 @@ def _default_error_summary(name: str, error_message: str, attempts: int) -> dict
     }
 
 
+def _sanitize_error_message(message: str, *, max_len: int = 160) -> str:
+    """Sanitize exception text before exposing it in checks output or logs."""
+    cleaned = " ".join((message or "").split())
+    if not cleaned:
+        return "internal error"
+    if len(cleaned) > max_len:
+        return f"{cleaned[:max_len]}..."
+    return cleaned
+
+
 async def run_tool_with_retries(
     *,
     name: str,
@@ -79,7 +89,7 @@ async def run_tool_with_retries(
                 output=output,
                 conclusion="success",
             )
-        except TimeoutError:
+        except (TimeoutError, asyncio.TimeoutError):
             logger.warning(
                 "tool-runner: timeout name=%s attempt=%s/%s timeout=%ss",
                 name,
@@ -100,20 +110,20 @@ async def run_tool_with_retries(
                 output=_default_timeout_summary(name, timeout_seconds, attempt),
                 conclusion="neutral",
             )
-        except Exception as exc:  # pragma: no cover - validated via tests
+        except Exception as exc:
+            err = _sanitize_error_message(str(exc) or exc.__class__.__name__)
             logger.error(
                 "tool-runner: error name=%s attempt=%s/%s error_type=%s error=%s",
                 name,
                 attempt,
                 attempts_allowed,
                 exc.__class__.__name__,
-                exc,
+                err,
             )
             if attempt < attempts_allowed:
                 if retry_delay_seconds:
                     await asyncio.sleep(retry_delay_seconds)
                 continue
-            err = str(exc) or exc.__class__.__name__
             return ToolRunResult(
                 name=name,
                 status="error",

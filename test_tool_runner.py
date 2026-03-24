@@ -31,14 +31,14 @@ def test_run_tool_with_retries_success_first_attempt():
 
 def test_run_tool_with_retries_timeout_neutral_fallback():
     async def runner():
-        await asyncio.sleep(0.1)
+        await asyncio.sleep(0.2)
         return {"title": "late", "summary": "too late"}
 
     result = _run(
         run_tool_with_retries(
             name="Semgrep",
             runner=runner,
-            timeout_seconds=0.02,
+            timeout_seconds=0.05,
             max_retries=1,
         )
     )
@@ -48,6 +48,29 @@ def test_run_tool_with_retries_timeout_neutral_fallback():
     assert result.attempt_count == 2
     assert result.conclusion == "neutral"
     assert "exceeded timeout" in result.output["summary"].lower()
+
+
+def test_run_tool_with_retries_timeout_then_success():
+    state = {"count": 0}
+
+    async def runner():
+        state["count"] += 1
+        if state["count"] == 1:
+            await asyncio.sleep(0.2)
+        return {"title": "ok", "summary": "recovered"}
+
+    result = _run(
+        run_tool_with_retries(
+            name="Bandit",
+            runner=runner,
+            timeout_seconds=0.05,
+            max_retries=1,
+        )
+    )
+
+    assert result.status == "success"
+    assert result.attempt_count == 2
+    assert result.conclusion == "success"
 
 
 def test_run_tool_with_retries_exception_then_success():
