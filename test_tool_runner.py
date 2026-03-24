@@ -141,6 +141,7 @@ def test_run_tool_with_retries_redacts_sensitive_exception_text():
         raise RuntimeError(
             "token=ghp_abcdefghijklmnopqrstuvwxyz123456 "
             "path=C:\\Users\\alice\\secrets.txt "
+            "home=~/private/key.txt "
             "email=alice@example.com "
             "hash=abcdefabcdefabcdefabcdefabcdefab"
         )
@@ -160,6 +161,7 @@ def test_run_tool_with_retries_redacts_sensitive_exception_text():
     assert "[REDACTED_PATH]" in result.error
     assert "alice@example.com" not in result.error
     assert "C:\\Users\\alice\\secrets.txt" not in result.error
+    assert "~/private/key.txt" not in result.error
     assert "ghp_abcdefghijklmnopqrstuvwxyz123456" not in result.error
 
 

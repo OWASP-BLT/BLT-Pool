@@ -52,7 +52,7 @@ def _sanitize_error_message(message: str, *, max_len: int = 160) -> str:
         # Windows absolute paths (e.g. C:\Users\name\file.txt)
         (re.compile(r"\b[A-Za-z]:\\[^\s]+"), "[REDACTED_PATH]"),
         # Unix-style absolute and home-relative paths
-        (re.compile(r"\b~\/[^\s]+"), "[REDACTED_PATH]"),
+        (re.compile(r"~\/[^\s]+"), "[REDACTED_PATH]"),
         (
             re.compile(r"\/(?:home|Users|var|etc|tmp|opt|srv|mnt|private|root)\/[^\s]+"),
             "[REDACTED_PATH]",
