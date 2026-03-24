@@ -2952,9 +2952,9 @@ async def _assign_mentor_to_issue(
     mentor_username = mentor["github_username"]
 
     # Ensure labels exist in the repo before applying them.
-    await _ensure_label_exists(owner, repo, NEEDS_MENTOR_LABEL, MENTOR_LABEL_COLOR, token)
-    await _ensure_label_exists(
-        owner, repo, MENTOR_ASSIGNED_LABEL, MENTOR_ASSIGNED_LABEL_COLOR, token
+    await ensure_label_exists(owner, repo, NEEDS_MENTOR_LABEL, MENTOR_LABEL_COLOR, "", token)
+    await ensure_label_exists(
+        owner, repo, MENTOR_ASSIGNED_LABEL, MENTOR_ASSIGNED_LABEL_COLOR, "", token
     )
 
     # Apply mentor-assigned label.
@@ -3544,7 +3544,7 @@ async def _assign(
             f'"{HELP_WANTED_LABEL}" label before `/assign` can be used.',
             token,
         )
-        await _ensure_label_exists(owner, repo, NEEDS_APPROVAL_LABEL, NEEDS_APPROVAL_LABEL_COLOR, token)
+        await ensure_label_exists(owner, repo, NEEDS_APPROVAL_LABEL, NEEDS_APPROVAL_LABEL_COLOR, "", token)
         await github_api(
             "POST",
             f"/repos/{owner}/{repo}/issues/{num}/labels",
@@ -4478,7 +4478,7 @@ async def label_pending_checks(
     if pending_count > 0:
         noun = "check" if pending_count == 1 else "checks"
         label = f"{pending_count} {noun} pending"
-        await _ensure_label_exists(owner, repo, label, "e4c84b", token)
+        await ensure_label_exists(owner, repo, label, "e4c84b", "", token)
         await github_api(
             "POST",
             f"/repos/{owner}/{repo}/issues/{pr_number}/labels",

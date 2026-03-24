@@ -365,14 +365,14 @@ class TestHandleAssign(unittest.TestCase):
         payload = _make_issue_payload(labels=[])
         comments, calls = [], []
         mock_ensure = AsyncMock()
-        with patch.object(_worker, "_ensure_label_exists", new=mock_ensure):
+        with patch.object(_worker, "ensure_label_exists", new=mock_ensure):
             self._run_assign(payload, comments, calls)
         # Comment must mention the requester, @donnieblt, and the "help wanted" label
         self.assertTrue(any("@alice" in c and "@donnieblt" in c and "help wanted" in c for c in comments))
-        # _ensure_label_exists must be called for the "needs-approval" label
+        # ensure_label_exists must be called for the "needs-approval" label
         mock_ensure.assert_called_once_with(
             "OWASP-BLT", "TestRepo",
-            _worker.NEEDS_APPROVAL_LABEL, _worker.NEEDS_APPROVAL_LABEL_COLOR, "tok",
+            _worker.NEEDS_APPROVAL_LABEL, _worker.NEEDS_APPROVAL_LABEL_COLOR, "", "tok",
         )
         # The "needs-approval" label must be added to the issue via POST
         self.assertTrue(any(
@@ -922,7 +922,7 @@ class TestHandlePullRequestReview(unittest.TestCase):
         ensure_calls = []
         self._run_review(payload, (200, reviews), (200, labels), calls, ensure_calls)
         
-        # Should call _ensure_label_exists for changes-requested
+        # Should call ensure_label_exists for changes-requested
         self.assertTrue(any(c[2] == "changes-requested" for c in ensure_calls))
         # POST to add label
         self.assertTrue(any(method == "POST" and "labels" in path and body == {"labels": ["changes-requested"]}
@@ -4627,7 +4627,7 @@ class TestAssignMentorToIssue(unittest.TestCase):
         async def _inner():
             with patch.object(_worker, "_select_mentor", new=AsyncMock(return_value=select_return)):
                 with patch.object(_worker, "_get_mentor_load_map", new=AsyncMock(return_value={})):
-                    with patch.object(_worker, "_ensure_label_exists", new=AsyncMock()):
+                    with patch.object(_worker, "ensure_label_exists", new=AsyncMock()):
                         with patch.object(
                             _worker,
                             "github_api",
