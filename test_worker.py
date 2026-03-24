@@ -3892,6 +3892,65 @@ class TestCheckUnresolvedConversations(unittest.TestCase):
         self.assertEqual(len(comment_creates), 0, "No comment should be posted when there are no threads")
 
 
+class TestCheckUnresolvedConversationsDispatch(unittest.TestCase):
+    """Verify that check_unresolved_conversations is called on PR synchronize and reopened events."""
+
+    def _make_pr_payload_with_action(self, action):
+        payload = _make_pr_payload(owner="acme", repo="widgets", number=7)
+        payload["action"] = action
+        payload["installation"] = {"id": "inst-1"}
+        return payload
+
+    def _run_dispatch(self, action):
+        """Dispatch a pull_request event with the given action and return whether
+        check_unresolved_conversations was called."""
+        payload = self._make_pr_payload_with_action(action)
+        body = json.dumps(payload)
+        secret = "test-secret"
+        sig = "sha256=" + _hmac.new(secret.encode(), body.encode(), hashlib.sha256).hexdigest()
+
+        req = types.SimpleNamespace(
+            method="POST",
+            url="https://example.com/api/github/webhooks",
+            headers=_HeadersStub({
+                "X-GitHub-Event": "pull_request",
+                "X-GitHub-Delivery": "delivery-1",
+                "X-Hub-Signature-256": sig,
+            }),
+            text=AsyncMock(return_value=body),
+        )
+        env = types.SimpleNamespace(
+            WEBHOOK_SECRET=secret,
+            APP_ID="123",
+            PRIVATE_KEY="pem",
+        )
+
+        called = []
+
+        async def _inner():
+            with patch.object(_worker, "get_installation_token", new=AsyncMock(return_value="tok")):
+                with patch.object(_worker, "check_unresolved_conversations", new=AsyncMock(side_effect=lambda *a, **k: called.append(True))):
+                    with patch.object(_worker, "handle_pull_request_for_review", new=AsyncMock()):
+                        with patch.object(_worker, "handle_pull_request_opened", new=AsyncMock()):
+                            with patch.object(_worker, "_track_pr_reopened_in_d1", new=AsyncMock()):
+                                with patch.object(_worker, "should_dispatch_check_orchestrator_event", return_value=False):
+                                    with patch.object(_worker, "console", new=types.SimpleNamespace(error=lambda x: None, log=lambda x: None)):
+                                        await _worker.handle_webhook(req, env)
+
+        _run(_inner())
+        return called
+
+    def test_synchronize_calls_check_unresolved_conversations(self):
+        """PR synchronize should trigger check_unresolved_conversations for the new head SHA."""
+        called = self._run_dispatch("synchronize")
+        self.assertTrue(len(called) >= 1, "check_unresolved_conversations should be called on synchronize")
+
+    def test_reopened_calls_check_unresolved_conversations(self):
+        """PR reopened should trigger check_unresolved_conversations for the new head SHA."""
+        called = self._run_dispatch("reopened")
+        self.assertTrue(len(called) >= 1, "check_unresolved_conversations should be called on reopened")
+
+
 # ---------------------------------------------------------------------------
 # label_pending_checks / handle_workflow_run / handle_check_run tests
 # ---------------------------------------------------------------------------

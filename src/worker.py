@@ -4841,9 +4841,13 @@ async def handle_webhook(request, env) -> Response:
                 await handle_pull_request_for_review(payload, token)
             elif action == "synchronize":
                 await handle_pull_request_for_review(payload, token)
+                # Re-check unresolved conversations for the new head SHA
+                await check_unresolved_conversations(payload, token)
             elif action == "reopened":
                 await _track_pr_reopened_in_d1(payload, env)
                 await handle_pull_request_for_review(payload, token)
+                # Re-check unresolved conversations for the new head SHA
+                await check_unresolved_conversations(payload, token)
             elif action == "closed":
                 await handle_pull_request_closed(payload, token, env)
         elif event == "pull_request_review":
