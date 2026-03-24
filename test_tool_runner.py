@@ -1,13 +1,9 @@
 """Unit tests for src/services/tool_runner.py."""
 
 import asyncio
-import pathlib
-import sys
+import pytest
 
-_SRC_PATH = pathlib.Path(__file__).parent / "src"
-sys.path.insert(0, str(_SRC_PATH))
-
-from services.tool_runner import run_tool_with_retries  # noqa: E402
+from services.tool_runner import run_tool_with_retries
 
 
 def _run(coro):
@@ -35,14 +31,14 @@ def test_run_tool_with_retries_success_first_attempt():
 
 def test_run_tool_with_retries_timeout_neutral_fallback():
     async def runner():
-        await asyncio.sleep(0.05)
+        await asyncio.sleep(0.1)
         return {"title": "late", "summary": "too late"}
 
     result = _run(
         run_tool_with_retries(
             name="Semgrep",
             runner=runner,
-            timeout_seconds=0.001,
+            timeout_seconds=0.02,
             max_retries=1,
         )
     )
@@ -101,14 +97,21 @@ def test_run_tool_with_retries_rejects_invalid_settings():
     async def runner():
         return {"title": "ok", "summary": "ok"}
 
-    import pytest
-
     with pytest.raises(ValueError):
         _run(
             run_tool_with_retries(
                 name="ESLint",
                 runner=runner,
                 timeout_seconds=0,
+            )
+        )
+
+    with pytest.raises(ValueError):
+        _run(
+            run_tool_with_retries(
+                name="ESLint",
+                runner=runner,
+                timeout_seconds=-1,
             )
         )
 

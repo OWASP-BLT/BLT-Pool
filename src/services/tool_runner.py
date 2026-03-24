@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from dataclasses import dataclass
-from typing import Awaitable, Callable, Optional
+from typing import Awaitable, Callable, Literal, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -15,12 +15,12 @@ class ToolRunResult:
     """Represents the outcome of a single tool execution workflow."""
 
     name: str
-    status: str
+    status: Literal["success", "timeout", "error"]
     attempt_count: int
     timed_out: bool
     error: Optional[str]
     output: Optional[dict]
-    conclusion: str
+    conclusion: Literal["success", "neutral"]
 
 
 def _default_timeout_summary(name: str, timeout_seconds: float, attempts: int) -> dict:
@@ -102,10 +102,11 @@ async def run_tool_with_retries(
             )
         except Exception as exc:  # pragma: no cover - validated via tests
             logger.error(
-                "tool-runner: error name=%s attempt=%s/%s error=%s",
+                "tool-runner: error name=%s attempt=%s/%s error_type=%s error=%s",
                 name,
                 attempt,
                 attempts_allowed,
+                exc.__class__.__name__,
                 exc,
             )
             if attempt < attempts_allowed:
