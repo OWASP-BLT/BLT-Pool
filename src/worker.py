@@ -26,7 +26,8 @@ Environment variables / secrets (configure via ``wrangler.toml`` or
     RATE_LIMIT_WINDOW_SECONDS — Rate limit window in seconds (default: 60)
     RATE_LIMIT_ASSIGNMENTS_MAX — Max requests/window for /api/assignments (default: 60)
     RATE_LIMIT_MENTOR_SIGNUP_MAX — Max requests/window for /api/mentors (default: 30)
-    RATE_LIMIT_KV      — KV binding for distributed rate limiting (optional)
+    RATE_LIMIT_DB      — D1 binding for atomic rate limiting (recommended)
+    RATE_LIMIT_KV      — KV binding for rate limiting fallback when D1 is unavailable (optional)
 """
 
 import base64
@@ -72,6 +73,7 @@ TRIAGE_REVIEWER = "donnieblt"
 
 # Best-effort local rate limit store when KV is not configured.
 _LOCAL_RATE_LIMIT = {}
+_RATE_LIMIT_SCHEMA_READY = False
 
 # ---------------------------------------------------------------------------
 # Mentor pool — slash commands and label names
@@ -6080,42 +6082,93 @@ def _get_client_ip(request) -> str:
     return ip or "unknown"
 
 
+async def _ensure_rate_limit_schema(db) -> None:
+    global _RATE_LIMIT_SCHEMA_READY
+    if _RATE_LIMIT_SCHEMA_READY:
+        return
+    await _d1_run(
+        db,
+        """
+        CREATE TABLE IF NOT EXISTS rate_limits (
+            scope TEXT NOT NULL,
+            client TEXT NOT NULL,
+            window_start INTEGER NOT NULL,
+            count INTEGER NOT NULL,
+            reset_at INTEGER NOT NULL,
+            PRIMARY KEY (scope, client, window_start)
+        )
+        """,
+    )
+    _RATE_LIMIT_SCHEMA_READY = True
+
+
 async def _rate_limit_check(request, env, scope: str, max_requests: int, window_seconds: int) -> Tuple[bool, dict]:
     if max_requests <= 0 or window_seconds <= 0:
         return True, {}
     now = int(time.time())
     window_start = now - (now % window_seconds)
     reset = window_start + window_seconds
-    key = f"rate:{scope}:{_get_client_ip(request)}:{window_start}"
+    client = _get_client_ip(request)
 
-    kv = getattr(env, "RATE_LIMIT_KV", None) if env else None
+    def _build_headers(count_value: int, force_block: bool = False) -> dict:
+        remaining = max(0, max_requests - count_value)
+        headers = {
+            "X-RateLimit-Limit": str(max_requests),
+            "X-RateLimit-Remaining": str(remaining),
+            "X-RateLimit-Reset": str(reset),
+        }
+        if force_block or count_value > max_requests:
+            headers["Retry-After"] = str(max(0, reset - now))
+        return headers
+
+    db = getattr(env, "RATE_LIMIT_DB", None) if env else None
     count = 0
-    if kv:
+    if db:
         try:
-            stored = await kv.get(key)
-            count = int(stored) if stored and str(stored).isdigit() else 0
-            count += 1
-            await kv.put(key, str(count), expirationTtl=window_seconds + 1)
+            await _ensure_rate_limit_schema(db)
+            await _d1_run(
+                db,
+                """
+                INSERT INTO rate_limits (scope, client, window_start, count, reset_at)
+                VALUES (?, ?, ?, 1, ?)
+                ON CONFLICT(scope, client, window_start)
+                DO UPDATE SET count = count + 1, reset_at = excluded.reset_at
+                """,
+                (scope, client, window_start, reset),
+            )
+            row = await _d1_first(
+                db,
+                "SELECT count FROM rate_limits WHERE scope = ? AND client = ? AND window_start = ?",
+                (scope, client, window_start),
+            )
+            count = int(row.get("count") or 0) if row else 0
         except Exception as exc:
-            console.error(f"[RateLimit] KV error: {exc}")
-            return True, {}
+            console.error(f"[RateLimit] D1 error: {exc}")
+            return False, _build_headers(max_requests + 1, force_block=True)
     else:
-        # Clean up expired entries opportunistically.
-        expired = [k for k, v in _LOCAL_RATE_LIMIT.items() if v[1] <= now]
-        for k in expired:
-            _LOCAL_RATE_LIMIT.pop(k, None)
-        count, _ = _LOCAL_RATE_LIMIT.get(key, (0, reset))
-        count += 1
-        _LOCAL_RATE_LIMIT[key] = (count, reset)
+        kv = getattr(env, "RATE_LIMIT_KV", None) if env else None
+        if kv:
+            key = f"rate:{scope}:{client}:{window_start}"
+            try:
+                stored = await kv.get(key)
+                count = int(stored) if stored and str(stored).isdigit() else 0
+                count += 1
+                await kv.put(key, str(count), expirationTtl=window_seconds + 1)
+            except Exception as exc:
+                console.error(f"[RateLimit] KV error: {exc}")
+                return False, _build_headers(max_requests + 1, force_block=True)
+        else:
+            # Clean up expired entries opportunistically.
+            expired = [k for k, v in _LOCAL_RATE_LIMIT.items() if v[1] <= now]
+            for k in expired:
+                _LOCAL_RATE_LIMIT.pop(k, None)
+            key = f"rate:{scope}:{client}:{window_start}"
+            count, _ = _LOCAL_RATE_LIMIT.get(key, (0, reset))
+            count += 1
+            _LOCAL_RATE_LIMIT[key] = (count, reset)
 
-    remaining = max(0, max_requests - count)
-    headers = {
-        "X-RateLimit-Limit": str(max_requests),
-        "X-RateLimit-Remaining": str(remaining),
-        "X-RateLimit-Reset": str(reset),
-    }
+    headers = _build_headers(count)
     if count > max_requests:
-        headers["Retry-After"] = str(max(0, reset - now))
         return False, headers
     return True, headers
 
