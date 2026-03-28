@@ -64,6 +64,10 @@ class _ResponseStub:
         self.status = status
         self.headers = headers or _HeadersStub()
 
+    async def text(self):
+        """Return body as text (async to match JS fetch API)."""
+        return self.body
+
     @classmethod
     def new(cls, body="", status=200, headers=None):
         return cls(body, status, headers)
@@ -77,12 +81,16 @@ class _ObjectStub:
 setattr(_ObjectStub, "fromEntries", staticmethod(lambda entries: dict(entries)))
 
 
+async def _default_fetch(url, **kwargs):
+    """Default fetch stub that returns a successful empty response."""
+    return _ResponseStub(body="{}", status=200)
+
 _js_stub.Headers = _HeadersStub
 _js_stub.Response = _ResponseStub
 _js_stub.Array = _ArrayStub
 _js_stub.Object = _ObjectStub
 _js_stub.console = types.SimpleNamespace(error=print, log=print)
-_js_stub.fetch = None  # not used in unit tests
+_js_stub.fetch = _default_fetch  # Default mock for service tests
 
 sys.modules.setdefault("js", _js_stub)
 

@@ -44,6 +44,15 @@ from services.admin import AdminService, has_merged_pr_in_org
 from services.mentor_seed import INITIAL_MENTORS
 from checks_api import build_update_check_run_payloads
 
+# Import new modular services
+from services.database import DatabaseService
+from services.github import GitHubService
+from services.leaderboard import LeaderboardService
+from services.libs import TimeUtils, Validators
+from services.mentor import MentorService
+from services.rendering import RenderingService
+from services.webhooks import WebhookService
+
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
@@ -107,6 +116,26 @@ _RSA_OID_SEQ = bytes([
 ])
 
 # ---------------------------------------------------------------------------
+# Service Initialization
+# ---------------------------------------------------------------------------
+
+# Supported commands for GitHubService
+ALL_COMMANDS = {
+    ASSIGN_COMMAND, UNASSIGN_COMMAND, LEADERBOARD_COMMAND,
+    MENTOR_COMMAND, UNMENTOR_COMMAND, MENTOR_PAUSE_COMMAND,
+    HANDOFF_COMMAND, REMATCH_COMMAND
+}
+
+def _get_services(env=None):
+    """Initialize and return service instances."""
+    github_svc = GitHubService(supported_commands=ALL_COMMANDS)
+    rendering_svc = RenderingService()
+    leaderboard_svc = LeaderboardService(github_svc, rendering_svc)
+    mentor_svc = MentorService(github_svc)
+    webhook_svc = WebhookService(github_svc, leaderboard_svc, mentor_svc, rendering_svc)
+    return github_svc, rendering_svc, leaderboard_svc, mentor_svc, webhook_svc
+
+# ---------------------------------------------------------------------------
 # DER / PEM helpers (needed for PKCS#1 → PKCS#8 conversion)
 # ---------------------------------------------------------------------------
 
@@ -122,23 +151,14 @@ def _der_len(n: int) -> bytes:
 
 def _wrap_pkcs1_as_pkcs8(pkcs1_der: bytes) -> bytes:
     """Wrap a PKCS#1 RSAPrivateKey DER blob into a PKCS#8 PrivateKeyInfo."""
-    version = bytes([0x02, 0x01, 0x00])  # INTEGER 0
-    octet = bytes([0x04]) + _der_len(len(pkcs1_der)) + pkcs1_der
-    content = version + _RSA_OID_SEQ + octet
-    return bytes([0x30]) + _der_len(len(content)) + content
+    github_svc, _, _, _, _ = _get_services()
+    return github_svc.wrap_pkcs1_as_pkcs8(pkcs1_der)
 
 
 def pem_to_pkcs8_der(pem: str) -> bytes:
-    """Convert a PEM private key (PKCS#1 or PKCS#8) to PKCS#8 DER bytes.
-
-    GitHub App private keys are usually PKCS#1 (``BEGIN RSA PRIVATE KEY``).
-    SubtleCrypto's ``importKey`` requires PKCS#8, so we wrap if necessary.
-    """
-    lines = pem.strip().splitlines()
-    is_pkcs1 = lines[0].strip() == "-----BEGIN RSA PRIVATE KEY-----"
-    b64 = "".join(line for line in lines if not line.startswith("-----"))
-    der = base64.b64decode(b64)
-    return _wrap_pkcs1_as_pkcs8(der) if is_pkcs1 else der
+    """Convert a PEM private key (PKCS#1 or PKCS#8) to PKCS#8 DER bytes."""
+    github_svc, _, _, _, _ = _get_services()
+    return github_svc.pem_to_pkcs8_der(pem)
 
 
 # ---------------------------------------------------------------------------
@@ -147,7 +167,8 @@ def pem_to_pkcs8_der(pem: str) -> bytes:
 
 
 def _b64url(data: bytes) -> str:
-    return base64.urlsafe_b64encode(data).rstrip(b"=").decode("ascii")
+    github_svc, _, _, _, _ = _get_services()
+    return github_svc.b64url(data)
 
 
 # ---------------------------------------------------------------------------
@@ -157,12 +178,8 @@ def _b64url(data: bytes) -> str:
 
 def verify_signature(payload: bytes, signature: str, secret: str) -> bool:
     """Return True when the X-Hub-Signature-256 header matches the payload."""
-    if not signature or not signature.startswith("sha256="):
-        return False
-    expected = "sha256=" + _hmac.new(
-        secret.encode("utf-8"), payload, hashlib.sha256
-    ).hexdigest()
-    return _hmac.compare_digest(expected, signature)
+    github_svc, _, _, _, _ = _get_services()
+    return github_svc.verify_signature(payload, signature, secret)
 
 
 # ---------------------------------------------------------------------------
@@ -172,47 +189,8 @@ def verify_signature(payload: bytes, signature: str, secret: str) -> bool:
 
 async def create_github_jwt(app_id: str, private_key_pem: str) -> str:
     """Create a signed GitHub App JWT using the Web Crypto SubtleCrypto API."""
-    from js import Uint8Array, crypto, Array, Object  # noqa: PLC0415 — runtime import
-    from pyodide.ffi import to_js  # noqa: PLC0415 — runtime import
-
-    now = int(time.time())
-    header_b64 = _b64url(
-        json.dumps({"alg": "RS256", "typ": "JWT"}, separators=(",", ":")).encode()
-    )
-    payload_b64 = _b64url(
-        json.dumps(
-            {"iat": now - 60, "exp": now + 600, "iss": str(app_id)},
-            separators=(",", ":"),
-        ).encode()
-    )
-    signing_input = f"{header_b64}.{payload_b64}"
-
-    # Import private key into SubtleCrypto
-    pkcs8_der = pem_to_pkcs8_der(private_key_pem)
-    key_array = Uint8Array.new(len(pkcs8_der))
-    for i, b in enumerate(pkcs8_der):
-        key_array[i] = b
-
-    # Create a proper JS Array for keyUsages
-    key_usages = getattr(Array, "from")(["sign"])
-
-    crypto_key = await crypto.subtle.importKey(
-        "pkcs8",
-        key_array.buffer,
-        to_js({"name": "RSASSA-PKCS1-v1_5", "hash": "SHA-256"}, dict_converter=Object.fromEntries),
-        False,
-        key_usages,
-    )
-
-    # Sign the JWT header.payload
-    msg_bytes = signing_input.encode("ascii")
-    msg_array = Uint8Array.new(len(msg_bytes))
-    for i, b in enumerate(msg_bytes):
-        msg_array[i] = b
-
-    sig_buf = await crypto.subtle.sign("RSASSA-PKCS1-v1_5", crypto_key, msg_array.buffer)
-    sig_bytes = bytes(Uint8Array.new(sig_buf))
-    return f"{signing_input}.{_b64url(sig_bytes)}"
+    github_svc, _, _, _, _ = _get_services()
+    return await github_svc.create_github_jwt(app_id, private_key_pem)
 
 
 # ---------------------------------------------------------------------------
@@ -221,47 +199,22 @@ async def create_github_jwt(app_id: str, private_key_pem: str) -> str:
 
 
 def _gh_headers(token: str) -> Headers:
-    h = {
-        "Accept": "application/vnd.github+json",
-        "Content-Type": "application/json",
-        "User-Agent": "BLT-Pool/1.0",
-        "X-GitHub-Api-Version": "2022-11-28",
-    }
-    if token:
-        h["Authorization"] = f"Bearer {token}"
-    return Headers.new(h.items())
+    github_svc, _, _, _, _ = _get_services()
+    return github_svc.gh_headers(token)
 
 
 async def github_api(method: str, path: str, token: str, body=None):
     """Make an authenticated request to the GitHub REST API."""
-    url = f"https://api.github.com{path}"
-    kwargs = {"method": method, "headers": _gh_headers(token)}
-    if body is not None:
-        kwargs["body"] = json.dumps(body)
-    return await fetch(url, **kwargs)
+    github_svc, _, _, _, _ = _get_services()
+    return await github_svc.github_api(method, path, token, body)
 
 
 async def get_installation_token(
     installation_id: int, app_id: str, private_key: str
 ) -> Optional[str]:
     """Exchange a GitHub App JWT for an installation access token."""
-    jwt = await create_github_jwt(app_id, private_key)
-    resp = await fetch(
-        f"https://api.github.com/app/installations/{installation_id}/access_tokens",
-        method="POST",
-        headers=Headers.new({
-            "Authorization": f"Bearer {jwt}",
-            "Accept": "application/vnd.github+json",
-            "Content-Type": "application/json",
-            "User-Agent": "BLT-Pool/1.0",
-            "X-GitHub-Api-Version": "2022-11-28",
-        }.items()),
-    )
-    if resp.status != 201:
-        console.error(f"[BLT] Failed to get installation token: {resp.status}")
-        return None
-    data = json.loads(await resp.text())
-    return data.get("token")
+    github_svc, _, _, _, _ = _get_services()
+    return await github_svc.get_installation_token(installation_id, app_id, private_key)
 
 
 async def get_installation_access_token(installation_id: int, jwt_token: str) -> Optional[str]:
@@ -288,42 +241,16 @@ async def create_comment(
     owner: str, repo: str, number: int, body: str, token: str
 ) -> None:
     """Post a comment on a GitHub issue or pull request."""
-    resp = await github_api(
-        "POST",
-        f"/repos/{owner}/{repo}/issues/{number}/comments",
-        token,
-        {"body": body},
-    )
-    if resp.status not in (200, 201):
-        try:
-            err_text = await resp.text()
-        except Exception:
-            err_text = "<no response body>"
-        console.error(
-            f"[GitHub] Failed to create comment on {owner}/{repo}#{number}: "
-            f"status={resp.status} body={err_text[:300]}"
-        )
+    github_svc, _, _, _, _ = _get_services()
+    await github_svc.create_comment(owner, repo, number, body, token)
 
 
 async def create_reaction(
     owner: str, repo: str, comment_id: int, reaction: str, token: str
 ) -> None:
-    """Add a reaction to a comment. Common reactions: +1, -1, laugh, confused, heart, hooray, rocket, eyes."""
-    resp = await github_api(
-        "POST",
-        f"/repos/{owner}/{repo}/issues/comments/{comment_id}/reactions",
-        token,
-        {"content": reaction},
-    )
-    if resp.status not in (200, 201):
-        try:
-            err_text = await resp.text()
-        except Exception:
-            err_text = "<no response body>"
-        console.error(
-            f"[GitHub] Failed to create reaction on {owner}/{repo} comment={comment_id}: "
-            f"status={resp.status} body={err_text[:300]}"
-        )
+    """Add a reaction to a comment."""
+    github_svc, _, _, _, _ = _get_services()
+    await github_svc.create_reaction(owner, repo, comment_id, reaction, token)
 
 
 # ---------------------------------------------------------------------------
@@ -452,30 +379,17 @@ LEADERBOARD_COMMENT_MARKER = LEADERBOARD_MARKER
 
 def _month_key(ts: Optional[int] = None) -> str:
     """Return YYYY-MM month key for UTC timestamp (or now)."""
-    if ts is None:
-        ts = int(time.time())
-    return time.strftime("%Y-%m", time.gmtime(ts))
+    return TimeUtils.month_key(ts)
 
 
 def _month_window(month_key: str) -> Tuple[int, int]:
     """Return start/end timestamps (UTC) for a YYYY-MM key."""
-    year, month = month_key.split("-")
-    y = int(year)
-    m = int(month)
-    start_struct = time.struct_time((y, m, 1, 0, 0, 0, 0, 0, 0))
-    start_ts = int(calendar.timegm(start_struct))
-    if m == 12:
-        next_struct = time.struct_time((y + 1, 1, 1, 0, 0, 0, 0, 0, 0))
-    else:
-        next_struct = time.struct_time((y, m + 1, 1, 0, 0, 0, 0, 0, 0))
-    end_ts = int(calendar.timegm(next_struct)) - 1
-    return start_ts, end_ts
+    return TimeUtils.month_window(month_key)
 
 
 def _d1_binding(env):
     """Return D1 binding object if configured, otherwise None."""
-    db = getattr(env, "LEADERBOARD_DB", None) if env else None
-    return db
+    return DatabaseService.get_binding(env)
 
 
 async def _d1_run(db, sql: str, params: tuple = ()):
