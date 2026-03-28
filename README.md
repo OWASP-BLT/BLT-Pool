@@ -1,108 +1,238 @@
 # BLT-Pool
 
-BLT-Pool is the main product for the OWASP BLT contributor experience.
+BLT-Pool is the OWASP BLT contributor platform running on a Python Cloudflare Worker.
 
-This repository now serves two connected surfaces:
+This repository provides two connected products:
 
-- `BLT-Pool` as the primary experience, including the mentor directory and contributor onboarding pages.
-- The `GitHub App` as a submodule of BLT-Pool, handling issue assignment, leaderboard scoring, review signals, and webhook automation.
+- BLT-Pool web experience: mentor directory, active mentorship view, referral leaderboard, and mentor onboarding form.
+- GitHub App automation: issue assignment, mentor workflows, leaderboard tracking, PR quality labels, and merge-time summaries.
+- Admin dashboard: secure mentor moderation panel (publish/block/delete) with session auth and D1-backed state.
 
-## What BLT-Pool Includes
+## What Is Implemented
 
-### 1. Mentor Directory
+### Issue Automation
 
-The homepage at `/` is the BLT-Pool mentor directory. It is not a static page anymore: the worker loads mentor data from D1, shows current active mentor assignments, and renders a referral leaderboard based on who invited mentors into the pool.
+- `/assign`: self-assign an issue for 8 hours.
+- `/unassign`: release your issue assignment.
+- `/leaderboard`: post the current monthly contributor ranking.
+- New issue welcome comment is posted on `issues.opened`.
+- Bug/security labels (`bug`, `vulnerability`, `security`) are reported to BLT API.
+- Stale contributor assignments are auto-released by cron.
 
-Mentor-side features currently exposed on the homepage:
+### Mentor Workflow
 
-- A live mentor list loaded from the D1 `mentors` table
-- Per-mentor stats pulled from D1 for homepage display
-- An active assignment section backed by the D1 `mentor_assignments` table
-- A referral leaderboard built from each mentor's `referred_by` field
-- A `Become a Mentor` form that submits directly to `POST /api/mentors`
-- A mentor command guide for `/mentor`, `/unmentor`, `/mentor-pause`, `/handoff`, and `/rematch`
+- `/mentor`: request a mentor.
+- `/unmentor`: remove mentor assignment (issue author, assigned mentor, or maintainer).
+- `/mentor-pause`: mentor requests temporary pause.
+- `/handoff`: assigned mentor transfers mentorship.
+- `/rematch`: contributor requests a different mentor.
+- `needs-mentor` label can trigger automatic mentor assignment.
+- Security-sensitive issues (`security`, `vulnerability`, `security-sensitive`, `private-security`) bypass mentor auto-assignment.
+- Stale mentor assignments are released after 14 days of no human activity.
 
-### 2. GitHub App Submodule
+Mentor matching behavior:
 
-The GitHub App lives under `/github-app` and powers repository automation for OWASP BLT projects.
+- Prefers active mentors with available capacity.
+- Uses issue label specialties when possible.
+- Uses load-aware selection with deterministic tie-breaking.
+- Tracks active mentor assignments in D1 for homepage display.
 
-Core GitHub automation features:
+### Pull Request Automation
 
-- `/assign` assigns an issue to the commenter for 8 hours.
-- `/unassign` releases the assignment.
-- `/leaderboard` shows the contributor's monthly ranking.
-- Stale assignments are removed automatically on a cron schedule.
-- Bug/security labels are reported to BLT.
-- Peer review, workflow approval, and unresolved conversation labels are maintained automatically.
-- PR volume protection closes excessive open PRs from the same author.
+- Excess PR protection: new PR is auto-closed when the author already has 50 or more open PRs in the same repository.
+- If a PR closes a mentored issue, the assigned mentor is requested as reviewer.
+- PRs are labeled for peer review status:
+	- `has-peer-review`
+	- `needs-peer-review`
+- PRs are labeled for unresolved review threads:
+	- `unresolved-conversations: N` (green/red depending on count)
+- PRs are labeled for queued checks:
+	- `N checks pending`
+- On merged PRs, one combined comment is posted with:
+	- merge congratulations
+	- contributor leaderboard snippet
+	- reviewer leaderboard snippet
 
-## Architecture
+Round-robin mentor reviewer mode:
 
-The app runs as a Python Cloudflare Worker. D1 is used for both the leaderboard system and the mentor pool system.
+- The code includes round-robin reviewer assignment helper logic.
+- The runtime path checks `MENTOR_AUTO_PR_REVIEWER_ENABLED`, and the helper is additionally gated by the module constant `MENTOR_AUTO_PR_REVIEWER_ENABLED = False` in `src/worker.py`.
 
-- `GET /` renders the BLT-Pool mentor directory.
-- `GET /github-app` renders the GitHub App landing page.
-- `POST /api/mentors` adds a mentor to the D1-backed mentor pool.
-- `POST /api/github/webhooks` receives GitHub webhook events.
-- `GET /health` returns a health check response.
-- `GET /callback` shows the post-installation success page.
+### Leaderboard Model (D1)
 
-### D1 Data Model
+Leaderboard scoring is event-driven and computed from D1 counters:
 
-The worker creates and uses several D1 tables at runtime:
+- Open PR: +1
+- Merged PR: +10
+- Closed unmerged PR: -2
+- Review credit: +5 (first two unique reviewers per PR/month)
+- Comment credit: +2 (bots and CodeRabbit pings excluded)
 
-- `mentors` stores mentor profile records such as name, GitHub username, specialties, timezone, max mentees, and referral source.
-- `mentor_assignments` stores active mentor-to-issue assignments so the homepage can show current load.
-- `leaderboard_monthly_stats`, `leaderboard_open_prs`, `leaderboard_pr_state`, `leaderboard_review_credits`, and related backfill tables power the GitHub leaderboard.
+Data is maintained via webhook events plus incremental backfill tables.
 
-The mentor pool is seeded on startup with an initial list of mentors using idempotent `INSERT OR IGNORE` statements, so first deploys still show data before new mentors are added through the form.
+### Web Experience
 
-### Leaderboard Model
+Homepage (`GET /`) includes:
 
-Leaderboard scoring is event-driven and stored in D1 for scalability.
+- live mentors list from D1 `mentors`
+- per-mentor activity stats
+- active mentor assignments (from D1 `mentor_assignments`)
+- referral leaderboard based on `referred_by`
+- mentor command quick guide
+- mentor signup form that posts to `POST /api/mentors`
 
-- PR opened: open PR count `+1`
-- PR merged: merged PR count `+1`, open PR count `-1`
-- PR closed unmerged: closed PR count `+1`, open PR count `-1`
-- Review submitted: review credit `+1` for the first two unique reviewers per PR/month
-- Comment created: comment credit `+1` excluding bots and CodeRabbit pings
+Mentor signup API behavior (`POST /api/mentors`):
 
-### Mentor Pool Flow
+- Validates display name, GitHub username, specialties, timezone, and optional `referred_by`.
+- Attempts to verify GitHub usernames via GitHub API (submitter and optional referrer), with fail-open behavior on transient API/network errors.
+- Stores the mentor in D1 `mentors`.
+- Auto-sets initial `active` state based on whether the mentor has at least one merged PR in `GITHUB_ORG`.
+	- If no merged PR is found, record is stored inactive and can later be published from the admin dashboard.
 
-The mentor pool is also automated in the worker:
+GitHub App landing (`GET /github-app`) shows install URL and env status dashboard.
 
-- Mentors are loaded from D1 for homepage display and for runtime assignment logic.
-- `POST /api/mentors` validates and inserts mentors directly into D1.
-- The homepage form accepts `name`, `github_username`, `specialties`, `max_mentees`, `timezone`, and `referred_by`.
-- Slash commands such as `/mentor` and `/unmentor` drive mentor assignment workflows in GitHub.
-- Mentor assignment state is stored in D1 so the homepage can reflect active pairings.
+### Admin Dashboard
+
+Admin UI and auth are implemented in `src/services/admin/service.py` and wired through `AdminService(env).handle(request)` in `src/worker.py`.
+
+Implemented behavior:
+
+- First-run bootstrap via `GET/POST /admin/signup`:
+	- Allows creating the first admin user only once.
+	- Enforces username format and password rules.
+- Login/logout flow via `GET/POST /admin/login` and `GET /admin/logout`.
+- Session auth:
+	- Cookie name: `blt_admin_session`
+	- Session TTL: 7 days
+	- Session records are stored in D1 and expired sessions are cleaned automatically.
+- Dashboard view at `GET /admin`:
+	- Mentor totals (total/published/blocked/assignments)
+	- Mentor table with specialties, capacity, timezone, referral source, assignment count.
+- Mentor moderation actions via `POST /admin/mentors/action`:
+	- `publish` (set active)
+	- `block` (set inactive)
+	- `delete` (remove mentor and clear mentor assignment records)
+
+Important distinction:
+
+- `POST /admin/reset-leaderboard-month` is intentionally **not** session-authenticated in `AdminService`.
+- It is protected separately in `src/worker.py` using bearer `ADMIN_SECRET`.
+
+## HTTP Endpoints
+
+### Public Endpoints
+
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/` | BLT-Pool homepage with mentor directory and active assignments |
+| `GET` | `/github-app` | GitHub App landing page |
+| `GET` | `/health` | Health check (`{"status":"ok","service":"BLT-Pool"}`) |
+| `GET` | `/callback` | Post-install callback page |
+| `POST` | `/api/mentors` | Add mentor to D1-backed pool (validated) |
+| `POST` | `/api/github/webhooks` | GitHub webhook receiver |
+
+### Admin Endpoints
+
+Admin routes are handled by `src/services/admin/service.py` and session-backed in D1.
+
+| Method | Path | Description |
+|---|---|---|
+| `GET`, `POST` | `/admin/signup` | Create first admin account |
+| `GET`, `POST` | `/admin/login` | Admin login |
+| `GET` | `/admin/logout` | End admin session |
+| `GET` | `/admin` | Admin dashboard (requires valid admin session cookie) |
+| `POST` | `/admin/mentors/action` | Publish, block, or delete mentor records |
+| `POST` | `/admin/reset-leaderboard-month` | Reset month data (requires bearer `ADMIN_SECRET`) |
+
+## Environment Variables
+
+### Required Secrets
+
+| Variable | Purpose |
+|---|---|
+| `APP_ID` | GitHub App numeric ID |
+| `PRIVATE_KEY` | GitHub App private key (PEM/PKCS#1/PKCS#8) |
+| `WEBHOOK_SECRET` | GitHub webhook signature verification secret |
+
+### Config Vars (`wrangler.toml [vars]`)
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `BLT_API_URL` | `https://github-app.owaspblt.org` | BLT API base URL (webhook fallback in code: `https://blt-api.owasp-blt.workers.dev`) |
+| `GITHUB_ORG` | `OWASP-BLT` | Org used for mentor stats and checks |
+| `GITHUB_APP_SLUG` | `blt-pool` | Install URL slug on `/github-app` |
+
+### Optional Secrets
+
+| Variable | Purpose |
+|---|---|
+| `GITHUB_TOKEN` | Higher GitHub API rate-limit for user lookups and merged-PR checks |
+| `ADMIN_SECRET` | Bearer token for `/admin/reset-leaderboard-month` |
+| `GITHUB_CLIENT_ID` | Optional status-display-only variable on `/github-app` |
+| `GITHUB_CLIENT_SECRET` | Optional status-display-only variable on `/github-app` |
+| `MENTOR_AUTO_PR_REVIEWER_ENABLED` | Runtime flag checked by PR open path for round-robin reviewer attempt |
+
+### Admin Auth Notes
+
+- Admin login itself does not require `ADMIN_SECRET`.
+- Admin auth requires a working D1 binding (`LEADERBOARD_DB`) because users/sessions are persisted there.
+- Without D1 configured, `/admin*` routes return an admin-unavailable response.
+
+## D1 Data Model Overview
+
+The codebase stores more than leaderboard counters in D1. Current usage includes:
+
+- Leaderboard/event tables (monthly stats, open PRs, PR state, review credits, backfill state)
+- Mentor pool tables:
+	- `mentors`
+	- `mentor_assignments`
+- Admin/auth tables:
+	- `admin_users`
+	- `admin_sessions`
+
+These tables are created on-demand by schema/bootstrap helpers in `src/worker.py` and `src/services/admin/service.py`.
+
+## GitHub App Permissions and Events
+
+### Permissions (`app.yml`)
+
+| Permission | Access |
+|---|---|
+| Issues | Read & Write |
+| Pull Requests | Read & Write |
+| Metadata | Read |
+| Checks | Read |
+| Actions | Read |
+
+### Default Subscribed Events (`app.yml`)
+
+- `issue_comment`
+- `issues`
+- `pull_request`
+- `pull_request_review`
+- `check_run`
+- `workflow_run`
+
+Note:
+
+- The webhook router in `src/worker.py` also contains handlers for `pull_request_review_comment` and `pull_request_review_thread`.
+- These two events are not in `app.yml` default events in the current codebase.
 
 ## Setup
 
 ### Prerequisites
 
-- [Cloudflare Workers](https://workers.cloudflare.com/)
-- A GitHub App installation
-- Python for tests
+- Cloudflare Workers account
+- GitHub App installation
+- Node.js (for Wrangler CLI)
+- Python (for tests)
 
-### Local Configuration
+### Local Setup
 
 ```bash
 cp .dev.vars.example .dev.vars
+npx wrangler dev
 ```
-
-Fill in:
-
-| Variable | Description |
-|---|---|
-| `APP_ID` | GitHub App numeric ID |
-| `PRIVATE_KEY` | GitHub App private key |
-| `WEBHOOK_SECRET` | GitHub App webhook secret |
-| `GITHUB_APP_SLUG` | Current GitHub App slug |
-| `BLT_API_URL` | BLT API base URL |
-| `GITHUB_CLIENT_ID` | Optional OAuth client ID |
-| `GITHUB_CLIENT_SECRET` | Optional OAuth client secret |
-| `GITHUB_ORG` | Optional org used for homepage mentor stats, defaults to `OWASP-BLT` |
 
 ### D1 Setup
 
@@ -110,34 +240,18 @@ Fill in:
 npx wrangler d1 create blt-leaderboard
 ```
 
-Copy the returned `database_id` into `wrangler.toml` under `[[d1_databases]]`.
-
-The same D1 binding is used for both:
-
-- GitHub leaderboard/event tracking
-- Mentor pool storage and mentor assignment state
-
-### Run Locally
-
-```bash
-npx wrangler dev
-```
+Copy the returned `database_id` into `wrangler.toml` in `[[d1_databases]]`.
 
 ### Deploy
-
-```bash
-npx wrangler deploy
-```
-
-### Production Secrets
 
 ```bash
 npx wrangler secret put APP_ID
 npx wrangler secret put PRIVATE_KEY
 npx wrangler secret put WEBHOOK_SECRET
+npx wrangler deploy
 ```
 
-Bulk upload is supported with:
+Optional bulk secret helper:
 
 ```bash
 chmod +x scripts/upload-production-vars.sh
@@ -151,78 +265,6 @@ pip install pytest
 pytest test_worker.py -v
 ```
 
-## Current Naming Note
-
-The product name is now `BLT-Pool`, but some deployment identifiers still use legacy GitHub App naming for continuity.
-
-Examples:
-
-- `wrangler.toml` worker name
-- `GITHUB_APP_SLUG`
-
-Those can be migrated separately when production deployment and GitHub App settings are ready.
-
-## GitHub App Permissions
-
-Required permissions:
-
-| Permission | Access |
-|---|---|
-| Issues | Read & Write |
-| Pull Requests | Read & Write |
-| Metadata | Read |
-| Checks | Read |
-| Actions | Read |
-
-Webhook events currently handled:
-
-- `issue_comment`
-- `issues`
-- `pull_request`
-- `pull_request_review`
-- `check_run`
-- `workflow_run`
-
-## Mentor API
-
-The mentor signup form on `/` submits to `POST /api/mentors`.
-
-Accepted payload fields:
-
-- `name` required
-- `github_username` required
-- `specialties` optional list or comma-separated string
-- `max_mentees` optional, clamped to `1..10`
-- `timezone` optional
-- `referred_by` optional GitHub username
-
-Validation implemented in `worker.py`:
-
-- GitHub usernames must match GitHub's normal username shape
-- Specialty tags are validated before insert
-- Invalid payloads return `400`
-- Successful inserts return `201`
-
-## Seeded Mentors
-
-The worker currently seeds an initial mentor pool in code so the homepage is populated on first run. This seeded list includes mentors such as:
-
-- Rinkit Adhana
-- Raj Gupta
-- Shriyash Soni
-- Mohammed Faiyaz Shaikh
-- Vinamra Vaswani
-- Carla Voorhees
-- Akshay Behl
-- Ahmed ElSheik
-- Kunal Kashyap
-- Rudra Bhaskar
-- Sanidhya Shishodia
-- Vedant Anand
-- Rishab Kumar Jha
-- Aryan Jain
-- Ramansh Saxena
-
 ## Project Structure
 
 ```text
@@ -235,7 +277,12 @@ The worker currently seeds an initial mentor pool in code so the homepage is pop
 ├── scripts/
 ├── src/
 │   ├── worker.py
-│   └── index_template.py
+│   ├── index_template.py
+│   └── services/
+│       ├── admin/
+│       │   ├── __init__.py
+│       │   └── service.py
+│       └── mentor_seed.py
 ├── templates/
 │   ├── index.html
 │   └── callback.html
