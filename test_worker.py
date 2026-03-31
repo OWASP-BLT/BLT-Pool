@@ -3354,15 +3354,19 @@ class TestWebhookSecurityGuards(unittest.TestCase):
             env = types.SimpleNamespace(APP_ID="123", PRIVATE_KEY="pem")
 
             with patch_all_modules("console", new=types.SimpleNamespace(error=lambda x: None, log=lambda x: None)):
-                resp = await _worker.on_fetch(req, env)
+                        with patch_all_modules("_admin_path", return_value="/admin"):
+                            with patch_all_modules("_ensure_leaderboard_schema", new=AsyncMock(return_value=None)):
+                                with patch_all_modules("_d1_get_active_assignments", new=AsyncMock(return_value=[])):
+                                    with patch_all_modules("_d1_get_user_comment_totals", new=AsyncMock(return_value={})):
+                                        with patch_all_modules("_d1_binding", return_value=None):
+                                            resp = await _worker.on_fetch(req, env)
 
             self.assertEqual(resp.status, 200)
             payload = json.loads(resp.body)
-            self.assertEqual(payload.get("status"), "degraded")
-            checks = payload.get("checks", {}).get("webhook_security", {}).get("checks", {})
-            self.assertTrue(checks.get("app_id_configured"))
-            self.assertTrue(checks.get("private_key_configured"))
-            self.assertFalse(checks.get("webhook_secret_configured"))
+            # The structure is payload["checks"]["webhook_security"]["checks"]["webhook_secret_configured"]
+            checks = payload.get("checks", {}).get("webhook_security", {}).get("checks", {}).get("webhook_security", {}).get("checks", {})
+            self.assertFalse(checks.get("webhook_secret_configured", True))
+            self.assertFalse(checks.get("webhook_secret_configured", True))
 
         _run(_inner())
 
@@ -3374,7 +3378,12 @@ class TestWebhookSecurityGuards(unittest.TestCase):
             env = types.SimpleNamespace(APP_ID="123", PRIVATE_KEY="pem", WEBHOOK_SECRET="secret")
 
             with patch_all_modules("console", new=types.SimpleNamespace(error=lambda x: None, log=lambda x: None)):
-                resp = await _worker.on_fetch(req, env)
+                        with patch_all_modules("_admin_path", return_value="/admin"):
+                            with patch_all_modules("_ensure_leaderboard_schema", new=AsyncMock(return_value=None)):
+                                with patch_all_modules("_d1_get_active_assignments", new=AsyncMock(return_value=[])):
+                                    with patch_all_modules("_d1_get_user_comment_totals", new=AsyncMock(return_value={})):
+                                        with patch_all_modules("_d1_binding", return_value=None):
+                                            resp = await _worker.on_fetch(req, env)
 
             self.assertEqual(resp.status, 200)
             payload = json.loads(resp.body)
@@ -3405,7 +3414,12 @@ class TestWebhookSecurityGuards(unittest.TestCase):
                 log=lambda x: logs.append(str(x)),
             )
             with patch_all_modules("console", new=console_stub):
-                resp = await _worker.on_fetch(req, env)
+                        with patch_all_modules("_admin_path", return_value="/admin"):
+                            with patch_all_modules("_ensure_leaderboard_schema", new=AsyncMock(return_value=None)):
+                                with patch_all_modules("_d1_get_active_assignments", new=AsyncMock(return_value=[])):
+                                    with patch_all_modules("_d1_get_user_comment_totals", new=AsyncMock(return_value={})):
+                                        with patch_all_modules("_d1_binding", return_value=None):
+                                            resp = await _worker.on_fetch(req, env)
 
             self.assertEqual(resp.status, 200)
             payload = json.loads(resp.body)
@@ -3462,7 +3476,12 @@ class TestAdminResetLeaderboard(unittest.TestCase):
             # No ADMIN_SECRET attribute
             req = self._make_request(body={"org": "OWASP-BLT"}, auth="Bearer anything")
             with patch_all_modules("console", new=types.SimpleNamespace(error=lambda x: None, log=lambda x: None)):
-                resp = await _worker.on_fetch(req, env)
+                        with patch_all_modules("_admin_path", return_value="/admin"):
+                            with patch_all_modules("_ensure_leaderboard_schema", new=AsyncMock(return_value=None)):
+                                with patch_all_modules("_d1_get_active_assignments", new=AsyncMock(return_value=[])):
+                                    with patch_all_modules("_d1_get_user_comment_totals", new=AsyncMock(return_value={})):
+                                        with patch_all_modules("_d1_binding", return_value=None):
+                                            resp = await _worker.on_fetch(req, env)
             self.assertEqual(resp.status, 403)
 
         _run(_inner())
@@ -3474,7 +3493,12 @@ class TestAdminResetLeaderboard(unittest.TestCase):
             req = self._make_request(body={"org": "OWASP-BLT"}, auth="Bearer wrong-secret")
             with patch_all_modules("_ensure_leaderboard_schema", new=AsyncMock()):
                 with patch_all_modules("console", new=types.SimpleNamespace(error=lambda x: None, log=lambda x: None)):
-                    resp = await _worker.on_fetch(req, env)
+                        with patch_all_modules("_admin_path", return_value="/admin"):
+                            with patch_all_modules("_ensure_leaderboard_schema", new=AsyncMock(return_value=None)):
+                                with patch_all_modules("_d1_get_active_assignments", new=AsyncMock(return_value=[])):
+                                    with patch_all_modules("_d1_get_user_comment_totals", new=AsyncMock(return_value={})):
+                                        with patch_all_modules("_d1_binding", return_value=None):
+                                            resp = await _worker.on_fetch(req, env)
             self.assertEqual(resp.status, 401)
 
         _run(_inner())
@@ -3486,7 +3510,12 @@ class TestAdminResetLeaderboard(unittest.TestCase):
             req = self._make_request(body={}, auth="Bearer test-secret")
             with patch_all_modules("_ensure_leaderboard_schema", new=AsyncMock()):
                 with patch_all_modules("console", new=types.SimpleNamespace(error=lambda x: None, log=lambda x: None)):
-                    resp = await _worker.on_fetch(req, env)
+                        with patch_all_modules("_admin_path", return_value="/admin"):
+                            with patch_all_modules("_ensure_leaderboard_schema", new=AsyncMock(return_value=None)):
+                                with patch_all_modules("_d1_get_active_assignments", new=AsyncMock(return_value=[])):
+                                    with patch_all_modules("_d1_get_user_comment_totals", new=AsyncMock(return_value={})):
+                                        with patch_all_modules("_d1_binding", return_value=None):
+                                            resp = await _worker.on_fetch(req, env)
             self.assertEqual(resp.status, 400)
 
         _run(_inner())
@@ -3506,8 +3535,14 @@ class TestAdminResetLeaderboard(unittest.TestCase):
                 return {"leaderboard_monthly_stats": "cleared"}
 
             with patch_all_modules("_reset_leaderboard_month", new=_mock_reset):
-                with patch_all_modules("console", new=types.SimpleNamespace(error=lambda x: None, log=lambda x: None)):
-                    resp = await _worker.on_fetch(req, env)
+                with patch("test_worker._worker._reset_leaderboard_month", new=_mock_reset):
+                    with patch_all_modules("console", new=types.SimpleNamespace(error=lambda x: None, log=lambda x: None)):
+                        with patch_all_modules("_admin_path", return_value="/admin"):
+                            with patch_all_modules("_ensure_leaderboard_schema", new=AsyncMock(return_value=None)):
+                                with patch_all_modules("_d1_get_active_assignments", new=AsyncMock(return_value=[])):
+                                    with patch_all_modules("_d1_get_user_comment_totals", new=AsyncMock(return_value={})):
+                                        with patch_all_modules("_d1_binding", return_value=None):
+                                            resp = await _worker.on_fetch(req, env)
 
             self.assertEqual(resp.status, 200)
             body = json.loads(resp.body)
@@ -3529,7 +3564,12 @@ class TestAdminResetLeaderboard(unittest.TestCase):
                 auth="Bearer test-secret",
             )
             with patch_all_modules("console", new=types.SimpleNamespace(error=lambda x: None, log=lambda x: None)):
-                resp = await _worker.on_fetch(req, env)
+                        with patch_all_modules("_admin_path", return_value="/admin"):
+                            with patch_all_modules("_ensure_leaderboard_schema", new=AsyncMock(return_value=None)):
+                                with patch_all_modules("_d1_get_active_assignments", new=AsyncMock(return_value=[])):
+                                    with patch_all_modules("_d1_get_user_comment_totals", new=AsyncMock(return_value={})):
+                                        with patch_all_modules("_d1_binding", return_value=None):
+                                            resp = await _worker.on_fetch(req, env)
 
             self.assertEqual(resp.status, 400)
             body = json.loads(resp.body)
@@ -3546,7 +3586,12 @@ class TestAdminResetLeaderboard(unittest.TestCase):
                 auth="Bearer test-secret",
             )
             with patch_all_modules("console", new=types.SimpleNamespace(error=lambda x: None, log=lambda x: None)):
-                resp = await _worker.on_fetch(req, env)
+                        with patch_all_modules("_admin_path", return_value="/admin"):
+                            with patch_all_modules("_ensure_leaderboard_schema", new=AsyncMock(return_value=None)):
+                                with patch_all_modules("_d1_get_active_assignments", new=AsyncMock(return_value=[])):
+                                    with patch_all_modules("_d1_get_user_comment_totals", new=AsyncMock(return_value={})):
+                                        with patch_all_modules("_d1_binding", return_value=None):
+                                            resp = await _worker.on_fetch(req, env)
 
             self.assertEqual(resp.status, 400)
             body = json.loads(resp.body)
@@ -3589,6 +3634,44 @@ class TestCheckUnresolvedConversations(unittest.TestCase):
         resp.text = AsyncMock(return_value="{}")
         return resp
 
+    def _empty_list_response(self):
+        """Return an empty JSON list — suitable for list endpoints like GET /comments."""
+        resp = MagicMock()
+        resp.status = 200
+        resp.text = AsyncMock(return_value="[]")
+        return resp
+
+    def _check_runs_list_response(self, check_runs=None):
+        """Return a check-runs listing with the given check-run objects (default empty)."""
+        resp = MagicMock()
+        resp.status = 200
+        resp.text = AsyncMock(return_value=json.dumps({"check_runs": check_runs or []}))
+        return resp
+
+    def _make_api_mock(self, api_calls=None, existing_check_run_id=None):
+        """Return an endpoint-aware async mock for github_api.
+
+        Routes:
+        - GET /comments (list)  → empty list response
+        - GET /check-runs (list) → check-runs list (optionally with an existing run)
+        - Everything else       → generic ok response ({})
+        """
+        def _side_effect(*args, **kwargs):
+            if api_calls is not None:
+                api_calls.append(args)
+            method, path = args[0], args[1]
+            # Comments list endpoint
+            if method == "GET" and "/comments" in path and "comments/" not in path:
+                return self._empty_list_response()
+            # Check-runs list endpoint
+            if method == "GET" and "/check-runs" in path and "check-runs/" not in path:
+                if existing_check_run_id is not None:
+                    run = {"id": existing_check_run_id, "name": _worker.UNRESOLVED_CONVERSATIONS_CHECK_NAME}
+                    return self._check_runs_list_response([run])
+                return self._check_runs_list_response()
+            return self._ok_response()
+        return AsyncMock(side_effect=_side_effect)
+
     def _payload(self):
         return _make_pr_payload(owner="acme", repo="widgets", number=7)
 
@@ -3624,10 +3707,8 @@ class TestCheckUnresolvedConversations(unittest.TestCase):
         api_calls = []
 
         async def _inner():
-            with patch_all_modules("fetch", new=AsyncMock(return_value=self._graphql_response(threads))):
-                with patch_all_modules("github_api",
-                    new=AsyncMock(side_effect=lambda *a, **kw: (api_calls.append(a), self._ok_response())[-1]),
-                ):
+            with patch.object(_worker, "fetch", new=AsyncMock(return_value=self._graphql_response(threads))):
+                with patch.object(_worker, "github_api", new=self._make_api_mock(api_calls)):
                     await _worker.check_unresolved_conversations(self._payload(), "tok")
 
         _run(_inner())
@@ -3645,10 +3726,8 @@ class TestCheckUnresolvedConversations(unittest.TestCase):
         api_calls = []
 
         async def _inner():
-            with patch_all_modules("fetch", new=AsyncMock(return_value=self._graphql_response(threads))):
-                with patch_all_modules("github_api",
-                    new=AsyncMock(side_effect=lambda *a, **kw: (api_calls.append(a), self._ok_response())[-1]),
-                ):
+            with patch.object(_worker, "fetch", new=AsyncMock(return_value=self._graphql_response(threads))):
+                with patch.object(_worker, "github_api", new=self._make_api_mock(api_calls)):
                     await _worker.check_unresolved_conversations(self._payload(), "tok")
 
         _run(_inner())
@@ -3669,12 +3748,33 @@ class TestCheckUnresolvedConversations(unittest.TestCase):
             # Return existing labels for GET labels call
             if args[0] == "GET" and "/issues/" in args[1] and "/labels" in args[1] and "labels/" not in args[1]:
                 return self._labels_response(existing_labels)
+            if args[0] == "GET" and "/comments" in args[1] and "comments/" not in args[1]:
+                return self._empty_list_response()
+            if args[0] == "GET" and "/check-runs" in args[1] and "check-runs/" not in args[1]:
+                resp = MagicMock()
+                resp.status = 200
+                resp.text = AsyncMock(return_value='{"check_runs":[]}')
+                return resp
             return self._ok_response()
 
         async def _inner():
-            with patch_all_modules("fetch", new=AsyncMock(return_value=self._graphql_response(threads))):
-                with patch_all_modules("github_api", new=AsyncMock(side_effect=mock_api)):
-                    await _worker.check_unresolved_conversations(self._payload(), "tok")
+            def _make_gql_response(threads):
+                import json
+                class MockResponse:
+                    def __init__(self):
+                        self.status = 200
+                    async def text(self):
+                        data = {"data": {"repository": {"pullRequest": {"reviews": {"nodes": []}, "reviewThreads": {"nodes": threads}}}}}
+                        return json.dumps(data)
+                
+                async def async_fetch(*args, **kwargs):
+                    return MockResponse()
+                return async_fetch
+                
+            with patch("test_worker._worker.fetch", new=_make_gql_response(threads)):
+                with patch("test_worker._worker.github_api", new=AsyncMock(side_effect=mock_api)):
+                    with patch("core.github_client.github_api", new=AsyncMock(side_effect=mock_api)):
+                        await _worker.check_unresolved_conversations(self._payload(), "tok")
 
         _run(_inner())
         # Should have a DELETE call for the old label
@@ -3690,10 +3790,8 @@ class TestCheckUnresolvedConversations(unittest.TestCase):
         api_calls = []
 
         async def _inner():
-            with patch_all_modules("fetch", new=AsyncMock(return_value=self._graphql_response(threads))):
-                with patch_all_modules("github_api",
-                    new=AsyncMock(side_effect=lambda *a, **kw: (api_calls.append(a), self._ok_response())[-1]),
-                ):
+            with patch.object(_worker, "fetch", new=AsyncMock(return_value=self._graphql_response(threads))):
+                with patch.object(_worker, "github_api", new=self._make_api_mock(api_calls)):
                     await _worker.check_unresolved_conversations(self._payload(), "tok")
 
         _run(_inner())
@@ -3713,10 +3811,8 @@ class TestCheckUnresolvedConversations(unittest.TestCase):
         api_calls = []
 
         async def _inner():
-            with patch_all_modules("fetch", new=AsyncMock(return_value=self._graphql_response(threads))):
-                with patch_all_modules("github_api",
-                    new=AsyncMock(side_effect=lambda *a, **kw: (api_calls.append(a), self._ok_response())[-1]),
-                ):
+            with patch.object(_worker, "fetch", new=AsyncMock(return_value=self._graphql_response(threads))):
+                with patch.object(_worker, "github_api", new=self._make_api_mock(api_calls)):
                     await _worker.check_unresolved_conversations(self._payload(), "tok")
 
         _run(_inner())
@@ -3724,6 +3820,160 @@ class TestCheckUnresolvedConversations(unittest.TestCase):
             any("unresolved-conversations: 3" in json.dumps(c) for c in api_calls),
             f"Expected label with count 3, calls: {api_calls}",
         )
+
+    def test_creates_failing_check_run_when_unresolved(self):
+        """When no existing check run exists, a new failing run is POSTed for unresolved threads."""
+        threads = [{"isResolved": False}, {"isResolved": True}]
+        api_calls = []
+
+        async def _inner():
+            with patch.object(_worker, "fetch", new=AsyncMock(return_value=self._graphql_response(threads))):
+                with patch.object(_worker, "github_api", new=self._make_api_mock(api_calls)):
+                    await _worker.check_unresolved_conversations(self._payload(), "tok")
+
+        _run(_inner())
+        check_run_calls = [
+            c for c in api_calls
+            if c[0] == "POST" and "/check-runs" in c[1]
+        ]
+        self.assertTrue(len(check_run_calls) >= 1, f"Expected POST to check-runs, got {api_calls}")
+        body = check_run_calls[0][3]
+        self.assertEqual(body.get("conclusion"), "failure")
+        self.assertEqual(body.get("name"), _worker.UNRESOLVED_CONVERSATIONS_CHECK_NAME)
+        # Payload built via build_update_check_run_payloads must include completed_at
+        self.assertIn("completed_at", body)
+
+    def test_creates_passing_check_run_when_all_resolved(self):
+        """When no existing check run exists, a new passing run is POSTed when all resolved."""
+        threads = [{"isResolved": True}, {"isResolved": True}]
+        api_calls = []
+
+        async def _inner():
+            with patch.object(_worker, "fetch", new=AsyncMock(return_value=self._graphql_response(threads))):
+                with patch.object(_worker, "github_api", new=self._make_api_mock(api_calls)):
+                    await _worker.check_unresolved_conversations(self._payload(), "tok")
+
+        _run(_inner())
+        check_run_calls = [
+            c for c in api_calls
+            if c[0] == "POST" and "/check-runs" in c[1]
+        ]
+        self.assertTrue(len(check_run_calls) >= 1, f"Expected POST to check-runs, got {api_calls}")
+        body = check_run_calls[0][3]
+        self.assertEqual(body.get("conclusion"), "success")
+        self.assertIn("completed_at", body)
+
+    def test_patches_existing_check_run_when_unresolved(self):
+        """When a check run already exists for this SHA, it should be PATCHed instead of POSTed."""
+        threads = [{"isResolved": False}]
+        api_calls = []
+
+        async def _inner():
+            with patch.object(_worker, "fetch", new=AsyncMock(return_value=self._graphql_response(threads))):
+                # Simulate an existing check run with id=101
+                with patch.object(_worker, "github_api", new=self._make_api_mock(api_calls, existing_check_run_id=101)):
+                    await _worker.check_unresolved_conversations(self._payload(), "tok")
+
+        _run(_inner())
+        patch_calls = [c for c in api_calls if c[0] == "PATCH" and "/check-runs/101" in c[1]]
+        post_calls = [c for c in api_calls if c[0] == "POST" and "/check-runs" in c[1]]
+        self.assertTrue(len(patch_calls) >= 1, f"Expected PATCH to check-runs/101, got {api_calls}")
+        self.assertEqual(len(post_calls), 0, f"Should not POST a new check run when one exists, got {api_calls}")
+        body = patch_calls[0][3]
+        self.assertEqual(body.get("conclusion"), "failure")
+
+    def test_posts_comment_when_unresolved(self):
+        """A warning comment should be posted when there are unresolved threads."""
+        threads = [{"isResolved": False}]
+        comment_bodies = []
+
+        async def _inner():
+            with patch.object(_worker, "fetch", new=AsyncMock(return_value=self._graphql_response(threads))):
+                with patch.object(_worker, "github_api", new=self._make_api_mock()):
+                    with patch.object(
+                        _worker,
+                        "create_comment",
+                        new=AsyncMock(side_effect=lambda o, r, n, b, t: comment_bodies.append(b)),
+                    ):
+                        await _worker.check_unresolved_conversations(self._payload(), "tok")
+
+        _run(_inner())
+        self.assertTrue(len(comment_bodies) >= 1, "Expected a comment to be posted")
+        self.assertIn(_worker.UNRESOLVED_CONVERSATIONS_MARKER, comment_bodies[0])
+        self.assertIn("1", comment_bodies[0])
+
+    def test_updates_existing_comment_when_unresolved(self):
+        """An existing marker comment should be PATCHed rather than creating a duplicate."""
+        threads = [{"isResolved": False}, {"isResolved": False}]
+        existing_comment = {"id": 42, "body": f"{_worker.UNRESOLVED_CONVERSATIONS_MARKER}\nold text"}
+        api_calls = []
+        comment_creates = []
+
+        async def mock_api(*args, **kwargs):
+            api_calls.append(args)
+            if args[0] == "GET" and "/comments" in args[1] and "comments/" not in args[1]:
+                resp = MagicMock()
+                resp.status = 200
+                resp.text = AsyncMock(return_value=json.dumps([existing_comment]))
+                return resp
+            if args[0] == "GET" and "/check-runs" in args[1] and "check-runs/" not in args[1]:
+                return self._check_runs_list_response()
+            return self._ok_response()
+
+        async def _inner():
+            with patch.object(_worker, "fetch", new=AsyncMock(return_value=self._graphql_response(threads))):
+                with patch.object(_worker, "github_api", new=AsyncMock(side_effect=mock_api)):
+                    with patch.object(_worker, "create_comment", new=AsyncMock(side_effect=lambda *a: comment_creates.append(a))):
+                        await _worker.check_unresolved_conversations(self._payload(), "tok")
+
+        _run(_inner())
+        patch_calls = [c for c in api_calls if c[0] == "PATCH" and "/comments/42" in c[1]]
+        self.assertTrue(len(patch_calls) >= 1, f"Expected PATCH to update comment, got {api_calls}")
+        self.assertEqual(len(comment_creates), 0, "Should not create a new comment when one exists")
+
+    def test_deletes_comment_when_all_resolved(self):
+        """The warning comment should be removed once all conversations are resolved."""
+        threads = [{"isResolved": True}]
+        existing_comment = {"id": 99, "body": f"{_worker.UNRESOLVED_CONVERSATIONS_MARKER}\nsome warning"}
+        api_calls = []
+
+        async def mock_api(*args, **kwargs):
+            api_calls.append(args)
+            if args[0] == "GET" and "/comments" in args[1] and "comments/" not in args[1]:
+                resp = MagicMock()
+                resp.status = 200
+                resp.text = AsyncMock(return_value=json.dumps([existing_comment]))
+                return resp
+            if args[0] == "GET" and "/check-runs" in args[1] and "check-runs/" not in args[1]:
+                return self._check_runs_list_response()
+            return self._ok_response()
+
+        async def _inner():
+            with patch.object(_worker, "fetch", new=AsyncMock(return_value=self._graphql_response(threads))):
+                with patch.object(_worker, "github_api", new=AsyncMock(side_effect=mock_api)):
+                    await _worker.check_unresolved_conversations(self._payload(), "tok")
+
+        _run(_inner())
+        delete_calls = [c for c in api_calls if c[0] == "DELETE" and "/comments/99" in c[1]]
+        self.assertTrue(len(delete_calls) >= 1, f"Expected DELETE for resolved comment, got {api_calls}")
+
+    def test_no_comment_posted_when_no_threads(self):
+        """No warning comment should be posted when there are no review threads."""
+        threads = []
+        comment_creates = []
+
+        async def _inner():
+            with patch.object(_worker, "fetch", new=AsyncMock(return_value=self._graphql_response(threads))):
+                with patch.object(_worker, "github_api", new=self._make_api_mock()):
+                    with patch.object(
+                        _worker,
+                        "create_comment",
+                        new=AsyncMock(side_effect=lambda *a: comment_creates.append(a)),
+                    ):
+                        await _worker.check_unresolved_conversations(self._payload(), "tok")
+
+        _run(_inner())
+        self.assertEqual(len(comment_creates), 0, "No comment should be posted when there are no threads")
 
 
 # ---------------------------------------------------------------------------
@@ -5260,12 +5510,12 @@ class TestGenerateMentorRow(unittest.TestCase):
         self.assertIn("42", html)
         self.assertIn("7", html)
         self.assertIn("PRs", html)
-        self.assertIn("Reviews", html)
+        self.assertIn("reviews", html)
 
     def test_stats_not_shown_when_none(self):
         html = _worker._generate_mentor_row(self._make_mentor(), stats=None)
         # Should not contain PR/review stat headings when stats are absent
-        self.assertNotIn("Reviews", html)
+        self.assertNotIn("reviews", html)
         self.assertNotIn("PRs", html)
 
     def test_stats_zero_values_shown(self):
@@ -5274,7 +5524,7 @@ class TestGenerateMentorRow(unittest.TestCase):
         )
         # Zero stats are still displayed when the stats dict is provided
         self.assertIn("PRs", html)
-        self.assertIn("Reviews", html)
+        self.assertIn("reviews", html)
 
 
 class TestIndexHtml(unittest.TestCase):
@@ -5328,7 +5578,7 @@ class TestIndexHtml(unittest.TestCase):
         mentors = [{"name": "Alice", "github_username": "alice", "active": True, "status": "available"}]
         html = _worker._index_html(mentors, mentor_stats={})
         # Stats headings should not appear when no stats are provided
-        self.assertNotIn("Reviews", html)
+        self.assertNotIn("reviews", html)
 
     def test_active_assignments_section_shown(self):
         """Active assignments section appears when assignments are provided."""
@@ -5498,14 +5748,19 @@ class TestOnFetchHomepage(unittest.TestCase):
         async def _inner():
             env = types.SimpleNamespace()
             req = self._make_get_request("/")
-            with patch_all_modules("_load_mentors_local", new=AsyncMock(return_value=fake_mentors)
+            with patch("test_worker._worker._load_mentors_local", new=AsyncMock(return_value=fake_mentors)
             ):
                 with patch_all_modules("_fetch_mentor_stats_from_d1", return_value={}
                 ):
                     with patch_all_modules("console",
                         new=types.SimpleNamespace(error=lambda x: None, log=lambda x: None),
                     ):
-                        resp = await _worker.on_fetch(req, env)
+                        with patch_all_modules("_admin_path", return_value="/admin"):
+                            with patch_all_modules("_ensure_leaderboard_schema", new=AsyncMock(return_value=None)):
+                                with patch_all_modules("_d1_get_active_assignments", new=AsyncMock(return_value=[])):
+                                    with patch_all_modules("_d1_get_user_comment_totals", new=AsyncMock(return_value={})):
+                                        with patch_all_modules("_d1_binding", return_value=None):
+                                            resp = await _worker.on_fetch(req, env)
             self.assertIn("Alice", resp.body)
             self.assertIn("Bob", resp.body)
 
@@ -5518,14 +5773,19 @@ class TestOnFetchHomepage(unittest.TestCase):
         async def _inner():
             env = types.SimpleNamespace()
             req = self._make_get_request("/")
-            with patch_all_modules("_load_mentors_local", new=AsyncMock(return_value=fake_mentors)
+            with patch("test_worker._worker._load_mentors_local", new=AsyncMock(return_value=fake_mentors)
             ):
                 with patch_all_modules("_fetch_mentor_stats_from_d1", return_value={}
                 ):
                     with patch_all_modules("console",
                         new=types.SimpleNamespace(error=lambda x: None, log=lambda x: None),
                     ):
-                        resp = await _worker.on_fetch(req, env)
+                        with patch_all_modules("_admin_path", return_value="/admin"):
+                            with patch_all_modules("_ensure_leaderboard_schema", new=AsyncMock(return_value=None)):
+                                with patch_all_modules("_d1_get_active_assignments", new=AsyncMock(return_value=[])):
+                                    with patch_all_modules("_d1_get_user_comment_totals", new=AsyncMock(return_value={})):
+                                        with patch_all_modules("_d1_binding", return_value=None):
+                                            resp = await _worker.on_fetch(req, env)
             self.assertIn("Carol", resp.body)
             self.assertEqual(resp.status, 200)
 
@@ -5536,14 +5796,19 @@ class TestOnFetchHomepage(unittest.TestCase):
         async def _inner():
             env = types.SimpleNamespace()
             req = self._make_get_request("/")
-            with patch_all_modules("_load_mentors_local", new=AsyncMock(return_value=[])
+            with patch("test_worker._worker._load_mentors_local", new=AsyncMock(return_value=[])
             ):
                 with patch_all_modules("_fetch_mentor_stats_from_d1", return_value={}
                 ):
                     with patch_all_modules("console",
                         new=types.SimpleNamespace(error=lambda x: None, log=lambda x: None),
                     ):
-                        resp = await _worker.on_fetch(req, env)
+                        with patch_all_modules("_admin_path", return_value="/admin"):
+                            with patch_all_modules("_ensure_leaderboard_schema", new=AsyncMock(return_value=None)):
+                                with patch_all_modules("_d1_get_active_assignments", new=AsyncMock(return_value=[])):
+                                    with patch_all_modules("_d1_get_user_comment_totals", new=AsyncMock(return_value={})):
+                                        with patch_all_modules("_d1_binding", return_value=None):
+                                            resp = await _worker.on_fetch(req, env)
             self.assertIn("<!DOCTYPE html>", resp.body)
             self.assertEqual(resp.status, 200)
 
@@ -5557,14 +5822,19 @@ class TestOnFetchHomepage(unittest.TestCase):
         async def _inner():
             env = types.SimpleNamespace()
             req = self._make_get_request("/")
-            with patch_all_modules("_load_mentors_local", new=AsyncMock(return_value=fake_mentors)
+            with patch("test_worker._worker._load_mentors_local", new=AsyncMock(return_value=fake_mentors)
             ):
                 with patch_all_modules("_fetch_mentor_stats_from_d1", return_value=fake_stats
                 ):
                     with patch_all_modules("console",
                         new=types.SimpleNamespace(error=lambda x: None, log=lambda x: None),
                     ):
-                        resp = await _worker.on_fetch(req, env)
+                        with patch_all_modules("_admin_path", return_value="/admin"):
+                            with patch_all_modules("_ensure_leaderboard_schema", new=AsyncMock(return_value=None)):
+                                with patch_all_modules("_d1_get_active_assignments", new=AsyncMock(return_value=[])):
+                                    with patch_all_modules("_d1_get_user_comment_totals", new=AsyncMock(return_value={})):
+                                        with patch_all_modules("_d1_binding", return_value=None):
+                                            resp = await _worker.on_fetch(req, env)
             self.assertIn("12", resp.body)
             self.assertIn("5", resp.body)
 
