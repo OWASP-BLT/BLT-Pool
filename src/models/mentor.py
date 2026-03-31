@@ -1,16 +1,17 @@
+import calendar
 import json
-import time
-from urllib.parse import quote
 import re
+import time
 from typing import Optional
+from urllib.parse import quote
 
 from js import console
 
 from core.db import _d1_all, _d1_binding, _d1_run
 from core.github_client import github_api, create_comment, _is_human, _is_bot
+from models.assignment import _d1_get_mentor_loads
+from models.leaderboard import _ensure_leaderboard_schema
 from services.mentor_seed import INITIAL_MENTORS
-import calendar
-import time
 
 def _parse_github_timestamp(ts_str: str) -> int:
     if not ts_str:
@@ -22,8 +23,6 @@ def _parse_github_timestamp(ts_str: str) -> int:
         return calendar.timegm(dt)
     except Exception:
         return 0
-from models.assignment import _d1_get_mentor_loads
-from models.leaderboard import _ensure_leaderboard_schema
 
 MENTOR_ASSIGNED_LABEL = "mentor-assigned"
 MENTOR_ASSIGNED_LABEL_COLOR = "0075ca"

@@ -7,6 +7,7 @@ from core.github_client import github_api, create_comment, _is_maintainer, _ensu
 from core.db import _d1_binding, _d1_run
 from models.mentor import _find_assigned_mentor_from_comments, _select_mentor, _get_last_human_activity_ts, _is_security_issue, _fetch_mentors_config, MENTOR_ASSIGNED_LABEL, MENTOR_STALE_DAYS, _SECONDS_PER_DAY, NEEDS_MENTOR_LABEL, MENTOR_LABEL_COLOR, MENTOR_ASSIGNED_LABEL_COLOR
 from models.assignment import _d1_record_mentor_assignment, _d1_remove_mentor_assignment
+from models.leaderboard import _ensure_leaderboard_schema
 
 
 async def _assign_mentor_to_issue(
@@ -294,7 +295,7 @@ async def handle_mentor_pause(
         except Exception as exc:
             console.error(f"[MentorPool] Failed to persist pause for @{login} in D1 (best-effort): {exc}")
     else:
-        console.error("[MentorPool] No D1 binding available; pause for @{login} was not persisted.")
+        console.error(f"[MentorPool] No D1 binding available; pause for @{login} was not persisted.")
 
 async def handle_mentor_handoff(
     owner: str,

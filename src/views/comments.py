@@ -192,9 +192,17 @@ async def _post_reviewer_leaderboard(owner: str, repo: str, pr_number: int, toke
 
     comment_body = _format_reviewer_leaderboard_comment(leaderboard_data, owner, pr_reviewers)
 
-    # Delete any existing reviewer leaderboard comment then post a fresh one
-    resp = await github_api("GET", f"/repos/{owner}/{repo}/issues/{pr_number}/comments?per_page=100", token)
-    if resp.status == 200:
+    # Delete any existing reviewer leaderboard comment then post a fresh one.
+    # Paginate through all comment pages so older marker comments on high-volume PRs are found.
+    page = 1
+    while True:
+        resp = await github_api(
+            "GET",
+            f"/repos/{owner}/{repo}/issues/{pr_number}/comments?per_page=100&page={page}",
+            token,
+        )
+        if resp.status != 200:
+            break
         existing_comments = json.loads(await resp.text())
         for c in existing_comments:
             body = c.get("body") or ""
@@ -209,6 +217,9 @@ async def _post_reviewer_leaderboard(owner: str, repo: str, pr_number: int, toke
                         f"[ReviewerLeaderboard] Failed to delete old reviewer leaderboard comment {c['id']} "
                         f"for {owner}/{repo}#{pr_number}: status={delete_resp.status}"
                     )
+        if len(existing_comments) < 100:
+            break
+        page += 1
 
     await create_comment(owner, repo, pr_number, comment_body, token)
     console.log(f"[ReviewerLeaderboard] Posted reviewer leaderboard for {owner}/{repo}#{pr_number}")
@@ -234,8 +245,20 @@ async def _post_or_update_leaderboard(owner: str, repo: str, issue_number: int, 
     comment_body = _format_leaderboard_comment(author_login, leaderboard_data, owner, leaderboard_note)
     
     # Delete existing leaderboard comment(s) and old /leaderboard command comments, then create a fresh leaderboard comment.
-    resp = await github_api("GET", f"/repos/{owner}/{repo}/issues/{issue_number}/comments?per_page=100", token)
-    if resp.status == 200:
+    # Paginate through all comment pages to catch markers on high-volume issues/PRs.
+    page = 1
+    while True:
+        resp = await github_api(
+            "GET",
+            f"/repos/{owner}/{repo}/issues/{issue_number}/comments?per_page=100&page={page}",
+            token,
+        )
+        if resp.status != 200:
+            console.error(
+                f"[Leaderboard] Failed to list comments for {owner}/{repo}#{issue_number}: "
+                f"status={resp.status}; posting new leaderboard anyway"
+            )
+            break
         comments = json.loads(await resp.text())
         for c in comments:
             body = c.get("body") or ""
@@ -252,11 +275,9 @@ async def _post_or_update_leaderboard(owner: str, repo: str, issue_number: int, 
                         f"[Leaderboard] Failed to delete old leaderboard/command comment {c['id']} "
                         f"for {owner}/{repo}#{issue_number}: status={delete_resp.status}"
                     )
-    else:
-        console.error(
-            f"[Leaderboard] Failed to list comments for {owner}/{repo}#{issue_number}: "
-            f"status={resp.status}; posting new leaderboard anyway"
-        )
+        if len(comments) < 100:
+            break
+        page += 1
 
     await create_comment(owner, repo, issue_number, comment_body, token)
     console.log(f"[Leaderboard] Posted leaderboard comment for {owner}/{repo}#{issue_number} (requested by @{author_login})")

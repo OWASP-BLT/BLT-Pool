@@ -150,20 +150,21 @@ def _webhook_security_status(env) -> dict:
         "missing": missing,
     }
 
-def _generate_mentor_row(mentor: dict, stats: Optional[dict] = None) -> str:
+def _generate_mentor_row(mentor: dict, stats: Optional[dict] = None, current_load: int = 0) -> str:
     """Generate HTML for a single mentor list row.
 
     Args:
-        mentor: Mentor entry dict (loaded from D1).
-        stats:  Optional dict with ``merged_prs`` and ``reviews`` keys from D1.
-                When provided, totals are shown on the card.
+        mentor:       Mentor entry dict (loaded from D1).
+        stats:        Optional dict with ``merged_prs`` and ``reviews`` keys from D1.
+                      When provided, totals are shown on the card.
+        current_load: Number of active mentee assignments for this mentor.
+                      Used to derive the status badge (Mentoring vs Available).
     """
     name = _html_mod.escape(mentor.get("name", "Unknown"))
     github = mentor.get("github_username", "")
     specialties = mentor.get("specialties", [])
     max_mentees = mentor.get("max_mentees", 3)
     timezone = mentor.get("timezone", "")
-    status = mentor.get("status", "available")
     active = mentor.get("active", True)
 
     avatar_url = (
@@ -172,9 +173,9 @@ def _generate_mentor_row(mentor: dict, stats: Optional[dict] = None) -> str:
         else "https://api.dicebear.com/7.x/initials/svg?seed=" + quote(name)
     )
 
-    if not active or status == "inactive":
+    if not active:
         status_badge = '<span class="inline-flex items-center gap-1 rounded-full border border-gray-200 bg-gray-50 px-2 py-0.5 text-xs font-semibold text-gray-500">Inactive</span>'
-    elif status == "assigned":
+    elif current_load >= max_mentees:
         status_badge = '<span class="inline-flex items-center gap-1 rounded-full border border-blue-200 bg-blue-50 px-2 py-0.5 text-xs font-semibold text-blue-700">Mentoring</span>'
     else:
         status_badge = '<span class="inline-flex items-center gap-1 rounded-full border border-emerald-200 bg-emerald-50 px-2 py-0.5 text-xs font-semibold text-emerald-700">Available</span>'
@@ -292,13 +293,45 @@ def _index_html(mentors: list = None, mentor_stats: Optional[dict] = None, activ
         assignment_comment_stats = {}
     # Normalize mentor_stats keys to lowercase for case-insensitive lookup.
     mentor_stats_lower = {k.lower(): v for k, v in mentor_stats.items()}
+    # Compute load per mentor from active assignments (mentor_login → count).
+    mentor_load_map: dict = {}
+    for a in active_assignments:
+        ml = (a.get("mentor_login") or "").lower()
+        if ml:
+            mentor_load_map[ml] = mentor_load_map.get(ml, 0) + 1
     year = time.gmtime().tm_year
     mentor_count = len(mentors)
-    available_count = len([m for m in mentors if m.get("active", True) and m.get("status", "available") == "available"])
+
+    def _mentor_is_available(m: dict) -> bool:
+        if not m.get("active", True):
+            return False
+        load = mentor_load_map.get((m.get("github_username") or "").lower(), 0)
+        return load < m.get("max_mentees", 3)
+
+    available_count = sum(1 for m in mentors if _mentor_is_available(m))
 
     mentor_rows_html = "\n".join(
-        _generate_mentor_row(m, mentor_stats_lower.get(m.get("github_username", "").lower()))
+        _generate_mentor_row(
+            m,
+            mentor_stats_lower.get(m.get("github_username", "").lower()),
+            mentor_load_map.get((m.get("github_username") or "").lower(), 0),
+        )
         for m in mentors
+    )
+
+    has_stats = bool(mentor_stats_lower)
+    header_desktop_cols = "sm:grid-cols-[1fr_auto_auto_auto_auto_auto_auto]" if has_stats else "sm:grid-cols-[1fr_auto_auto_auto_auto]"
+    stats_header_cols = "<span class=\"text-center\">PRs</span><span class=\"text-center\">Reviews</span>" if has_stats else ""
+    header_row_html = (
+        f'<li class="hidden sm:grid {header_desktop_cols} sm:items-center sm:gap-4 sm:px-4 sm:py-1'
+        ' text-xs font-semibold uppercase tracking-wide text-gray-400">'
+        '<span>Mentor</span>'
+        '<span>Status</span>'
+        '<span class="text-center">Cap</span>'
+        + stats_header_cols +
+        '<span>Timezone</span>'
+        '<span>Link</span>'
+        '</li>'
     )
 
     # Build active assignments section HTML.
@@ -543,14 +576,7 @@ def _index_html(mentors: list = None, mentor_stats: Optional[dict] = None, activ
           </h3>
         </div>
         <ul class="space-y-2" aria-label="Mentor list">
-          <!-- Header row (desktop) -->
-          <li class="hidden sm:grid sm:grid-cols-[1fr_auto_auto_auto_auto] sm:items-center sm:gap-4 sm:px-4 sm:py-1 text-xs font-semibold uppercase tracking-wide text-gray-400">
-            <span>Mentor</span>
-            <span>Status</span>
-            <span class="text-center">Cap</span>
-            <span>Timezone</span>
-            <span>Link</span>
-          </li>
+          {header_row_html}
           {mentor_rows_html}
         </ul>
       </section>

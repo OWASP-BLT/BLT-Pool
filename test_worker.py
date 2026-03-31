@@ -5233,7 +5233,7 @@ class TestGenerateMentorRow(unittest.TestCase):
         self.assertIn("Inactive", html)
 
     def test_assigned_mentor_shows_mentoring_badge(self):
-        html = _worker._generate_mentor_row(self._make_mentor(status="assigned", active=True))
+        html = _worker._generate_mentor_row(self._make_mentor(active=True), current_load=3)
         self.assertIn("Mentoring", html)
 
     def test_github_link_present_when_username_set(self):
