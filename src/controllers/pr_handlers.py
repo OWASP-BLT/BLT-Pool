@@ -12,6 +12,9 @@ from models.mentor import _fetch_mentors_config, _find_assigned_mentor_from_comm
 
 MENTOR_AUTO_PR_REVIEWER_ENABLED = False
 
+UNRESOLVED_CONVERSATIONS_CHECK_NAME = "Unresolved Conversations"
+UNRESOLVED_CONVERSATIONS_MARKER = "<!-- BLT-UNRESOLVED-CONVERSATIONS -->"
+
 
 async def handle_pull_request_opened(payload: dict, token: str, env=None) -> None:
     pr = payload["pull_request"]

@@ -267,14 +267,13 @@ def _build_referral_leaderboard(mentors: list) -> list:
             counts[ref] = counts.get(ref, 0) + 1
     return sorted(counts.items(), key=lambda x: x[1], reverse=True)
 
-def _index_html(mentors: list = None, mentor_stats: Optional[dict] = None, active_assignments: Optional[list] = None, assignment_comment_stats: Optional[dict] = None) -> str:
-    """Generate the BLT-Pool mentor directory homepage.
+def _index_html(mentors: list = None, mentor_stats: Optional[dict] = None, active_assignments: Optional[list] = None, assignment_comment_stats: Optional[dict] = None, admin_path: str = "/admin") -> str:
+    """Generate the mentor list homepage HTML.
 
     Args:
-        mentors:                  Mentor list loaded from D1.
-                                  Defaults to an empty list when omitted or ``None``.
+        mentors:                  List of mentor entry dicts from D1.
         mentor_stats:             Optional mapping of ``github_username → {"merged_prs", "reviews"}``
-                                  from D1, used to show activity stats on each mentor card.
+                                  used to show all-time merged PRs and reviews for each mentor card.
                                   When ``None`` or empty, stats columns are hidden.
         active_assignments:       Optional list of active mentor-issue assignment dicts from D1.
                                   Each dict has keys: org, mentor_login, mentee_login, issue_repo,
