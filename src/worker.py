@@ -267,7 +267,7 @@ async def on_fetch(request, env) -> Response:
 
     if method == "GET" and path == "/github-app":
         app_slug = getattr(env, "GITHUB_APP_SLUG", "")
-        return _html(_github_app_html(app_slug, env))
+        return _html(_github_app_html(app_slug, env, admin_path=_admin_path(env)))
 
     if method == "GET" and path == "/health":
         webhook_security = _webhook_security_status(env)
@@ -372,13 +372,14 @@ async def _run_scheduled(env):
                     mentor_stats=stats,
                     active_assignments=active_assignments,
                     assignment_comment_stats=comment_stats,
+                    admin_path=_admin_path(env),
                 )
             )
 
         # 3. GitHub App documentation & install link
         if (url.endswith("/github-app") or url.endswith("/github-app/")) and request.method == "GET":
             slug = getattr(env, "GITHUB_APP_SLUG", "blt-github-app")
-            return _html(_github_app_html(slug, env))
+            return _html(_github_app_html(slug, env, admin_path=_admin_path(env)))
 
         # 4. GitHub callback (redirects back to homepage after app installation)
         if url.split("?")[0].endswith("/callback") and request.method == "GET":

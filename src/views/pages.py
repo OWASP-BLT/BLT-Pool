@@ -93,7 +93,7 @@ def _secret_vars_status_html(env) -> str:
         )
     return "\n".join(rows)
 
-def _github_app_html(app_slug: str, env=None) -> str:
+def _github_app_html(app_slug: str, env=None, admin_path: str = "/admin") -> str:
     install_url = (
         f"https://github.com/apps/{app_slug}/installations/new"
         if app_slug
@@ -106,11 +106,12 @@ def _github_app_html(app_slug: str, env=None) -> str:
         .replace("{{INSTALL_URL}}", install_url)
         .replace("{{YEAR}}", str(year))
         .replace("{{SECRET_VARS_STATUS}}", secret_vars_html)
+        .replace("{{ADMIN_PATH}}", admin_path)
     )
 
-def _landing_html(app_slug: str, env=None) -> str:
+def _landing_html(app_slug: str, env=None, admin_path: str = "/admin") -> str:
     """Alias for _github_app_html; renders the landing page with secret-var status."""
-    return _github_app_html(app_slug, env)
+    return _github_app_html(app_slug, env, admin_path=admin_path)
 
 def _callback_html() -> str:
     return _CALLBACK_HTML
@@ -509,7 +510,7 @@ def _index_html(mentors: list = None, mentor_stats: Optional[dict] = None, activ
           <i class="fa-solid fa-circle text-[0.4rem]" aria-hidden="true"></i>
           Live
         </span>
-        <a href="/admin/login"
+        <a href="{admin_path}"
            class="inline-flex items-center gap-1.5 rounded-md border border-[#E5E5E5] px-3 py-2 text-xs font-semibold text-gray-700 transition hover:border-[#E10101] hover:bg-[#feeae9] hover:text-[#E10101] focus:outline-none focus:ring-2 focus:ring-red-600 focus:ring-offset-2">
           <i class="fa-solid fa-shield-halved text-[#E10101]" aria-hidden="true"></i>
           Admin
