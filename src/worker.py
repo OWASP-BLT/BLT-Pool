@@ -72,6 +72,7 @@ UNMENTOR_COMMAND = "/unmentor"
 MENTOR_PAUSE_COMMAND = "/mentor-pause"
 HANDOFF_COMMAND = "/handoff"
 REMATCH_COMMAND = "/rematch"
+PEER_COMMAND = "/peer"
 NEEDS_MENTOR_LABEL = "needs-mentor"
 MENTOR_ASSIGNED_LABEL = "mentor-assigned"
 NEEDS_APPROVAL_LABEL = "needs-approval"
@@ -430,6 +431,7 @@ def _extract_command(body: str) -> Optional[str]:
         MENTOR_PAUSE_COMMAND,
         HANDOFF_COMMAND,
         REMATCH_COMMAND,
+        PEER_COMMAND,
     }
     for t in tokens:
         tok = t.strip().lower().rstrip(".,!?:;")
@@ -3456,6 +3458,41 @@ async def _check_stale_mentor_assignments(owner: str, repo: str, token: str) -> 
 # ---------------------------------------------------------------------------
 
 
+async def handle_peer_command(
+    owner: str,
+    repo: str,
+    issue: dict,
+    login: str,
+    token: str,
+    env=None,
+) -> None:
+    """Handle the ``/peer`` slash command — send a Slack notification requesting peer review."""
+    pr_url = issue.get("html_url", "")
+    message = f"peer review required: {pr_url}"
+
+    slack_webhook = getattr(env, "SLACK_WEBHOOK_URL", "") if env else ""
+    if slack_webhook:
+        try:
+            resp = await fetch(
+                slack_webhook,
+                method="POST",
+                headers=Headers.new({"Content-Type": "application/json"}.items()),
+                body=json.dumps({"text": message}),
+            )
+            if resp.status not in (200, 201):
+                console.error(
+                    f"[Peer] Slack webhook returned unexpected status {resp.status} "
+                    f"for {owner}/{repo}#{issue.get('number')}"
+                )
+        except Exception as exc:
+            console.error(f"[Peer] Failed to send Slack notification: {exc}")
+    else:
+        console.log(
+            f"[Peer] SLACK_WEBHOOK_URL not configured — skipping Slack notification "
+            f"for {owner}/{repo}#{issue.get('number')}"
+        )
+
+
 async def handle_issue_comment(payload: dict, token: str, env=None) -> None:
     comment = payload["comment"]
     issue = payload["issue"]
@@ -3536,6 +3573,8 @@ async def handle_issue_comment(payload: dict, token: str, env=None) -> None:
             await handle_mentor_handoff(owner, repo, issue, login, token, mentors_config, env=env)
         elif command == REMATCH_COMMAND:
             await handle_mentor_rematch(owner, repo, issue, login, token, mentors_config, env=env)
+    elif command == PEER_COMMAND:
+        await handle_peer_command(owner, repo, issue, login, token, env=env)
 
 
 async def _assign(

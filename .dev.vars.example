@@ -25,3 +25,7 @@ ADMIN_BASIC_AUTH_PASSWORD=
 
 # Optional: change admin route (default: /admin)
 ADMIN_PATH=/admin
+
+# Optional: Slack incoming webhook URL for /peer command notifications
+# Set with:  wrangler secret put SLACK_WEBHOOK_URL
+SLACK_WEBHOOK_URL=

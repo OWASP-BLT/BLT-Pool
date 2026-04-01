@@ -41,6 +41,7 @@ binding = "ASSETS"
 # ADMIN_BASIC_AUTH_USERNAME — Basic Auth username for /admin routes
 # ADMIN_BASIC_AUTH_PASSWORD — Basic Auth password for /admin routes
 # ADMIN_SECRET         — Bearer token for POST /admin/reset-leaderboard-month (optional)
+# SLACK_WEBHOOK_URL    — Slack incoming webhook URL for /peer command notifications (optional)
 
 
 # ---------------------------------------------------------------------------

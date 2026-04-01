@@ -660,6 +660,85 @@ class TestHandleIssueComment(unittest.TestCase):
         self.assertEqual(len(denies), 1)
 
 
+class TestHandlePeerCommand(unittest.TestCase):
+    """handle_peer_command — /peer sends a Slack webhook notification"""
+
+    def _run_peer(self, issue, env=None, fetch_side_effect=None):
+        fetch_calls = []
+
+        async def _mock_fetch(url, **kwargs):
+            fetch_calls.append((url, kwargs))
+            if fetch_side_effect is not None:
+                return fetch_side_effect
+            resp = MagicMock()
+            resp.status = 200
+            return resp
+
+        async def _inner():
+            with patch.object(_worker, "fetch", new=_mock_fetch):
+                await _worker.handle_peer_command("OWASP-BLT", "TestRepo", issue, "alice", "tok", env=env)
+
+        _run(_inner())
+        return fetch_calls
+
+    def _make_env(self, slack_url="https://hooks.slack.com/services/test"):
+        env = MagicMock()
+        env.SLACK_WEBHOOK_URL = slack_url
+        return env
+
+    def _make_issue(self, html_url="https://github.com/OWASP-BLT/TestRepo/pull/42", number=42):
+        return {"number": number, "html_url": html_url}
+
+    def test_sends_slack_notification_with_pr_url(self):
+        issue = self._make_issue()
+        env = self._make_env()
+        calls = self._run_peer(issue, env=env)
+        self.assertEqual(len(calls), 1)
+        url, kwargs = calls[0]
+        self.assertEqual(url, "https://hooks.slack.com/services/test")
+        body = json.loads(kwargs["body"])
+        self.assertIn("peer review required:", body["text"])
+        self.assertIn(issue["html_url"], body["text"])
+
+    def test_slack_message_format(self):
+        issue = self._make_issue(html_url="https://github.com/OWASP-BLT/BLT/pull/99")
+        env = self._make_env()
+        calls = self._run_peer(issue, env=env)
+        _, kwargs = calls[0]
+        body = json.loads(kwargs["body"])
+        self.assertEqual(
+            body["text"],
+            "peer review required: https://github.com/OWASP-BLT/BLT/pull/99",
+        )
+
+    def test_no_fetch_when_slack_webhook_not_configured(self):
+        issue = self._make_issue()
+        env = MagicMock()
+        env.SLACK_WEBHOOK_URL = ""
+        calls = self._run_peer(issue, env=env)
+        self.assertEqual(calls, [])
+
+    def test_no_fetch_when_env_is_none(self):
+        issue = self._make_issue()
+        calls = self._run_peer(issue, env=None)
+        self.assertEqual(calls, [])
+
+    def test_routes_peer_command_via_handle_issue_comment(self):
+        payload = _make_issue_payload(comment_body="/peer", is_pr=True)
+        peer_calls = []
+
+        async def _inner():
+            with patch.object(_worker, "handle_peer_command", new=AsyncMock(side_effect=lambda *a, **kw: peer_calls.append(a))):
+                with patch.object(_worker, "_assign", new=AsyncMock()):
+                    with patch.object(_worker, "_unassign", new=AsyncMock()):
+                        with patch.object(_worker, "_approve", new=AsyncMock()):
+                            with patch.object(_worker, "_deny", new=AsyncMock()):
+                                await _worker.handle_issue_comment(payload, "tok")
+
+        _run(_inner())
+        self.assertEqual(len(peer_calls), 1)
+
+
 class TestHandleIssueOpened(unittest.TestCase):
     """handle_issue_opened — mirrors handleIssueOpened in issue-opened.test.js"""
 
