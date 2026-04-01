@@ -9,6 +9,7 @@ import hmac
 import html as _html
 import json
 import re
+import time
 from typing import Optional, Tuple
 from urllib.parse import parse_qs, quote_plus, urlparse
 
@@ -63,14 +64,14 @@ def _parse_basic_auth_header(auth_header: str) -> Tuple[str, str]:
 
 
 def _github_headers(token: str = "") -> Headers:
-    headers = {
-        "Accept": "application/vnd.github+json",
-        "User-Agent": "BLT-Pool/1.0",
-        "X-GitHub-Api-Version": "2022-11-28",
-    }
+    pairs = [
+        ["Accept", "application/vnd.github+json"],
+        ["User-Agent", "BLT-Pool/1.0"],
+        ["X-GitHub-Api-Version", "2022-11-28"],
+    ]
     if token:
-        headers["Authorization"] = f"Bearer {token}"
-    return Headers.new(headers.items())
+        pairs.append(["Authorization", f"Bearer {token}"])
+    return Headers.new(pairs)
 
 
 async def has_merged_pr_in_org(env, github_username: str, org: str = "OWASP-BLT") -> bool:
@@ -241,15 +242,19 @@ class AdminService:
                 issue_repo TEXT NOT NULL,
                 issue_number INTEGER NOT NULL,
                 assigned_at INTEGER NOT NULL,
-            mentee_login TEXT NOT NULL DEFAULT '',
+                mentee_login TEXT NOT NULL DEFAULT '',
                 PRIMARY KEY (org, issue_repo, issue_number)
             )
             """
         )
         if not await self._d1_has_column("mentor_assignments", "mentee_login"):
-          await self._d1_run(
-            "ALTER TABLE mentor_assignments ADD COLUMN mentee_login TEXT NOT NULL DEFAULT ''"
-          )
+            await self._d1_run(
+                "ALTER TABLE mentor_assignments ADD COLUMN mentee_login TEXT NOT NULL DEFAULT ''"
+            )
+        await self._d1_run(
+            "DELETE FROM admin_sessions WHERE expires_at <= ?",
+            (int(time.time()),),
+        )
 
     async def _d1_has_column(self, table_name: str, column_name: str) -> bool:
         rows = await self._d1_all(f"PRAGMA table_info({table_name})")
@@ -359,16 +364,20 @@ class AdminService:
         return Response.new(
             json.dumps(payload),
             status=status,
-            headers=Headers.new({"Content-Type": "application/json"}.items()),
+            headers=Headers.new([["Content-Type", "application/json"]]),
         )
 
-    def _html(self, body: str, status: int = 200):
-        headers = {"Content-Type": "text/html; charset=utf-8"}
-        return Response.new(body, status=status, headers=Headers.new(headers.items()))
+    def _html(self, body: str, status: int = 200, set_cookie: str = ""):
+        pairs = [["Content-Type", "text/html; charset=utf-8"]]
+        if set_cookie:
+            pairs.append(["Set-Cookie", set_cookie])
+        return Response.new(body, status=status, headers=Headers.new(pairs))
 
-    def _redirect(self, location: str):
-        headers = {"Location": location}
-        return Response.new("", status=302, headers=Headers.new(headers.items()))
+    def _redirect(self, location: str, set_cookie: str = ""):
+        pairs = [["Location", location]]
+        if set_cookie:
+            pairs.append(["Set-Cookie", set_cookie])
+        return Response.new("", status=302, headers=Headers.new(pairs))
 
     def _shell(self, title: str, content: str, user: str = "", subtitle: str = "") -> str:
         auth_chip = (
