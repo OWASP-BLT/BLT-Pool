@@ -33,7 +33,7 @@ import re
 import time
 from typing import Optional, Tuple
 from urllib.parse import quote, urlparse
-
+import asyncio
 from js import Headers, Response, console, fetch  # Cloudflare Workers JS bindings
 from index_template import GITHUB_PAGE_HTML  # Landing page HTML template
 from services.check_orchestrator import (
@@ -544,6 +544,19 @@ async def _d1_first(db, sql: str, params: tuple = ()):
     return rows[0] if rows else None
 
 
+async def _d1_has_column(db, table_name: str, column_name: str) -> bool:
+    """Return True when the table already contains the given column."""
+    try:
+        rows = await _d1_all(db, f"PRAGMA table_info({table_name})")
+    except Exception:
+        return False
+    normalized = (column_name or "").strip().lower()
+    for row in rows:
+        if str(row.get("name") or "").strip().lower() == normalized:
+            return True
+    return False
+
+
 async def _ensure_leaderboard_schema(db) -> None:
     """Create leaderboard tables if they do not exist."""
     await _d1_run(
@@ -643,14 +656,12 @@ async def _ensure_leaderboard_schema(db) -> None:
         )
         """,
     )
-    # Migration: add mentee_login column to existing tables that pre-date this field.
-    try:
+    # Migration: add mentee_login only when missing to avoid duplicate-column errors.
+    if not await _d1_has_column(db, "mentor_assignments", "mentee_login"):
         await _d1_run(
             db,
             "ALTER TABLE mentor_assignments ADD COLUMN mentee_login TEXT NOT NULL DEFAULT ''",
         )
-    except Exception:
-        pass  # Column already exists — ignore the error.
     await _d1_run(
         db,
         """
@@ -661,10 +672,22 @@ async def _ensure_leaderboard_schema(db) -> None:
             max_mentees INTEGER NOT NULL DEFAULT 3,
             active INTEGER NOT NULL DEFAULT 1,
             timezone TEXT NOT NULL DEFAULT '',
-            referred_by TEXT NOT NULL DEFAULT ''
+            referred_by TEXT NOT NULL DEFAULT '',
+            email TEXT NOT NULL DEFAULT '',
+            slack_username TEXT NOT NULL DEFAULT ''
         )
         """,
     )
+    if not await _d1_has_column(db, "mentors", "email"):
+        await _d1_run(
+            db,
+            "ALTER TABLE mentors ADD COLUMN email TEXT NOT NULL DEFAULT ''",
+        )
+    if not await _d1_has_column(db, "mentors", "slack_username"):
+        await _d1_run(
+            db,
+            "ALTER TABLE mentors ADD COLUMN slack_username TEXT NOT NULL DEFAULT ''",
+        )
     await _d1_run(
         db,
         """
@@ -675,6 +698,30 @@ async def _ensure_leaderboard_schema(db) -> None:
             reviews INTEGER NOT NULL DEFAULT 0,
             fetched_at INTEGER NOT NULL,
             PRIMARY KEY (org, github_username)
+        )
+        """,
+    )
+    await _d1_run(
+        db,
+        """
+        CREATE TABLE IF NOT EXISTS contributor_referrals (
+            org TEXT NOT NULL,
+            month_key TEXT NOT NULL,
+            referrer_login TEXT NOT NULL,
+            referred_login TEXT NOT NULL,
+            repo TEXT NOT NULL,
+            issue_number INTEGER NOT NULL,
+            created_at INTEGER NOT NULL,
+            PRIMARY KEY (org, month_key, referrer_login, referred_login)
+        )
+        """,
+    )
+    await _d1_run(
+        db,
+        """
+        CREATE TABLE IF NOT EXISTS leaderboard_processed_comments (
+            comment_id INTEGER NOT NULL PRIMARY KEY,
+            processed_at INTEGER NOT NULL
         )
         """,
     )
@@ -697,8 +744,8 @@ async def _populate_mentors_table(db) -> None:
                 db,
                 """
                 INSERT OR IGNORE INTO mentors
-                    (github_username, name, specialties, max_mentees, active, timezone, referred_by)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                    (github_username, name, specialties, max_mentees, active, timezone, referred_by, email, slack_username)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     m["github_username"],
@@ -708,6 +755,8 @@ async def _populate_mentors_table(db) -> None:
                     1 if m.get("active", True) else 0,
                     m.get("timezone", "") or "",
                     m.get("referred_by", "") or "",
+                    m.get("email", "") or "",
+                    m.get("slack_username", "") or "",
                 ),
             )
         except Exception as exc:
@@ -724,7 +773,7 @@ async def _load_mentors_from_d1(db) -> list:
         await _ensure_leaderboard_schema(db)
         rows = await _d1_all(
             db,
-            "SELECT github_username, name, specialties, max_mentees, active, timezone, referred_by FROM mentors",
+            "SELECT github_username, name, specialties, max_mentees, active, timezone, referred_by, email, slack_username FROM mentors",
         )
         mentors = []
         for row in rows:
@@ -740,6 +789,8 @@ async def _load_mentors_from_d1(db) -> list:
                 "active": bool(row.get("active", 1)),
                 "timezone": row.get("timezone") or "",
                 "referred_by": row.get("referred_by") or "",
+                "email": row.get("email") or "",
+                "slack_username": row.get("slack_username") or "",
             })
         console.log(f"[MentorPool] Loaded {len(mentors)} mentors from D1")
         return mentors
@@ -757,21 +808,25 @@ async def _d1_add_mentor(
     active: bool = True,
     timezone: str = "",
     referred_by: str = "",
+    email: str = "",
+    slack_username: str = "",
 ) -> None:
     """Insert or replace a mentor row in the D1 ``mentors`` table."""
     await _d1_run(
         db,
         """
         INSERT INTO mentors
-            (github_username, name, specialties, max_mentees, active, timezone, referred_by)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
+            (github_username, name, specialties, max_mentees, active, timezone, referred_by, email, slack_username)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(github_username) DO UPDATE SET
             name        = excluded.name,
             specialties = excluded.specialties,
             max_mentees = excluded.max_mentees,
             active      = excluded.active,
             timezone    = excluded.timezone,
-            referred_by = excluded.referred_by
+            referred_by = excluded.referred_by,
+            email = excluded.email,
+            slack_username = excluded.slack_username
         """,
         (
             github_username,
@@ -781,6 +836,8 @@ async def _d1_add_mentor(
             1 if active else 0,
             timezone or "",
             referred_by or "",
+            email or "",
+            slack_username or "",
         ),
     )
 
@@ -977,6 +1034,7 @@ async def _d1_inc_monthly(db, org: str, month_key: str, user_login: str, field: 
         console.log(f"[D1] Updated {field} org={org} month={month_key} user={user_login} +{delta}")
     except Exception as e:
         console.error(f"[D1] Failed to update {field} org={org} month={month_key} user={user_login}: {e}")
+        raise
 
 
 async def _track_pr_opened_in_d1(payload: dict, env) -> None:
@@ -1148,13 +1206,48 @@ async def _track_comment_in_d1(payload: dict, env) -> None:
         return
     org = (payload.get("repository") or {}).get("owner", {}).get("login", "")
     login = user.get("login", "")
+    comment_id = comment.get("id")
     created_at = comment.get("created_at")
-    if not (org and login):
+    if not (org and login and comment_id):
         return
 
     await _ensure_leaderboard_schema(db)
+    
+    # Atomic dedup — only increment if this comment_id has never been processed.
+    # Mirrors the INSERT OR IGNORE + changes pattern already used in _d1_record_referral.
+    result = await _d1_run(
+        db,
+        """
+        INSERT INTO leaderboard_processed_comments (comment_id, processed_at)
+        VALUES (?, ?)
+        ON CONFLICT (comment_id) DO NOTHING
+        """,
+        (comment_id, int(time.time())),
+    )
+    changes = 0
+    if isinstance(result, dict):
+        changes = int((result.get("meta") or {}).get("changes") or 0)
+    else:
+        meta = getattr(result, "meta", None)
+        if meta is not None:
+            changes = int(getattr(meta, "changes", 0) or 0)
+
+    if changes == 0:
+        # Already processed — skip to prevent double-counting on redelivery.
+        console.log(f"[D1] Skipping duplicate comment_id={comment_id}")
+        return
+
     mk = _month_key(_parse_github_timestamp(created_at) if created_at else int(time.time()))
-    await _d1_inc_monthly(db, org, mk, login, "comments", 1)
+    try:
+        await _d1_inc_monthly(db, org, mk, login, "comments", 1)
+    except Exception:
+        # Compensate so a redelivery can retry counting this comment.
+        await _d1_run(
+            db,
+            "DELETE FROM leaderboard_processed_comments WHERE comment_id = ?",
+            (comment_id,),
+        )
+        raise
 
 
 async def _track_review_in_d1(payload: dict, env) -> None:
@@ -1216,6 +1309,314 @@ async def _track_review_in_d1(payload: dict, env) -> None:
         (org, repo, pr_number, mk, reviewer_login, int(time.time())),
     )
     await _d1_inc_monthly(db, org, mk, reviewer_login, "reviews", 1)
+
+
+# ---------------------------------------------------------------------------
+# Contributor Referral System
+# ---------------------------------------------------------------------------
+
+#: Regex that matches GitHub @mention tokens in comment bodies.
+_MENTION_RE = re.compile(r"(?<![`\w])@([A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?)")
+
+#: HTML comment marker attached to referral congratulation comments so they
+#: can be programmatically identified (for example by tooling or future code).
+REFERRAL_MARKER = "<!-- blt-referral-bot -->"
+
+#: Maximum number of @-mentions inspected for referrals in a single comment.
+#: Caps the number of GitHub search API calls triggered per comment.
+MAX_REFERRAL_MENTIONS_PER_COMMENT = 5
+
+
+def _extract_mentions(body: str) -> list:
+    """Return a deduplicated list of @-mentioned GitHub usernames from *body*.
+
+    Mentions immediately preceded by a backtick or word character are excluded
+    by the regex lookbehind, but this does not robustly skip all usernames
+    that appear inside inline or fenced code spans.
+    """
+    return list(dict.fromkeys(m.lower() for m in _MENTION_RE.findall(body)))
+
+async def _user_has_prior_activity(owner: str, username: str, token: str) -> bool:
+    """Return True if *username* has any prior across the entire *owner* org.
+
+    Checks (in order, stopping early):
+    1. Issues or PRs authored by the user (search API).
+    2. Comments on issues/PRs authored by the user (search API).
+
+    Fails closed: a non-200 response (rate limit, permission error, network
+    failure) is treated as "activity present" so that transient API errors
+    never inflate referral counts or trigger spurious congratulation comments.
+    """
+    
+    base = f"org:{owner}+fork:false"
+    u = username  # GitHub treats logins case-insensitively
+
+    # 1) Authored issues/PRs anywhere in the org.
+    authored_q = f"/search/issues?q={base}+author:{u}&per_page=1"
+    resp = await github_api("GET", authored_q, token)
+    if resp.status != 200:
+        console.error(
+            f"[Referral] Search API returned {resp.status} for {u} in {base}; "
+            "treating as active to fail closed"
+        )
+        return True
+    data = json.loads(await resp.text())
+    if int(data.get("total_count") or 0) > 0:
+        return True
+
+    # 2) Comments authored anywhere in the org.
+    comments_q = f"/search/issues?q={base}+commenter:{u}&per_page=1"
+    resp2 = await github_api("GET", comments_q, token)
+    if resp2.status != 200:
+        console.error(
+            f"[Referral] Comment-search API returned {resp2.status} for {u} in {base}; "
+            "treating as active to fail closed"
+        )
+        return True
+    data2 = json.loads(await resp2.text())
+    if int(data2.get("total_count") or 0) > 0:
+        return True
+
+    return False
+
+
+async def _d1_record_referral(
+    db, org: str, referrer: str, referred: str, repo: str, issue_number: int, month_key: str
+) -> bool:
+    """Insert a referral record.  Returns True when inserted, False when it already existed."""
+    now = int(time.time())
+    try:
+        # Use a single INSERT with ON CONFLICT DO NOTHING for atomic idempotency,
+        # avoiding a SELECT→INSERT race under concurrent webhook deliveries.
+        result = await _d1_run(
+            db,
+            """
+            INSERT INTO contributor_referrals
+                (org, month_key, referrer_login, referred_login, repo, issue_number, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT (org, month_key, referrer_login, referred_login) DO NOTHING
+            """,
+            (org, month_key, referrer.lower(), referred.lower(), repo, issue_number, now),
+        )
+        # Determine whether a row was actually inserted from the reported change count.
+        changes = 0
+        if isinstance(result, dict):
+            meta = result.get("meta") or {}
+            changes = int(meta.get("changes") or 0)
+        else:
+            meta = getattr(result, "meta", None)
+            if meta is not None:
+                changes = int(getattr(meta, "changes", 0) or 0)
+        return changes > 0
+    except Exception as exc:
+        console.error(f"[Referral] Failed to record referral {referrer}->{referred}: {exc}")
+        return False
+
+
+async def _d1_get_referral_count(db, org: str, referrer: str, month_key: str) -> int:
+    """Return the total number of successful referrals made by *referrer* in *month_key*."""
+    try:
+        row = await _d1_first(
+            db,
+            """
+            SELECT COUNT(*) AS cnt FROM contributor_referrals
+            WHERE org = ? AND month_key = ? AND referrer_login = ?
+            """,
+            (org, month_key, referrer.lower()),
+        )
+        return int((row or {}).get("cnt") or 0)
+    except Exception as exc:
+        console.error(f"[Referral] Failed to get referral count for {referrer}: {exc}")
+        return 0
+
+
+async def _d1_get_referral_leaderboard(db, org: str, month_key: str) -> list:
+    """Return list of (login, count) tuples sorted descending by referral count."""
+    try:
+        rows = await _d1_all(
+            db,
+            """
+            SELECT referrer_login, COUNT(*) AS cnt
+            FROM contributor_referrals
+            WHERE org = ? AND month_key = ?
+            GROUP BY referrer_login
+            ORDER BY cnt DESC, referrer_login ASC
+            """,
+            (org, month_key),
+        )
+        return [(r["referrer_login"], int(r["cnt"])) for r in rows]
+    except Exception as exc:
+        console.error(f"[Referral] Failed to get leaderboard for {org}/{month_key}: {exc}")
+        return []
+
+
+def _format_referral_rank_comment(
+    referrer: str,
+    total: int,
+    leaderboard: list,
+) -> str:
+    """Build the congratulation comment body for a successful referral.
+
+    Shows the referrer's rank along with 2 users above and 2 below in the
+    monthly leaderboard.
+    """
+    # Find rank (1-based, lower is better). Falls back to one beyond last place
+    # when the referrer is not yet present in the leaderboard.
+    rank = next(
+        (i + 1 for i, (login, _) in enumerate(leaderboard) if login == referrer.lower()),
+        len(leaderboard) + 1,
+    )
+
+    lines = [
+        REFERRAL_MARKER,
+        f":tada: @{referrer} You referred a new contributor! "
+        f"Total referrals: **{total}**. Current rank: **#{rank}**.",
+        "",
+        "**Monthly Referral Leaderboard (your neighborhood)**",
+        "",
+        "| Rank | Contributor | Referrals |",
+        "| ---: | :---------- | --------: |",
+    ]
+
+    # Show 2 above + self + 2 below (clamped to list bounds).
+    start = max(0, rank - 3)
+    end = min(len(leaderboard), rank + 2)
+    for i in range(start, end):
+        entry_login, entry_count = leaderboard[i]
+        pos = i + 1
+        marker = " ← you" if entry_login == referrer.lower() else ""
+        lines.append(f"| {pos} | @{entry_login}{marker} | {entry_count} |")
+
+    return "\n".join(lines)
+
+_user_cache: dict[str, dict] = {}
+_MAX = 1000  # optional cap
+
+# --- Referral human gate -------------------------------------------------
+_DEFAULT_REFERRAL_BLOCKLIST = {
+    'owasp-blt', 'openai', 'anthropic', 'claude',
+    'google', 'microsoft', 'github', 'github-actions[bot]',
+    'dependabot[bot]', 'coderabbitai[bot]', 'owasp-blt[bot]',
+    'copilot[bot]', 'sentry[bot]',
+}
+
+async def _github_user(login: str, token: str) -> dict | None:
+    key = (login or "").strip().lower()
+    if not key:
+        return None
+
+    if key in _user_cache:
+        return _user_cache[key]
+
+    resp = await github_api("GET", f"/users/{key}", token)
+    if resp.status != 200:
+        return None  # don't cache failures to avoid sticky errors
+
+    data = json.loads(await resp.text() or "{}")
+    if len(_user_cache) >= _MAX:  # simple FIFO eviction
+        _user_cache.pop(next(iter(_user_cache)))
+    _user_cache[key] = data
+    return data
+
+async def _is_valid_human_referree(login: str, token: str,
+                                   block: set[str] = _DEFAULT_REFERRAL_BLOCKLIST) -> bool:
+    """Return True only for real human GitHub users (not orgs/teams/bots/service accts)."""
+    login_lower = (login or "").strip().lower()
+    if not login_lower or '/' in login_lower:            # team mention like `@org/team`
+        return False
+    if login_lower.endswith('[bot]') or login_lower in block:
+        return False
+    user = await _github_user(login_lower, token)
+    return bool(user) and (user.get('type', '').lower() == 'user')
+
+async def _process_referral_mentions(
+    owner: str,
+    repo: str,
+    issue_number: int,
+    commenter: str,
+    body: str,
+    token: str,
+    env,
+) -> None:
+    """Detect @-mentions of new contributors and record referrals in D1.
+
+    For each mentioned username that has no prior activity in the repo, a
+    referral is recorded and the commenter receives a congratulation comment.
+    """
+    db = _d1_binding(env)
+    if not db:
+        return
+
+    mentions = _extract_mentions(body)
+    if not mentions:
+        return
+
+    # Strip the commenter themselves from mentions.
+    mentions = [m for m in mentions if m != commenter.lower()]
+    if not mentions:
+        return
+
+    # Cap the number of mentions inspected per comment to avoid rate-limit bursts.
+    if len(mentions) > MAX_REFERRAL_MENTIONS_PER_COMMENT:
+        console.log(
+            f"[Referral] Capping mentions from {len(mentions)} to "
+            f"{MAX_REFERRAL_MENTIONS_PER_COMMENT} in {owner}/{repo}#{issue_number}"
+        )
+        mentions = mentions[:MAX_REFERRAL_MENTIONS_PER_COMMENT]
+
+    # Keep only valid human users (not orgs/teams/bots/AI/service accounts)
+    filtered = []
+    for m in mentions:
+        try:
+            if await _is_valid_human_referree(m, token):
+                filtered.append(m)
+        except Exception:
+            # Fail-closed for referrals: if we cannot verify, do not award
+            # Log for operability and incident triage.
+            pass
+    mentions = list(dict.fromkeys(filtered))
+    if not mentions:
+        return
+
+    # Cap the number of mentions processed per comment to avoid rate-limit bursts.
+    if len(mentions) > MAX_REFERRAL_MENTIONS_PER_COMMENT:
+        console.log(
+            f"[Referral] Capping mentions from {len(mentions)} to "
+            f"{MAX_REFERRAL_MENTIONS_PER_COMMENT} in {owner}/{repo}#{issue_number}"
+        )
+        mentions = mentions[:MAX_REFERRAL_MENTIONS_PER_COMMENT]
+
+    await _ensure_leaderboard_schema(db)
+    mk = _month_key()
+    new_referrals = []
+
+    # Allow GitHub Search indexing to catch up before querying.
+    await asyncio.sleep(5)
+
+    for mentioned in mentions:
+        try:
+            already_active = await _user_has_prior_activity(owner, mentioned, token)
+            if already_active:
+                continue
+            recorded = await _d1_record_referral(
+                db, owner, commenter, mentioned, repo, issue_number, mk
+            )
+            if recorded:
+                new_referrals.append(mentioned)
+        except Exception as exc:
+            console.error(f"[Referral] Error processing mention @{mentioned}: {exc}")
+
+    if not new_referrals:
+        return
+
+    # Post one congrats comment covering all newly referred users.
+    try:
+        total = await _d1_get_referral_count(db, owner, commenter, mk)
+        leaderboard = await _d1_get_referral_leaderboard(db, owner, mk)
+        comment_body = _format_referral_rank_comment(commenter, total, leaderboard)
+        await create_comment(owner, repo, issue_number, comment_body, token)
+    except Exception as exc:
+        console.error(f"[Referral] Failed to post congratulation comment: {exc}")
 
 
 async def _calculate_leaderboard_stats_from_d1(owner: str, env) -> Optional[dict]:
@@ -3423,10 +3824,11 @@ async def _check_stale_mentor_assignments(owner: str, repo: str, token: str) -> 
 # ---------------------------------------------------------------------------
 
 
-async def handle_issue_comment(payload: dict, token: str, env=None) -> None:
+async def handle_issue_comment(payload: dict, token: str, env=None, ctx=None) -> None:
     comment = payload["comment"]
     issue = payload["issue"]
-    if not _is_human(comment["user"]):
+    # Require a human AND not a bot account (covers [bot] suffix, service users)
+    if (not _is_human(comment["user"])) or _is_bot(comment["user"]):
         return
 
     # Persist comments to D1 for leaderboard scoring.
@@ -3442,6 +3844,23 @@ async def handle_issue_comment(payload: dict, token: str, env=None) -> None:
     login = comment["user"]["login"]
     issue_number = issue["number"]
     comment_id = comment.get("id")
+
+    # Process @-mentions for the contributor referral system.
+    if env is not None:
+        async def _deferred_referral():
+            try:
+                await _process_referral_mentions(
+                    owner, repo, issue_number, login, body, token, env
+                )
+            except Exception as exc:
+                console.error(f"[Referral] Failed to process mentions: {exc}")
+
+        if ctx is not None:
+            # Cloudflare Workers: runs after 200 OK is sent — no redelivery risk.
+            ctx.waitUntil(_deferred_referral())
+        else:
+            # Fallback for local tests / non-CW runtimes.
+            await _deferred_referral()
 
     # Add eyes reaction immediately to acknowledge command receipt
     if comment_id and command:
@@ -3605,14 +4024,50 @@ async def _unassign(
     )
 
 
+async def _get_last_assign_requester(
+    owner: str, repo: str, num: int, token: str
+) -> Optional[str]:
+    """Return the login of the last human who commented ``/assign`` on the issue, or None."""
+    try:
+        page = 1
+        per_page = 100
+        while True:
+            resp = await github_api(
+                "GET",
+                f"/repos/{owner}/{repo}/issues/{num}/comments"
+                f"?per_page={per_page}&page={page}&sort=created&direction=desc",
+                token,
+            )
+            if resp.status != 200:
+                return None
+            comments = json.loads(await resp.text())
+            if not comments:
+                break
+            for c in comments:
+                user = c.get("user") or {}
+                body = (c.get("body") or "").strip()
+                login = user.get("login", "")
+                if not login or not _is_human(user):
+                    continue
+                if _extract_command(body) == ASSIGN_COMMAND:
+                    return login
+            if len(comments) < per_page:
+                break
+            page += 1
+    except Exception:
+        pass
+    return None
+
+
 async def _approve(
     owner: str, repo: str, issue: dict, login: str, token: str
 ) -> None:
     """Handle the ``/approve`` command (triage reviewer approves an issue for assignment).
 
     Only :data:`TRIAGE_REVIEWER` is authorised to use this command.  When
-    approved the ``help wanted`` label is added and the issue opener is
-    assigned so they can start work immediately.
+    approved the ``help wanted`` label is added.  The issue is then assigned to
+    the last person who requested ``/assign`` (if any); otherwise the issue
+    opener is assigned so they can start work immediately.
     """
     num = issue["number"]
     if login.lower() != TRIAGE_REVIEWER.lower():
@@ -3633,31 +4088,33 @@ async def _approve(
         token,
         {"labels": [HELP_WANTED_LABEL]},
     )
-    # Assign the issue to the person who opened it, respecting existing assignees
-    # and the global MAX_ASSIGNEES limit enforced by the /assign workflow.
+    # Determine who to assign: prefer the last person who said /assign, falling
+    # back to the issue opener so they can start work immediately.
     opener = issue.get("user", {}).get("login", "")
-    opener_assigned = False
+    last_requester = await _get_last_assign_requester(owner, repo, num, token)
+    assignee = last_requester or opener
+    assignee_was_assigned = False
     assignment_note = ""
-    if opener:
+    if assignee:
         assignees = issue.get("assignees") or []
         assignee_logins = {
             a.get("login")
             for a in assignees
             if isinstance(a, dict) and a.get("login")
         }
-        # If the opener is already assigned, we don't need to call the API again.
-        if opener in assignee_logins:
-            opener_assigned = True
+        # If the chosen assignee is already assigned, we don't need to call the API again.
+        if assignee in assignee_logins:
+            assignee_was_assigned = True
         # If we've reached the maximum number of assignees, do not add another.
         elif len(assignee_logins) >= MAX_ASSIGNEES:
             assignment_note = (
                 "However, this issue already has the maximum number of assignees, "
-                "so the opener was not additionally assigned."
+                "so the chosen assignee was not additionally assigned."
             )
-        # If someone else has already claimed the issue, avoid assigning the opener.
+        # If someone else has already claimed the issue, avoid assigning over them.
         elif assignee_logins:
             assignment_note = (
-                "Note: this issue already has an assignee, so the opener was not "
+                "Note: this issue already has an assignee, so the chosen assignee was not "
                 "automatically assigned."
             )
         else:
@@ -3665,11 +4122,11 @@ async def _approve(
                 "POST",
                 f"/repos/{owner}/{repo}/issues/{num}/assignees",
                 token,
-                {"assignees": [opener]},
+                {"assignees": [assignee]},
             )
-            opener_assigned = True
-    if opener and opener_assigned:
-        assignment_text = f"@{opener} You have been assigned — good luck! 🚀\n\n"
+            assignee_was_assigned = True
+    if assignee and assignee_was_assigned:
+        assignment_text = f"@{assignee} You have been assigned — good luck! 🚀\n\n"
     elif assignment_note:
         assignment_text = assignment_note + "\n\n"
     else:
@@ -4738,7 +5195,7 @@ async def handle_pull_request_for_review(payload: dict, token: str) -> None:
 # ---------------------------------------------------------------------------
 
 
-async def handle_webhook(request, env) -> Response:
+async def handle_webhook(request, env, ctx=None) -> Response:
     """Verify the GitHub webhook signature and route to the correct handler."""
     body_text = await request.text()
     payload_bytes = body_text.encode("utf-8")
@@ -4829,7 +5286,7 @@ async def handle_webhook(request, env) -> Response:
                 )
 
         if event == "issue_comment" and action == "created":
-            await handle_issue_comment(payload, token, env)
+            await handle_issue_comment(payload, token, env, ctx=ctx)
         elif event == "issues":
             if action == "opened":
                 await handle_issue_opened(payload, token, blt_api_url)
@@ -4976,6 +5433,7 @@ def _github_app_html(app_slug: str, env=None) -> str:
     return (
         GITHUB_PAGE_HTML
         .replace("{{INSTALL_URL}}", install_url)
+        .replace("{{ADMIN_PATH}}", _admin_path(env))
         .replace("{{YEAR}}", str(year))
         .replace("{{SECRET_VARS_STATUS}}", secret_vars_html)
     )
@@ -4984,6 +5442,17 @@ def _github_app_html(app_slug: str, env=None) -> str:
 def _landing_html(app_slug: str, env=None) -> str:
     """Alias for _github_app_html; renders the landing page with secret-var status."""
     return _github_app_html(app_slug, env)
+
+
+def _admin_path(env) -> str:
+    """Return normalized admin path from ADMIN_PATH env var."""
+    raw = str(getattr(env, "ADMIN_PATH", "/admin") or "").strip() if env else "/admin"
+    if not raw:
+        return "/admin"
+    if not raw.startswith("/"):
+        raw = "/" + raw
+    normalized = raw.rstrip("/")
+    return normalized or "/admin"
 
 
 def _callback_html() -> str:
@@ -5034,6 +5503,7 @@ def _generate_mentor_row(mentor: dict, stats: Optional[dict] = None) -> str:
     timezone = mentor.get("timezone", "")
     status = mentor.get("status", "available")
     active = mentor.get("active", True)
+    referred_by = (mentor.get("referred_by", "") or "").strip()
 
     avatar_url = (
         f"https://github.com/{github}.png"
@@ -5041,87 +5511,122 @@ def _generate_mentor_row(mentor: dict, stats: Optional[dict] = None) -> str:
         else "https://api.dicebear.com/7.x/initials/svg?seed=" + quote(name)
     )
 
+    # Status dot color: green = available, blue = mentoring, gray = inactive.
     if not active or status == "inactive":
-        status_badge = '<span class="inline-flex items-center gap-1 rounded-full border border-gray-200 bg-gray-50 px-2 py-0.5 text-xs font-semibold text-gray-500">Inactive</span>'
+        dot_color = "bg-gray-300"
+        dot_title = "Inactive"
     elif status == "assigned":
-        status_badge = '<span class="inline-flex items-center gap-1 rounded-full border border-blue-200 bg-blue-50 px-2 py-0.5 text-xs font-semibold text-blue-700">Mentoring</span>'
+        dot_color = "bg-blue-400"
+        dot_title = "Mentoring"
     else:
-        status_badge = '<span class="inline-flex items-center gap-1 rounded-full border border-emerald-200 bg-emerald-50 px-2 py-0.5 text-xs font-semibold text-emerald-700">Available</span>'
+        dot_color = "bg-emerald-400"
+        dot_title = "Available"
+
+    # Avatar wrapped in a GitHub profile link; status dot overlaid bottom-right.
+    if github:
+        avatar_block = (
+            f'<div class="relative shrink-0" title="{dot_title}">'
+            f'<a href="https://github.com/{github}" target="_blank" rel="noopener" aria-label="{name} GitHub profile">'
+            f'<img src="{avatar_url}" alt="{name}" width="44" height="44" '
+            f'class="h-11 w-11 aspect-square rounded-full border border-[#E5E5E5] bg-white object-cover">'
+            f'</a>'
+            f'<span class="absolute bottom-0 right-0 h-3 w-3 rounded-full border-2 border-white {dot_color}"></span>'
+            f'</div>'
+        )
+    else:
+        avatar_block = (
+            f'<div class="relative shrink-0" title="{dot_title}">'
+            f'<img src="{avatar_url}" alt="{name}" width="44" height="44" '
+            f'class="h-11 w-11 aspect-square rounded-full border border-[#E5E5E5] bg-white object-cover">'
+            f'<span class="absolute bottom-0 right-0 h-3 w-3 rounded-full border-2 border-white {dot_color}"></span>'
+            f'</div>'
+        )
 
     specialty_chips = " ".join(
         f'<span class="rounded bg-gray-100 px-1.5 py-0.5 text-xs text-gray-600">{s}</span>'
         for s in specialties
-    ) if specialties else '<span class="text-xs text-gray-400">—</span>'
+    ) if specialties else ""
 
-    github_link = (
-        f'<a href="https://github.com/{github}" target="_blank" rel="noopener" '
-        f'class="text-gray-500 hover:text-[#E10101]" aria-label="{name} GitHub profile">'
-        '<i class="fa-brands fa-github" aria-hidden="true"></i></a>'
-        if github
-        else '<span class="text-gray-300"><i class="fa-brands fa-github" aria-hidden="true"></i></span>'
+    # Visible status chip — used instead of a tooltip so mobile users can read status.
+    if not active or status == "inactive":
+        status_chip = (
+            '<span class="inline-flex items-center gap-1 text-xs text-gray-400 whitespace-nowrap">'
+            '<span class="h-2 w-2 rounded-full bg-gray-300 shrink-0"></span>Inactive</span>'
+        )
+    elif status == "assigned":
+        status_chip = (
+            '<span class="inline-flex items-center gap-1 text-xs text-blue-500 whitespace-nowrap">'
+            '<span class="h-2 w-2 rounded-full bg-blue-400 shrink-0"></span>Mentoring</span>'
+        )
+    else:
+        status_chip = (
+            '<span class="inline-flex items-center gap-1 text-xs text-emerald-600 whitespace-nowrap">'
+            '<span class="h-2 w-2 rounded-full bg-emerald-400 shrink-0"></span>Available</span>'
+        )
+
+    # Compact meta items — each is its own flex child so they can wrap independently on mobile.
+    sep = '<span class="text-gray-300 select-none text-xs" aria-hidden="true">·</span>'
+    meta_parts = [status_chip]
+    if timezone:
+        meta_parts.append(
+            f'<span class="text-xs text-gray-400 whitespace-nowrap">'
+            f'<i class="fa-regular fa-clock mr-0.5" aria-hidden="true"></i>'
+            f'{_html_mod.escape(timezone)}</span>'
+        )
+    meta_parts.append(
+        f'<span class="text-xs text-gray-400 whitespace-nowrap">Cap&nbsp;{max_mentees}</span>'
+    )
+    if referred_by:
+        ref_escaped = _html_mod.escape(referred_by)
+        meta_parts.append(
+            f'<a href="https://github.com/{ref_escaped}" target="_blank" rel="noopener" '
+            f'class="inline-flex items-center gap-1 text-xs text-gray-400 hover:text-[#E10101] whitespace-nowrap" '
+            f'title="Referred by @{ref_escaped}">'
+            f'<img src="https://github.com/{ref_escaped}.png" alt="{ref_escaped}" width="16" height="16" '
+            f'class="h-4 w-4 aspect-square rounded-full border border-gray-200 object-cover">'
+            f'@{ref_escaped}'
+            f'</a>'
+        )
+    meta_row = (
+        f'<div class="mt-0.5 flex flex-wrap items-center gap-x-1.5 gap-y-0.5 min-w-0">'
+        + sep.join(meta_parts)
+        + '</div>'
     )
 
-    tz_cell = f'<span class="text-xs text-gray-500">{_html_mod.escape(timezone)}</span>' if timezone else '<span class="text-xs text-gray-400">—</span>'
+    skills_row = (
+        '<div class="mt-1.5 flex flex-wrap gap-1">' + specialty_chips + '</div>'
+        if specialty_chips else ''
+    )
 
-    # Stats cells — shown when D1 data is available.
+    # Compact stats row — shown only when D1 data is available.
     if stats:
         merged_prs = int(stats.get("merged_prs") or 0)
         reviews = int(stats.get("reviews") or 0)
-        stats_desktop = (
-            f'<div class="text-center">'
-            f'  <p class="text-xs text-gray-400 leading-none">PRs</p>'
-            f'  <p class="text-sm font-semibold text-gray-700">{merged_prs}</p>'
-            f'</div>'
-            f'<div class="text-center">'
-            f'  <p class="text-xs text-gray-400 leading-none">Reviews</p>'
-            f'  <p class="text-sm font-semibold text-gray-700">{reviews}</p>'
+        stats_row = (
+            f'<div class="mt-1.5 flex flex-wrap items-center gap-x-3 gap-y-0.5">'
+            f'<span class="text-xs text-gray-400 whitespace-nowrap">'
+            f'<i class="fa-solid fa-code-pull-request mr-0.5 text-gray-300" aria-hidden="true"></i>'
+            f'<span class="font-semibold text-gray-600">{merged_prs}</span> PRs</span>'
+            f'<span class="text-xs text-gray-400 whitespace-nowrap">'
+            f'<i class="fa-solid fa-magnifying-glass-chart mr-0.5 text-gray-300" aria-hidden="true"></i>'
+            f'<span class="font-semibold text-gray-600">{reviews}</span> reviews</span>'
             f'</div>'
         )
-        stats_mobile = (
-            f'<span class="text-xs text-gray-500">'
-            f'<i class="fa-solid fa-code-pull-request text-gray-400" aria-hidden="true"></i> {merged_prs} PRs</span>'
-            f'<span class="text-xs text-gray-500">'
-            f'<i class="fa-solid fa-magnifying-glass-chart text-gray-400" aria-hidden="true"></i> {reviews} reviews</span>'
-        )
-        desktop_cols = "sm:grid-cols-[1fr_auto_auto_auto_auto_auto_auto]"
     else:
-        stats_desktop = ""
-        stats_mobile = ""
-        desktop_cols = "sm:grid-cols-[1fr_auto_auto_auto_auto]"
+        stats_row = ""
 
     return f'''
-    <li class="flex items-start gap-3 rounded-xl border border-[#E5E5E5] bg-white px-4 py-3 transition hover:shadow-sm sm:items-center sm:gap-4">
-      <img src="{avatar_url}" alt="{name}" class="mt-0.5 h-9 w-9 shrink-0 rounded-full border border-[#E5E5E5] bg-white object-cover sm:mt-0 sm:h-10 sm:w-10">
+    <li class="flex items-start gap-3 rounded-xl border border-[#E5E5E5] bg-white px-4 py-3 transition hover:shadow-sm">
+      {avatar_block}
       <div class="min-w-0 flex-1">
-        <!-- Desktop: grid layout with separate columns -->
-        <div class="hidden sm:grid {desktop_cols} sm:items-center sm:gap-4">
-          <div class="min-w-0">
-            <p class="truncate font-semibold text-[#111827] text-sm">{name}</p>
-            <div class="mt-0.5 flex flex-wrap gap-1">{specialty_chips}</div>
-          </div>
-          <div>{status_badge}</div>
-          <div class="text-center">
-            <p class="text-xs text-gray-400 leading-none">Cap</p>
-            <p class="text-sm font-semibold text-gray-700">{max_mentees}</p>
-          </div>
-          {stats_desktop}
-          <div>{tz_cell}</div>
-          <div>{github_link}</div>
-        </div>
-        <!-- Mobile: compact card layout -->
-        <div class="sm:hidden">
-          <div class="flex items-start justify-between gap-2">
-            <p class="truncate font-semibold text-[#111827] text-sm">{name}</p>
-            <div class="shrink-0">{github_link}</div>
-          </div>
-          <div class="mt-0.5 flex flex-wrap gap-1">{specialty_chips}</div>
-          <div class="mt-1.5 flex flex-wrap items-center gap-x-2 gap-y-1">
-            {status_badge}
-            <span class="text-xs text-gray-500">Cap: {max_mentees}</span>
-            {stats_mobile}
-            {tz_cell}
-          </div>
-        </div>
+        <!-- Row 1: name -->
+        <p class="font-semibold text-[#111827] text-sm leading-snug">{name}</p>
+        <!-- Row 2: status + meta — each item wraps independently on narrow screens -->
+        {meta_row}
+        <!-- Row 3: skills — full width -->
+        {skills_row}
+        <!-- Row 4: compact stats -->
+        {stats_row}
       </div>
     </li>
     '''
@@ -5137,7 +5642,7 @@ def _build_referral_leaderboard(mentors: list) -> list:
     return sorted(counts.items(), key=lambda x: x[1], reverse=True)
 
 
-def _index_html(mentors: list = None, mentor_stats: Optional[dict] = None, active_assignments: Optional[list] = None, assignment_comment_stats: Optional[dict] = None) -> str:
+def _index_html(mentors: list = None, mentor_stats: Optional[dict] = None, active_assignments: Optional[list] = None, assignment_comment_stats: Optional[dict] = None, admin_path: str = "/admin") -> str:
     """Generate the BLT-Pool mentor directory homepage.
 
     Args:
@@ -5274,6 +5779,10 @@ def _index_html(mentors: list = None, mentor_stats: Optional[dict] = None, activ
           <ol class="space-y-0">
             {lb_items}
           </ol>
+          <div class="mt-4 rounded-lg bg-gray-50 border border-[#E5E5E5] px-3 py-2">
+            <p class="text-xs font-semibold text-gray-600 mb-1"><i class="fa-solid fa-circle-info mr-1 text-[#E10101]" aria-hidden="true"></i>How to refer a friend</p>
+            <p class="text-xs text-gray-500">Mention them in any issue or PR comment, e.g. <code class="rounded bg-gray-200 px-1 py-0.5 text-xs font-mono text-gray-700">Hey @username, check this out!</code> — if they have no prior activity, it counts as a referral.</p>
+          </div>
         </section>'''
     else:
         leaderboard_html = '''
@@ -5284,7 +5793,11 @@ def _index_html(mentors: list = None, mentor_stats: Optional[dict] = None, activ
             </div>
             <h3 class="text-lg font-bold text-[#111827]">Referral Leaderboard</h3>
           </div>
-          <p class="text-sm text-gray-500">No referrals yet — be the first to invite a mentor!</p>
+          <p class="mb-4 text-sm text-gray-500">No referrals yet — be the first to invite a friend!</p>
+          <div class="rounded-lg bg-gray-50 border border-[#E5E5E5] px-3 py-2">
+            <p class="text-xs font-semibold text-gray-600 mb-1"><i class="fa-solid fa-circle-info mr-1 text-[#E10101]" aria-hidden="true"></i>How to refer a friend</p>
+            <p class="text-xs text-gray-500">Mention them in any issue or PR comment, e.g. <code class="rounded bg-gray-200 px-1 py-0.5 text-xs font-mono text-gray-700">Hey @username, check this out!</code> — if they have no prior activity, it counts as a referral.</p>
+          </div>
         </section>'''
 
     return f'''<!DOCTYPE html>
@@ -5349,11 +5862,6 @@ def _index_html(mentors: list = None, mentor_stats: Optional[dict] = None, activ
           <i class="fa-solid fa-circle text-[0.4rem]" aria-hidden="true"></i>
           Live
         </span>
-        <a href="/admin/login"
-           class="inline-flex items-center gap-1.5 rounded-md border border-[#E5E5E5] px-3 py-2 text-xs font-semibold text-gray-700 transition hover:border-[#E10101] hover:bg-[#feeae9] hover:text-[#E10101] focus:outline-none focus:ring-2 focus:ring-red-600 focus:ring-offset-2">
-          <i class="fa-solid fa-shield-halved text-[#E10101]" aria-hidden="true"></i>
-          Admin
-        </a>
       </div>
     </div>
   </header>
@@ -5415,14 +5923,6 @@ def _index_html(mentors: list = None, mentor_stats: Optional[dict] = None, activ
           </h3>
         </div>
         <ul class="space-y-2" aria-label="Mentor list">
-          <!-- Header row (desktop) -->
-          <li class="hidden sm:grid sm:grid-cols-[1fr_auto_auto_auto_auto] sm:items-center sm:gap-4 sm:px-4 sm:py-1 text-xs font-semibold uppercase tracking-wide text-gray-400">
-            <span>Mentor</span>
-            <span>Status</span>
-            <span class="text-center">Cap</span>
-            <span>Timezone</span>
-            <span>Link</span>
-          </li>
           {mentor_rows_html}
         </ul>
       </section>
@@ -5542,6 +6042,22 @@ def _index_html(mentors: list = None, mentor_stats: Optional[dict] = None, activ
                  maxlength="60"
                  class="w-full rounded-md border border-gray-300 px-3 py-2 text-sm text-gray-900 placeholder:text-gray-400 focus:border-[#E10101] focus:ring-1 focus:ring-[#E10101] focus:outline-none">
         </div>
+                <div>
+                    <label for="mf-email" class="mb-1 block text-sm font-semibold text-gray-700">
+                        Email <span class="text-xs font-normal text-gray-400">(optional)</span>
+                    </label>
+                    <input id="mf-email" type="email" placeholder="e.g. mentor@example.com"
+                                 maxlength="255"
+                                 class="w-full rounded-md border border-gray-300 px-3 py-2 text-sm text-gray-900 placeholder:text-gray-400 focus:border-[#E10101] focus:ring-1 focus:ring-[#E10101] focus:outline-none">
+                </div>
+                <div>
+                    <label for="mf-slack" class="mb-1 block text-sm font-semibold text-gray-700">
+                        Slack Username <span class="text-xs font-normal text-gray-400">(optional)</span>
+                    </label>
+                    <input id="mf-slack" type="text" placeholder="e.g. janedoe"
+                                 maxlength="80"
+                                 class="w-full rounded-md border border-gray-300 px-3 py-2 text-sm text-gray-900 placeholder:text-gray-400 focus:border-[#E10101] focus:ring-1 focus:ring-[#E10101] focus:outline-none">
+                </div>
         <div class="sm:col-span-2">
           <label for="mf-referral" class="mb-1 block text-sm font-semibold text-gray-700">
             Referred By <span class="text-xs font-normal text-gray-400">(optional — GitHub username of who invited you)</span>
@@ -5566,6 +6082,8 @@ def _index_html(mentors: list = None, mentor_stats: Optional[dict] = None, activ
           var GH_USERNAME_RE = /^[a-zA-Z0-9](?:[a-zA-Z0-9\\-]{{0,37}}[a-zA-Z0-9])?$/;
           // Regex matching each specialty tag (identical to server-side _SPECIALTY_RE).
           var SPECIALTY_RE = /^[a-z0-9][a-z0-9+#.\\-]{{0,29}}$/;
+          var EMAIL_RE = /^[A-Za-z0-9._%+-]{{1,64}}@[A-Za-z0-9.-]{{1,190}}[.][A-Za-z]{{2,}}$/;
+          var SLACK_RE = /^[A-Za-z0-9._-]{{1,80}}$/;
 
           /**
            * Return true if the value contains HTML angle brackets, raw ampersands,
@@ -5585,6 +6103,8 @@ def _index_html(mentors: list = None, mentor_stats: Optional[dict] = None, activ
             var specs    = document.getElementById('mf-specialties').value.trim();
             var maxM     = parseInt(document.getElementById('mf-max').value.trim(), 10);
             var tz       = document.getElementById('mf-tz').value.trim();
+            var email    = document.getElementById('mf-email').value.trim().toLowerCase();
+            var slack    = document.getElementById('mf-slack').value.trim().replace(/^@/, '');
             var referral = document.getElementById('mf-referral').value.trim().replace(/^@/, '');
             var errEl    = document.getElementById('mf-error');
             var okEl     = document.getElementById('mf-success');
@@ -5615,6 +6135,11 @@ def _index_html(mentors: list = None, mentor_stats: Optional[dict] = None, activ
               errEl.classList.remove('hidden');
               return;
             }}
+                        if (email.length > 255) {{
+                            errEl.textContent = 'Email must be 255 characters or fewer.';
+                            errEl.classList.remove('hidden');
+                            return;
+                        }}
 
             // Script / HTML injection checks on free-text fields.
             if (containsScripting(name)) {{
@@ -5632,6 +6157,16 @@ def _index_html(mentors: list = None, mentor_stats: Optional[dict] = None, activ
               errEl.classList.remove('hidden');
               return;
             }}
+                        if (containsScripting(email)) {{
+                            errEl.textContent = 'Email contains invalid characters. HTML and scripting are not allowed.';
+                            errEl.classList.remove('hidden');
+                            return;
+                        }}
+                        if (containsScripting(slack)) {{
+                            errEl.textContent = 'Slack username contains invalid characters. HTML and scripting are not allowed.';
+                            errEl.classList.remove('hidden');
+                            return;
+                        }}
 
             // GitHub username format validation.
             if (!GH_USERNAME_RE.test(github)) {{
@@ -5644,6 +6179,16 @@ def _index_html(mentors: list = None, mentor_stats: Optional[dict] = None, activ
               errEl.classList.remove('hidden');
               return;
             }}
+                        if (email && !EMAIL_RE.test(email)) {{
+                            errEl.textContent = 'Email format is invalid.';
+                            errEl.classList.remove('hidden');
+                            return;
+                        }}
+                        if (slack && !SLACK_RE.test(slack)) {{
+                            errEl.textContent = 'Slack username may only use letters, numbers, dot, underscore, and hyphen (max 80 characters).';
+                            errEl.classList.remove('hidden');
+                            return;
+                        }}
 
             // Validate each specialty tag format.
             var specialties = specs ? specs.split(',').map(function(s) {{ return s.trim(); }}).filter(Boolean) : [];
@@ -5672,7 +6217,9 @@ def _index_html(mentors: list = None, mentor_stats: Optional[dict] = None, activ
                 specialties: specialties,
                 max_mentees: maxM,
                 timezone: tz,
-                referred_by: referral
+                                referred_by: referral,
+                                email: email,
+                                slack_username: slack
               }})
             }})
             .then(function(res) {{
@@ -5733,6 +6280,10 @@ _SPECIALTY_RE = re.compile(r"^[a-z0-9][a-z0-9+#.\-]{0,29}$")
 _NAME_RE = re.compile(r"^[^<>&\"\x00-\x1f]{1,100}$")
 # Timezone: optional free-form label, same restrictions as name but max 60 chars.
 _TIMEZONE_RE = re.compile(r"^[^<>&\"\x00-\x1f]{1,60}$")
+# Email format and bounds for mentor contact details.
+_EMAIL_RE = re.compile(r"^[A-Za-z0-9._%+\-]{1,64}@[A-Za-z0-9.\-]{1,190}\.[A-Za-z]{2,}$")
+# Slack username without @, lower/upper letters, digits, dot, underscore, hyphen.
+_SLACK_USERNAME_RE = re.compile(r"^[A-Za-z0-9._\-]{1,80}$")
 # Bounds for the max_mentees field in the mentor form.
 _MENTOR_MIN_MENTEES_CAP = 1
 _MENTOR_MAX_MENTEES_CAP = 10
@@ -5765,7 +6316,9 @@ async def _handle_add_mentor(request, env) -> "Response":
             "specialties": ["frontend", "python"],   // optional
             "max_mentees": 3,                         // optional, 1-10
             "timezone": "UTC+5:30",                   // optional
-            "referred_by": "referrer"                 // optional
+            "referred_by": "referrer",                // optional
+            "email": "mentor@example.com",             // optional
+            "slack_username": "mentor-handle"          // optional
         }
 
     Returns 201 on success, 400 on validation failure, 500 on DB error.
@@ -5781,6 +6334,8 @@ async def _handle_add_mentor(request, env) -> "Response":
     max_mentees = body.get("max_mentees", 3)
     timezone = (body.get("timezone") or "").strip()
     referred_by = (body.get("referred_by") or "").strip().lstrip("@")
+    email = (body.get("email") or "").strip().lower()
+    slack_username = (body.get("slack_username") or "").strip().lstrip("@")
 
     if not name:
         return _json({"error": "Field 'name' is required"}, 400)
@@ -5817,6 +6372,10 @@ async def _handle_add_mentor(request, env) -> "Response":
 
     if referred_by and not _GH_USERNAME_RE.match(referred_by):
         return _json({"error": "Invalid referred_by username format"}, 400)
+    if email and not _EMAIL_RE.match(email):
+        return _json({"error": "Invalid email format"}, 400)
+    if slack_username and not _SLACK_USERNAME_RE.match(slack_username):
+        return _json({"error": "Invalid Slack username format"}, 400)
 
     # Verify the referrer's GitHub username exists (if provided).
     if referred_by and not await _verify_gh_user_exists(referred_by, env):
@@ -5855,6 +6414,8 @@ async def _handle_add_mentor(request, env) -> "Response":
             active=mentor_is_active,
             timezone=timezone,
             referred_by=referred_by,
+            email=email,
+            slack_username=slack_username,
         )
     except Exception as exc:
         console.error(f"[MentorPool] Failed to add mentor {github_username}: {exc}")
@@ -5898,7 +6459,7 @@ def _html(html: str, status: int = 200) -> Response:
 # ---------------------------------------------------------------------------
 
 
-async def on_fetch(request, env) -> Response:
+async def on_fetch(request, env, ctx=None) -> Response:
     method = request.method
     path = urlparse(str(request.url)).path.rstrip("/") or "/"
 
@@ -5945,7 +6506,7 @@ async def on_fetch(request, env) -> Response:
                     assignment_comment_stats = await _d1_get_user_comment_totals(db, org, all_logins)
                 except Exception as exc:
                     console.error(f"[MentorPool] Failed to fetch assignment comment stats: {exc}")
-        return _html(_index_html(mentors, mentor_stats, active_assignments, assignment_comment_stats))
+        return _html(_index_html(mentors, mentor_stats, active_assignments, assignment_comment_stats, _admin_path(env)))
 
     if method == "GET" and path == "/github-app":
         app_slug = getattr(env, "GITHUB_APP_SLUG", "")
@@ -5967,7 +6528,7 @@ async def on_fetch(request, env) -> Response:
         return await _handle_add_mentor(request, env)
 
     if method == "POST" and path == "/api/github/webhooks":
-        return await handle_webhook(request, env)
+        return await handle_webhook(request, env, ctx=ctx)
 
     # GitHub redirects here after a successful installation
     if method == "GET" and path == "/callback":
@@ -5975,7 +6536,7 @@ async def on_fetch(request, env) -> Response:
 
     # Admin: reset corrupted leaderboard data for a given org/month so a fresh
     # backfill can re-populate it.  Requires ADMIN_SECRET env variable.
-    if method == "POST" and path == "/admin/reset-leaderboard-month":
+    if method == "POST" and path in {"/admin/reset-leaderboard-month", f"{_admin_path(env)}/reset-leaderboard-month"}:
         admin_secret = getattr(env, "ADMIN_SECRET", "")
         if not admin_secret:
             return _json({"error": "Admin endpoint not configured"}, 403)

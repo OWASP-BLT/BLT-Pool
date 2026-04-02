@@ -1,58 +1,65 @@
 """Admin service for BLT-Pool.
 
-Keeps admin auth, session handling, and mentor management out of worker.py.
+Keeps admin auth and mentor management out of worker.py.
 """
 
-import hashlib
+import base64
+import binascii
 import hmac
 import html as _html
 import json
 import re
-import secrets
-import time
-from typing import Optional
+from typing import Optional, Tuple
 from urllib.parse import parse_qs, quote_plus, urlparse
 
 from js import Headers, Response, console, fetch
 
 
-_ADMIN_COOKIE = "blt_admin_session"
-_SESSION_TTL_SECONDS = 7 * 24 * 60 * 60
-_ADMIN_USERNAME_RE = r"^[A-Za-z0-9_.-]{3,32}$"
+_ADMIN_BASIC_USER_ENV = "ADMIN_BASIC_AUTH_USERNAME"
+_ADMIN_BASIC_PASS_ENV = "ADMIN_BASIC_AUTH_PASSWORD"
+_ADMIN_BASIC_REALM = "BLT-Pool Admin"
+_GH_USERNAME_RE = re.compile(r"^[a-zA-Z0-9](?:[a-zA-Z0-9\-]{0,37}[a-zA-Z0-9])?$")
+_EMAIL_RE = re.compile(r"^[A-Za-z0-9._%+\-]{1,64}@[A-Za-z0-9.\-]{1,190}\.[A-Za-z]{2,}$")
+_SLACK_USERNAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._\- ]{0,79}$")
+_ASSIGNMENT_REF_RE = re.compile(r"^(?:(?P<org>[A-Za-z0-9_.-]+)/)?(?P<repo>[A-Za-z0-9_.-]+)#(?P<number>\d+)$")
+
+
 def _escape(value: str) -> str:
     return _html.escape(value or "", quote=True)
 
 
-def _cookie_value(cookie_header: str, name: str) -> str:
-    if not cookie_header:
-        return ""
-    for item in cookie_header.split(";"):
-        part = item.strip()
-        if not part or "=" not in part:
-            continue
-        key, value = part.split("=", 1)
-        if key.strip() == name:
-            return value.strip()
-    return ""
+def _normalize_admin_path(raw_path: str) -> str:
+    value = (raw_path or "").strip()
+    if not value:
+        return "/admin"
+    if not value.startswith("/"):
+        value = "/" + value
+    value = value.rstrip("/")
+    return value or "/admin"
 
 
-def _password_hash(password: str, salt: bytes | None = None) -> str:
-    salt = salt or secrets.token_bytes(16)
-    derived = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, 120_000)
-    return f"{salt.hex()}:{derived.hex()}"
+def _parse_basic_auth_header(auth_header: str) -> Tuple[str, str]:
+    """Parse a Basic auth header and return (username, password)."""
+    if not auth_header:
+        return "", ""
+    prefix = "Basic "
+    if not auth_header.startswith(prefix):
+        return "", ""
 
+    encoded = auth_header[len(prefix):].strip()
+    if not encoded:
+        return "", ""
 
-def _password_matches(password: str, stored_hash: str) -> bool:
     try:
-        salt_hex, expected_hex = stored_hash.split(":", 1)
-    except ValueError:
-        return False
-    recalculated = _password_hash(password, bytes.fromhex(salt_hex))
-    return hmac.compare_digest(recalculated, stored_hash)
+        decoded = base64.b64decode(encoded, validate=True).decode("utf-8")
+    except (binascii.Error, UnicodeDecodeError):
+        return "", ""
 
+    if ":" not in decoded:
+        return "", ""
 
-def _session_hash(session_token: str) -> str:
-    return hashlib.sha256(session_token.encode("utf-8")).hexdigest()
+    username, password = decoded.split(":", 1)
+    return username, password
 
 
 def _github_headers(token: str = "") -> Headers:
@@ -95,14 +102,25 @@ class AdminService:
     def __init__(self, env):
         self.env = env
         self.db = getattr(env, "LEADERBOARD_DB", None) if env else None
+        self.admin_path = _normalize_admin_path(getattr(env, "ADMIN_PATH", "/admin") if env else "/admin")
+        self.mentor_action_path = f"{self.admin_path}/mentors/action"
 
     async def handle(self, request):
         """Handle admin routes, or return None when the path is not for this service."""
         path = urlparse(str(request.url)).path.rstrip("/") or "/"
-        if path == "/admin/reset-leaderboard-month":
+        legacy_mentor_action_path = "/admin/mentors/action"
+
+        # Reset endpoint is handled in worker.py.
+        if path in {"/admin/reset-leaderboard-month", f"{self.admin_path}/reset-leaderboard-month"}:
             return None
-        if not path.startswith("/admin"):
+
+        if not (
+            path == self.admin_path
+            or path.startswith(f"{self.admin_path}/")
+            or path == legacy_mentor_action_path
+        ):
             return None
+
         if not self.db:
             return self._html(
                 self._shell(
@@ -114,24 +132,34 @@ class AdminService:
 
         await self._ensure_tables()
 
-        if path == "/admin/signup":
-            if request.method == "POST":
-                return await self._handle_signup_post(request)
-            return await self._handle_signup_get(request)
+        if path in {
+            f"{self.admin_path}/login",
+            f"{self.admin_path}/signup",
+            f"{self.admin_path}/logout",
+        }:
+            return self._redirect(self.admin_path)
 
-        if path == "/admin/login":
-            if request.method == "POST":
-                return await self._handle_login_post(request)
-            return await self._handle_login_get(request)
+        configured_user, configured_pass = self._configured_basic_auth()
+        if not configured_user or not configured_pass:
+            return self._html(
+                self._shell(
+                    "Admin unavailable",
+                    "<p class='text-sm text-gray-600'>"
+                    f"Set {_ADMIN_BASIC_USER_ENV} and {_ADMIN_BASIC_PASS_ENV} "
+                    f"to enable Basic Auth for {self.admin_path}.</p>",
+                ),
+                500,
+            )
 
-        if path == "/admin/logout":
-            return await self._handle_logout(request)
+        request_user = self._authorized_admin(request, configured_user, configured_pass)
+        if not request_user:
+            return self._basic_auth_challenge()
 
-        if path == "/admin/mentors/action" and request.method == "POST":
-            return await self._handle_mentor_action(request)
+        if path in {self.mentor_action_path, legacy_mentor_action_path} and request.method == "POST":
+            return await self._handle_mentor_action(request, request_user)
 
-        if path == "/admin":
-            return await self._handle_dashboard(request)
+        if path == self.admin_path:
+            return await self._handle_dashboard(request_user)
 
         return self._json({"error": "Not found"}, 404)
 
@@ -184,26 +212,6 @@ class AdminService:
     async def _ensure_tables(self) -> None:
         await self._d1_run(
             """
-            CREATE TABLE IF NOT EXISTS admin_users (
-                id INTEGER PRIMARY KEY CHECK(id = 1),
-                username TEXT NOT NULL UNIQUE,
-                password_hash TEXT NOT NULL,
-                created_at INTEGER NOT NULL
-            )
-            """
-        )
-        await self._d1_run(
-            """
-            CREATE TABLE IF NOT EXISTS admin_sessions (
-                session_hash TEXT PRIMARY KEY,
-                username TEXT NOT NULL,
-                created_at INTEGER NOT NULL,
-                expires_at INTEGER NOT NULL
-            )
-            """
-        )
-        await self._d1_run(
-            """
             CREATE TABLE IF NOT EXISTS mentors (
                 github_username TEXT NOT NULL PRIMARY KEY,
                 name TEXT NOT NULL,
@@ -211,10 +219,20 @@ class AdminService:
                 max_mentees INTEGER NOT NULL DEFAULT 3,
                 active INTEGER NOT NULL DEFAULT 1,
                 timezone TEXT NOT NULL DEFAULT '',
-                referred_by TEXT NOT NULL DEFAULT ''
+                referred_by TEXT NOT NULL DEFAULT '',
+                email TEXT NOT NULL DEFAULT '',
+                slack_username TEXT NOT NULL DEFAULT ''
             )
             """
         )
+        if not await self._d1_has_column("mentors", "email"):
+            await self._d1_run(
+                "ALTER TABLE mentors ADD COLUMN email TEXT NOT NULL DEFAULT ''"
+            )
+        if not await self._d1_has_column("mentors", "slack_username"):
+            await self._d1_run(
+                "ALTER TABLE mentors ADD COLUMN slack_username TEXT NOT NULL DEFAULT ''"
+            )
         await self._d1_run(
             """
             CREATE TABLE IF NOT EXISTS mentor_assignments (
@@ -223,60 +241,119 @@ class AdminService:
                 issue_repo TEXT NOT NULL,
                 issue_number INTEGER NOT NULL,
                 assigned_at INTEGER NOT NULL,
+            mentee_login TEXT NOT NULL DEFAULT '',
                 PRIMARY KEY (org, issue_repo, issue_number)
             )
             """
         )
-        await self._d1_run(
-            "DELETE FROM admin_sessions WHERE expires_at <= ?",
-            (int(time.time()),),
-        )
+        if not await self._d1_has_column("mentor_assignments", "mentee_login"):
+          await self._d1_run(
+            "ALTER TABLE mentor_assignments ADD COLUMN mentee_login TEXT NOT NULL DEFAULT ''"
+          )
 
+    async def _d1_has_column(self, table_name: str, column_name: str) -> bool:
+        rows = await self._d1_all(f"PRAGMA table_info({table_name})")
+        target = (column_name or "").strip().lower()
+        for row in rows:
+            if str(row.get("name") or "").strip().lower() == target:
+                return True
+        return False
 
-    async def _has_admin(self) -> bool:
-        row = await self._d1_first("SELECT username FROM admin_users WHERE id = 1")
-        return bool(row and row.get("username"))
+    def _parse_assignment_refs(self, assignment_value: str) -> Optional[list]:
+        org = str(getattr(self.env, "GITHUB_ORG", "OWASP-BLT") or "OWASP-BLT").strip() or "OWASP-BLT"
+        refs = []
+        seen = set()
+        for raw_item in [item.strip() for item in (assignment_value or "").split(",") if item.strip()]:
+            match = _ASSIGNMENT_REF_RE.match(raw_item)
+            if not match:
+                return None
+            item_org = (match.group("org") or org).strip()
+            repo = match.group("repo").strip()
+            issue_number = int(match.group("number"))
+            if item_org != org:
+                return None
+            key = (item_org, repo, issue_number)
+            if key in seen:
+                continue
+            seen.add(key)
+            refs.append(key)
+        return refs
 
-    async def _current_admin(self, request) -> Optional[str]:
-        cookie = _cookie_value(request.headers.get("Cookie") or "", _ADMIN_COOKIE)
-        if not cookie:
-            return None
-        hashed = _session_hash(cookie)
-        row = await self._d1_first(
-            "SELECT username, expires_at FROM admin_sessions WHERE session_hash = ?",
-            (hashed,),
-        )
-        if not row:
-            return None
-        if int(row.get("expires_at") or 0) <= int(time.time()):
-            await self._d1_run("DELETE FROM admin_sessions WHERE session_hash = ?", (hashed,))
-            return None
-        return row.get("username")
+    async def _sync_assignments(self, original_login: str, new_login: str, assignment_value: str) -> bool:
+        desired = self._parse_assignment_refs(assignment_value)
+        if desired is None:
+            return False
 
-    async def _create_session(self, username: str) -> str:
-        token = secrets.token_urlsafe(32)
-        now = int(time.time())
-        await self._d1_run(
+        org = str(getattr(self.env, "GITHUB_ORG", "OWASP-BLT") or "OWASP-BLT").strip() or "OWASP-BLT"
+        current_rows = await self._d1_all(
             """
-            INSERT INTO admin_sessions (session_hash, username, created_at, expires_at)
-            VALUES (?, ?, ?, ?)
+            SELECT org, issue_repo, issue_number
+            FROM mentor_assignments
+            WHERE org = ? AND mentor_login IN (?, ?)
             """,
-            (_session_hash(token), username, now, now + _SESSION_TTL_SECONDS),
+            (org, original_login, new_login),
         )
-        return token
+        current = {
+            (str(row.get("org") or org), str(row.get("issue_repo") or ""), int(row.get("issue_number") or 0))
+            for row in current_rows
+            if row.get("issue_repo") and int(row.get("issue_number") or 0) > 0
+        }
+        desired_set = set(desired)
 
-    async def _delete_session(self, request) -> None:
-        cookie = _cookie_value(request.headers.get("Cookie") or "", _ADMIN_COOKIE)
-        if cookie:
+        for item_org, repo, issue_number in current - desired_set:
             await self._d1_run(
-                "DELETE FROM admin_sessions WHERE session_hash = ?",
-                (_session_hash(cookie),),
+                "DELETE FROM mentor_assignments WHERE org = ? AND issue_repo = ? AND issue_number = ?",
+                (item_org, repo, issue_number),
             )
+
+        for item_org, repo, issue_number in desired_set:
+            await self._d1_run(
+                """
+                INSERT INTO mentor_assignments (org, mentor_login, issue_repo, issue_number, assigned_at, mentee_login)
+                VALUES (?, ?, ?, ?, strftime('%s','now'), '')
+                ON CONFLICT(org, issue_repo, issue_number) DO UPDATE SET
+                    mentor_login = excluded.mentor_login,
+                    assigned_at = excluded.assigned_at,
+                    mentee_login = excluded.mentee_login
+                """,
+                (item_org, new_login, repo, issue_number),
+            )
+        return True
+
+    def _configured_basic_auth(self) -> Tuple[str, str]:
+        username = str(getattr(self.env, _ADMIN_BASIC_USER_ENV, "") or "").strip()
+        password = str(getattr(self.env, _ADMIN_BASIC_PASS_ENV, "") or "")
+        return username, password
+
+    def _authorized_admin(self, request, expected_user: str, expected_pass: str) -> Optional[str]:
+        supplied_user, supplied_pass = _parse_basic_auth_header(request.headers.get("Authorization") or "")
+        if not supplied_user and not supplied_pass:
+            return None
+        if not hmac.compare_digest(supplied_user, expected_user):
+            return None
+        if not hmac.compare_digest(supplied_pass, expected_pass):
+            return None
+        return supplied_user
+
+    def _basic_auth_challenge(self):
+        return Response.new(
+            "Authentication required",
+            status=401,
+            headers=Headers.new(
+                {
+                    "Content-Type": "text/plain; charset=utf-8",
+                    "WWW-Authenticate": f'Basic realm="{_ADMIN_BASIC_REALM}", charset="UTF-8"',
+                }.items()
+            ),
+        )
 
     async def _form_data(self, request) -> dict:
         body = await request.text()
-        parsed = parse_qs(body, keep_blank_values=False)
+        parsed = parse_qs(body, keep_blank_values=True)
         return {key: values[0].strip() if values else "" for key, values in parsed.items()}
+
+    def _is_autosave_request(self, request) -> bool:
+        return (request.headers.get("X-Admin-Autosave") or "").strip().lower() == "1"
 
     def _json(self, payload, status: int = 200):
         return Response.new(
@@ -285,34 +362,21 @@ class AdminService:
             headers=Headers.new({"Content-Type": "application/json"}.items()),
         )
 
-    def _html(self, body: str, status: int = 200, set_cookie: str = ""):
+    def _html(self, body: str, status: int = 200):
         headers = {"Content-Type": "text/html; charset=utf-8"}
-        if set_cookie:
-            headers["Set-Cookie"] = set_cookie
         return Response.new(body, status=status, headers=Headers.new(headers.items()))
 
-    def _redirect(self, location: str, set_cookie: str = ""):
+    def _redirect(self, location: str):
         headers = {"Location": location}
-        if set_cookie:
-            headers["Set-Cookie"] = set_cookie
         return Response.new("", status=302, headers=Headers.new(headers.items()))
 
-    def _session_cookie(self, token: str) -> str:
-        return (
-            f"{_ADMIN_COOKIE}={token}; Path=/; HttpOnly; SameSite=Lax; "
-            f"Max-Age={_SESSION_TTL_SECONDS}"
-        )
-
-    def _clear_session_cookie(self) -> str:
-        return f"{_ADMIN_COOKIE}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0"
-
     def _shell(self, title: str, content: str, user: str = "", subtitle: str = "") -> str:
-        user_chip = ""
-        if user:
-            user_chip = (
-                f'<div class="inline-flex items-center gap-2 rounded-full border border-[#E5E5E5] '
-                f'bg-white px-3 py-1 text-xs font-semibold text-gray-600">Signed in as @{_escape(user)}</div>'
-            )
+        auth_chip = (
+            f'<div class="inline-flex items-center gap-2 rounded-full border border-[#E5E5E5] '
+            f'bg-white px-3 py-1 text-xs font-semibold text-gray-600">Basic Auth as @{_escape(user)}</div>'
+            if user
+            else ""
+        )
         subtitle_html = f"<p class='mt-3 text-sm leading-relaxed text-gray-600'>{subtitle}</p>" if subtitle else ""
         return f"""<!DOCTYPE html>
 <html lang="en" class="scroll-smooth">
@@ -347,12 +411,19 @@ class AdminService:
         radial-gradient(circle at 95% 4%, rgba(225, 1, 1, 0.05), transparent 28%),
         #f8fafc;
     }}
+
+    #admin-mentor-table thead th {{
+      position: sticky;
+      top: var(--admin-header-offset, 80px);
+      z-index: 30;
+      background: #f9fafb;
+    }}
   </style>
 </head>
 <body class="min-h-screen font-sans text-gray-900 antialiased">
-  <header class="sticky top-0 z-40 border-b border-[#E5E5E5] bg-white/90 backdrop-blur">
-    <div class="mx-auto flex max-w-7xl items-center justify-between gap-3 px-4 py-4 sm:px-6 lg:px-8">
-      <a href="/admin" class="flex items-center gap-3" aria-label="BLT-Pool admin home">
+  <header data-admin-topbar class="sticky top-0 z-40 border-b border-[#E5E5E5] bg-white/90 backdrop-blur">
+    <div class="mx-auto flex w-full max-w-[98vw] items-center justify-between gap-3 px-4 py-4 sm:px-6 lg:px-8">
+      <a href="{self.admin_path}" class="flex items-center gap-3" aria-label="BLT-Pool admin home">
         <img src="/logo-sm.png" alt="OWASP BLT logo" class="h-10 w-10 rounded-xl border border-[#E5E5E5] bg-white object-contain p-1">
         <div>
           <p class="text-sm font-semibold uppercase tracking-wide text-gray-500">OWASP BLT</p>
@@ -360,13 +431,12 @@ class AdminService:
         </div>
       </a>
       <div class="flex items-center gap-3">
-        {user_chip}
-        {"<a href='/admin/logout' class='inline-flex items-center gap-2 rounded-md border border-[#E10101] px-4 py-2 text-sm font-semibold text-[#E10101] transition hover:bg-[#E10101] hover:text-white'><i class='fa-solid fa-right-from-bracket' aria-hidden='true'></i>Logout</a>" if user else ""}
+        {auth_chip}
       </div>
     </div>
   </header>
-  <main class="mx-auto w-full max-w-7xl px-4 py-10 sm:px-6 lg:px-8">
-    <section class="overflow-hidden rounded-3xl border border-[#E5E5E5] bg-white p-7 shadow-[0_14px_40px_rgba(225,1,1,0.10)] sm:p-10">
+  <main class="mx-auto w-full max-w-[98vw] px-4 py-8 sm:px-6 lg:px-8">
+    <section class="overflow-visible rounded-3xl border border-[#E5E5E5] bg-white p-5 shadow-[0_14px_40px_rgba(225,1,1,0.10)] sm:p-6 lg:p-7">
       <div class="mb-8">
         <span class="inline-flex items-center gap-2 rounded-full border border-[#E5E5E5] bg-gray-50 px-3 py-1 text-xs font-semibold text-gray-700">
           <i class="fa-solid fa-shield-halved text-[#E10101]" aria-hidden="true"></i>
@@ -407,6 +477,26 @@ class AdminService:
   </div>
   <script>
     (() => {{
+      const syncStickyHeaderOffset = () => {{
+        const headerEl = document.querySelector('[data-admin-topbar]');
+        const rect = headerEl ? headerEl.getBoundingClientRect() : null;
+        const navHeight = rect ? rect.height : 80;
+        const navTop = rect ? rect.top : 0;
+        const offsetPx = Math.max(0, Math.ceil(navHeight + navTop + 1));
+        document.documentElement.style.setProperty('--admin-header-offset', `${{offsetPx}}px`);
+      }};
+      syncStickyHeaderOffset();
+      requestAnimationFrame(syncStickyHeaderOffset);
+      window.addEventListener('resize', syncStickyHeaderOffset);
+      window.addEventListener('load', syncStickyHeaderOffset);
+      if (window.ResizeObserver) {{
+        const headerEl = document.querySelector('[data-admin-topbar]');
+        if (headerEl) {{
+          const headerResizeObserver = new ResizeObserver(() => syncStickyHeaderOffset());
+          headerResizeObserver.observe(headerEl);
+        }}
+      }}
+
       const overlay = document.getElementById('admin-confirm-overlay');
       const titleEl = document.getElementById('admin-confirm-title');
       const messageEl = document.getElementById('admin-confirm-message');
@@ -452,6 +542,31 @@ class AdminService:
         openDialog(button, form);
       }});
 
+      document.addEventListener('click', (event) => {{
+        const toggle = event.target.closest('button[data-editor-target]');
+        if (!toggle) {{
+          return;
+        }}
+        const targetId = toggle.dataset.editorTarget;
+        const panel = targetId ? document.getElementById(targetId) : null;
+        if (!panel) {{
+          return;
+        }}
+        const isHidden = panel.classList.contains('hidden');
+        document.querySelectorAll('[data-editor-row]').forEach((row) => {{
+          row.classList.add('hidden');
+        }});
+        document.querySelectorAll('button[data-editor-target]').forEach((btn) => {{
+          btn.dataset.expanded = 'false';
+          btn.innerHTML = '<i class="fa-solid fa-pen-to-square" aria-hidden="true"></i>Edit';
+        }});
+        if (isHidden) {{
+          panel.classList.remove('hidden');
+          toggle.dataset.expanded = 'true';
+          toggle.innerHTML = '<i class="fa-solid fa-chevron-up" aria-hidden="true"></i>Close';
+        }}
+      }});
+
       cancelBtn.addEventListener('click', closeDialog);
 
       confirmBtn.addEventListener('click', () => {{
@@ -476,125 +591,276 @@ class AdminService:
           closeDialog();
         }}
       }});
+
+      const autosaveTimers = new Map();
+
+      const markRowStatus = (row, status, text) => {{
+        const statusEl = row ? row.querySelector('[data-autosave-status]') : null;
+        if (!statusEl) {{
+          return;
+        }}
+        statusEl.dataset.state = status;
+        statusEl.textContent = text;
+        statusEl.classList.remove('text-gray-500', 'text-emerald-700', 'text-red-700');
+        if (status === 'saved') {{
+          statusEl.classList.add('text-emerald-700');
+        }} else if (status === 'error') {{
+          statusEl.classList.add('text-red-700');
+        }} else {{
+          statusEl.classList.add('text-gray-500');
+        }}
+      }};
+
+      const getFieldAutosaveValue = (field) => {{
+        if (!field) {{
+          return '';
+        }}
+        if (field.type === 'checkbox') {{
+          return field.checked ? '1' : '0';
+        }}
+        return (field.value || '').toString();
+      }};
+
+      const hasFieldChanged = (field) => {{
+        const currentValue = getFieldAutosaveValue(field);
+        if (!Object.prototype.hasOwnProperty.call(field.dataset, 'savedValue')) {{
+          field.dataset.savedValue = currentValue;
+          return false;
+        }}
+        return field.dataset.savedValue !== currentValue;
+      }};
+
+      const buildAutosaveParams = (field) => {{
+        const row = field.closest('tr[data-mentor-row]');
+        const form = field.form;
+        if (!row || !form) {{
+          return null;
+        }}
+        const originalField = form.querySelector('input[name="original_github_username"]');
+        if (!originalField || !originalField.value.trim()) {{
+          return null;
+        }}
+
+        const params = new URLSearchParams();
+        params.set('action', 'save');
+        params.set('original_github_username', originalField.value.trim());
+
+        const githubField = form.querySelector('[data-field="github_username"]');
+        params.set('github_username', githubField ? githubField.value.trim() : originalField.value.trim());
+
+        const key = field.dataset.field;
+        if (!key) {{
+          return null;
+        }}
+        if (field.type === 'checkbox') {{
+          params.set(key, field.checked ? '1' : '0');
+        }} else {{
+          params.set(key, field.value);
+        }}
+        return {{ row, form, params }};
+      }};
+
+      const queueAutosave = (field, delayMs) => {{
+        if (!hasFieldChanged(field)) {{
+          return;
+        }}
+        const payload = buildAutosaveParams(field);
+        if (!payload) {{
+          return;
+        }}
+        const {{ row, form, params }} = payload;
+        const configuredActionPath = {json.dumps(self.mentor_action_path)};
+        const currentPath = (window.location && window.location.pathname) ? window.location.pathname.replace(/\\/+$/, '') : '';
+        const actionCandidates = [];
+        if (form.action) {{
+          actionCandidates.push(form.action);
+        }}
+        if (configuredActionPath && !actionCandidates.includes(configuredActionPath)) {{
+          actionCandidates.push(configuredActionPath);
+        }}
+        if (currentPath) {{
+          const currentPathAction = `${{currentPath}}/mentors/action`;
+          if (!actionCandidates.includes(currentPathAction)) {{
+            actionCandidates.push(currentPathAction);
+          }}
+        }}
+        const timerKey = form.id || form.getAttribute('action') || Math.random().toString(16);
+        const existingTimer = autosaveTimers.get(timerKey);
+        if (existingTimer) {{
+          clearTimeout(existingTimer);
+        }}
+        markRowStatus(row, 'saving', 'Saving...');
+
+        const timer = setTimeout(async () => {{
+          try {{
+            let response = null;
+            for (const actionUrl of actionCandidates) {{
+              response = await fetch(actionUrl, {{
+                method: 'POST',
+                headers: {{
+                  'Content-Type': 'application/x-www-form-urlencoded;charset=UTF-8',
+                  'X-Admin-Autosave': '1',
+                }},
+                body: params.toString(),
+              }});
+              if (response.status !== 404) {{
+                break;
+              }}
+            }}
+            if (!response) {{
+              markRowStatus(row, 'error', 'Save failed');
+              return;
+            }}
+            if (!response.ok) {{
+              let errorCode = '';
+              try {{
+                const errorData = await response.json();
+                errorCode = (errorData && errorData.error) ? String(errorData.error) : '';
+              }} catch (_parseError) {{
+                errorCode = '';
+              }}
+              markRowStatus(row, 'error', errorCode ? `Save failed (${{errorCode}})` : 'Save failed');
+              return;
+            }}
+            const data = await response.json();
+            if (!data || data.ok !== true) {{
+              const errorCode = (data && data.error) ? String(data.error) : '';
+              markRowStatus(row, 'error', errorCode ? `Save failed (${{errorCode}})` : 'Save failed');
+              return;
+            }}
+
+            const nextUsername = (data.github_username || '').trim();
+            if (nextUsername) {{
+              const originalField = form.querySelector('input[name="original_github_username"]');
+              const githubField = form.querySelector('[data-field="github_username"]');
+              if (originalField) {{
+                originalField.value = nextUsername;
+              }}
+              if (githubField) {{
+                githubField.value = nextUsername;
+                githubField.dataset.savedValue = nextUsername;
+              }}
+              row.dataset.github_username = nextUsername.toLowerCase();
+            }}
+            if (field.dataset.field !== 'github_username') {{
+              field.dataset.savedValue = getFieldAutosaveValue(field);
+            }}
+            markRowStatus(row, 'saved', 'Saved');
+          }} catch (_error) {{
+            markRowStatus(row, 'error', 'Network error');
+          }} finally {{
+            autosaveTimers.delete(timerKey);
+          }}
+        }}, delayMs);
+
+        autosaveTimers.set(timerKey, timer);
+      }};
+
+      const assignmentCountFromValue = (value) => {{
+        const raw = (value || '').toString().trim();
+        if (!raw) {{
+          return 0;
+        }}
+        return raw.split(',').map((item) => item.trim()).filter((item) => item.length > 0).length;
+      }};
+
+      const updateAssignmentCountBadge = (row) => {{
+        if (!row) {{
+          return;
+        }}
+        const assignmentField = row.querySelector('[data-field="assignments"]');
+        const countBadge = row.querySelector('[data-assignment-count]');
+        if (!assignmentField || !countBadge) {{
+          return;
+        }}
+        const count = assignmentCountFromValue(assignmentField.value);
+        row.dataset.assignment_count = String(count);
+        countBadge.textContent = `${{count}} total`;
+      }};
+
+      document.querySelectorAll('tr[data-mentor-row]').forEach((row) => {{
+        updateAssignmentCountBadge(row);
+      }});
+
+      document.querySelectorAll('tr[data-mentor-row] [data-field]').forEach((field) => {{
+        field.dataset.savedValue = getFieldAutosaveValue(field);
+        const isToggle = field.type === 'checkbox';
+        field.addEventListener(isToggle ? 'change' : 'input', () => {{
+          queueAutosave(field, isToggle ? 0 : 320);
+          if (field.dataset.field === 'assignments') {{
+            updateAssignmentCountBadge(field.closest('tr[data-mentor-row]'));
+          }}
+        }});
+        field.addEventListener('blur', () => {{
+          queueAutosave(field, 0);
+          if (field.dataset.field === 'assignments') {{
+            updateAssignmentCountBadge(field.closest('tr[data-mentor-row]'));
+          }}
+        }});
+      }});
+
+      const getSortableValue = (row, key) => {{
+        if (key === 'assignments') {{
+          const assignmentField = row.querySelector('[data-field="assignments"]');
+          if (assignmentField) {{
+            return String(assignmentCountFromValue(assignmentField.value));
+          }}
+          return ((row.dataset.assignment_count || '0') + '').trim();
+        }}
+        if (key === 'actions') {{
+          const statusEl = row.querySelector('[data-autosave-status]');
+          return ((statusEl ? statusEl.textContent : '') || '').toString().trim().toLowerCase();
+        }}
+        const field = row.querySelector(`[data-field="${{key}}"]`);
+        if (field) {{
+          if (field.type === 'checkbox') {{
+            return field.checked ? '1' : '0';
+          }}
+          return (field.value || '').toString().trim().toLowerCase();
+        }}
+        return ((row.dataset[key] || '') + '').trim().toLowerCase();
+      }};
+
+      document.querySelectorAll('[data-sort-key]').forEach((button) => {{
+        button.addEventListener('click', () => {{
+          const table = button.closest('table');
+          const tbody = table ? table.querySelector('tbody') : null;
+          if (!tbody) {{
+            return;
+          }}
+          const key = button.dataset.sortKey;
+          const currentDirection = button.dataset.sortDirection === 'asc' ? 'asc' : 'desc';
+          const nextDirection = currentDirection === 'asc' ? 'desc' : 'asc';
+          document.querySelectorAll('[data-sort-key]').forEach((other) => {{
+            other.dataset.sortDirection = 'desc';
+            other.classList.remove('text-[#111827]');
+          }});
+          button.dataset.sortDirection = nextDirection;
+          button.classList.add('text-[#111827]');
+
+          const rows = Array.from(tbody.querySelectorAll('tr[data-mentor-row]'));
+          rows.sort((left, right) => {{
+            const leftValue = getSortableValue(left, key);
+            const rightValue = getSortableValue(right, key);
+            const leftNumber = Number(leftValue);
+            const rightNumber = Number(rightValue);
+            let result = 0;
+            if (!Number.isNaN(leftNumber) && !Number.isNaN(rightNumber) && leftValue !== '' && rightValue !== '') {{
+              result = leftNumber - rightNumber;
+            }} else {{
+              result = leftValue.localeCompare(rightValue);
+            }}
+            return nextDirection === 'asc' ? result : -result;
+          }});
+          rows.forEach((row) => tbody.appendChild(row));
+        }});
+      }});
     }})();
   </script>
 </body>
 </html>"""
 
-    def _auth_form(self, mode: str, error: str = "") -> str:
-        title = "Create the first admin" if mode == "signup" else "Admin login"
-        action = "/admin/signup" if mode == "signup" else "/admin/login"
-        submit = "Create admin" if mode == "signup" else "Login"
-        helper = (
-            "This route only works once. After the first admin is created, future visits go through login."
-            if mode == "signup"
-            else "Use the admin account created during first-time setup."
-        )
-        confirm_field = ""
-        if mode == "signup":
-            confirm_field = """
-            <div>
-              <label for="confirm_password" class="mb-1 block text-sm font-semibold text-gray-700">Confirm password</label>
-              <input id="confirm_password" name="confirm_password" type="password" required class="w-full rounded-md border border-gray-400 px-4 py-2 text-sm text-gray-900 focus:border-red-600 focus:ring-1 focus:ring-red-600 focus:outline-none">
-            </div>
-            """
-        error_html = ""
-        if error:
-            error_html = f"<p class='mb-4 rounded-lg border border-red-200 bg-red-50 px-4 py-3 text-sm font-medium text-red-700'>{_escape(error)}</p>"
-        content = f"""
-        <div class="mx-auto max-w-md">
-          <p class="mb-6 text-sm leading-relaxed text-gray-600">{helper}</p>
-          {error_html}
-          <form method="POST" action="{action}" class="space-y-4">
-            <div>
-              <label for="username" class="mb-1 block text-sm font-semibold text-gray-700">Username</label>
-              <input id="username" name="username" type="text" autocomplete="username" required class="w-full rounded-md border border-gray-400 px-4 py-2 text-sm text-gray-900 focus:border-red-600 focus:ring-1 focus:ring-red-600 focus:outline-none">
-            </div>
-            <div>
-              <label for="password" class="mb-1 block text-sm font-semibold text-gray-700">Password</label>
-              <input id="password" name="password" type="password" autocomplete="current-password" required class="w-full rounded-md border border-gray-400 px-4 py-2 text-sm text-gray-900 focus:border-red-600 focus:ring-1 focus:ring-red-600 focus:outline-none">
-            </div>
-            {confirm_field}
-            <button type="submit" class="inline-flex items-center gap-2 rounded-md bg-[#E10101] px-5 py-3 text-sm font-semibold text-white transition hover:bg-red-700 focus:outline-none focus:ring-2 focus:ring-red-600 focus:ring-offset-2">
-              <i class="fa-solid fa-lock" aria-hidden="true"></i>
-              {submit}
-            </button>
-          </form>
-        </div>
-        """
-        return self._shell(title, content, subtitle="Simple D1-backed admin auth for mentor management.")
-
-    async def _handle_signup_get(self, request):
-        if await self._has_admin():
-            current = await self._current_admin(request)
-            if current:
-                return self._redirect("/admin")
-            return self._redirect("/admin/login")
-        return self._html(self._auth_form("signup"))
-
-    async def _handle_signup_post(self, request):
-        if await self._has_admin():
-            return self._redirect("/admin/login")
-
-        form = await self._form_data(request)
-        username = form.get("username", "")
-        password = form.get("password", "")
-        confirm = form.get("confirm_password", "")
-
-        if not username or not password:
-            return self._html(self._auth_form("signup", "Username and password are required."), 400)
-        if not re.match(_ADMIN_USERNAME_RE, username):
-            return self._html(self._auth_form("signup", "Username must be 3-32 characters using letters, numbers, dot, underscore, or hyphen."), 400)
-        if len(password) < 8:
-            return self._html(self._auth_form("signup", "Password must be at least 8 characters."), 400)
-        if password != confirm:
-            return self._html(self._auth_form("signup", "Passwords do not match."), 400)
-
-        try:
-            await self._d1_run(
-                "INSERT INTO admin_users (id, username, password_hash, created_at) VALUES (1, ?, ?, ?)",
-                (username, _password_hash(password), int(time.time())),
-            )
-        except Exception as exc:
-            console.error(f"[AdminService] Failed to create first admin: {exc}")
-            return self._html(self._auth_form("signup", "Admin setup is already complete or the account could not be created."), 409)
-
-        token = await self._create_session(username)
-        return self._redirect("/admin", set_cookie=self._session_cookie(token))
-
-    async def _handle_login_get(self, request):
-        if not await self._has_admin():
-            return self._redirect("/admin/signup")
-        current = await self._current_admin(request)
-        if current:
-            return self._redirect("/admin")
-        return self._html(self._auth_form("login"))
-
-    async def _handle_login_post(self, request):
-        if not await self._has_admin():
-            return self._redirect("/admin/signup")
-
-        form = await self._form_data(request)
-        username = form.get("username", "")
-        password = form.get("password", "")
-        row = await self._d1_first("SELECT username, password_hash FROM admin_users WHERE id = 1")
-        if not row or row.get("username") != username or not _password_matches(password, row.get("password_hash", "")):
-            return self._html(self._auth_form("login", "Invalid username or password."), 401)
-
-        token = await self._create_session(username)
-        return self._redirect("/admin", set_cookie=self._session_cookie(token))
-
-    async def _handle_logout(self, request):
-        await self._delete_session(request)
-        return self._redirect("/admin/login", set_cookie=self._clear_session_cookie())
-
-    async def _handle_dashboard(self, request):
-        if not await self._has_admin():
-            return self._redirect("/admin/signup")
-        username = await self._current_admin(request)
-        if not username:
-            return self._redirect("/admin/login")
-
+    async def _handle_dashboard(self, username: str):
         mentors = await self._mentor_rows()
         counts = {
             "total": len(mentors),
@@ -606,12 +872,12 @@ class AdminService:
         mentor_rows = "\n".join(self._mentor_row_html(row) for row in mentors)
         if not mentor_rows:
             mentor_rows = (
-                "<tr><td colspan='8' class='px-4 py-6 text-center text-sm text-gray-500'>"
-                "No mentors found in D1 yet.</td></tr>"
+                "<div class='rounded-2xl border border-dashed border-[#E5E5E5] bg-gray-50 px-6 py-10 text-center text-sm text-gray-500'>"
+                "No mentors found in D1 yet.</div>"
             )
 
         content = f"""
-        <div class="grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
+        <div class="mx-auto max-w-6xl grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
           <article class="rounded-xl border border-[#E5E5E5] bg-gray-50 p-4">
             <p class="text-xs font-semibold uppercase tracking-wide text-gray-500">Total mentors</p>
             <p class="mt-1 text-2xl font-extrabold text-[#111827]">{counts['total']}</p>
@@ -625,34 +891,64 @@ class AdminService:
             <p class="mt-1 text-2xl font-extrabold text-[#111827]">{counts['inactive']}</p>
           </article>
           <article class="rounded-xl border border-[#E5E5E5] bg-gray-50 p-4">
-            <p class="text-xs font-semibold uppercase tracking-wide text-gray-500">Active assignments</p>
+            <p class="text-xs font-semibold uppercase tracking-wide text-gray-500">Total assignments</p>
             <p class="mt-1 text-2xl font-extrabold text-[#111827]">{counts['assignments']}</p>
           </article>
         </div>
 
-        <div class="mt-8 rounded-2xl border border-[#E5E5E5] bg-white">
+        <div class="mt-8 -mx-5 overflow-visible border-t border-[#E5E5E5] bg-white sm:-mx-6 lg:-mx-7">
           <div class="border-b border-[#E5E5E5] px-5 py-4">
             <h3 class="text-lg font-bold text-[#111827]">Mentor management</h3>
-            <p class="mt-1 text-sm text-gray-600">Publish, block, or delete mentors from the pool.</p>
+            <p class="mt-1 text-sm text-gray-600">Inline editable mentor grid with sortable columns.</p>
           </div>
-          <div class="overflow-x-auto">
-            <table class="min-w-full text-left text-sm">
-              <thead class="bg-gray-50 text-xs font-semibold uppercase tracking-wide text-gray-500">
+          <div class="relative overflow-x-auto overflow-y-visible">
+            <table id="admin-mentor-table" class="min-w-full text-left text-sm">
+              <thead class="bg-gray-50 text-[11px] font-semibold uppercase tracking-wide text-gray-500 shadow-sm">
                 <tr>
-                  <th class="px-4 py-3">Mentor</th>
-                  <th class="px-4 py-3">Status</th>
-                  <th class="px-4 py-3">Specialties</th>
-                  <th class="px-4 py-3">Cap</th>
-                  <th class="px-4 py-3">Timezone</th>
-                  <th class="px-4 py-3">Referral</th>
-                  <th class="px-4 py-3">Assignments</th>
-                  <th class="px-4 py-3">Actions</th>
+                  <th class="sticky z-30 bg-gray-50 px-3 py-3" style="top: var(--admin-header-offset, 80px)"><button type="button" data-sort-key="mentor" data-sort-direction="desc" class="inline-flex items-center gap-1">Mentor <i class="fa-solid fa-sort text-[10px]" aria-hidden="true"></i></button></th>
+                  <th class="sticky z-30 bg-gray-50 px-3 py-3" style="top: var(--admin-header-offset, 80px)"><button type="button" data-sort-key="name" data-sort-direction="desc" class="inline-flex items-center gap-1">Name <i class="fa-solid fa-sort text-[10px]" aria-hidden="true"></i></button></th>
+                  <th class="sticky z-30 bg-gray-50 px-3 py-3" style="top: var(--admin-header-offset, 80px)"><button type="button" data-sort-key="github_username" data-sort-direction="desc" class="inline-flex items-center gap-1">GitHub <i class="fa-solid fa-sort text-[10px]" aria-hidden="true"></i></button></th>
+                  <th class="sticky z-30 bg-gray-50 px-3 py-3" style="top: var(--admin-header-offset, 80px)"><button type="button" data-sort-key="active" data-sort-direction="desc" class="inline-flex items-center gap-1">Published <i class="fa-solid fa-sort text-[10px]" aria-hidden="true"></i></button></th>
+                  <th class="sticky z-30 bg-gray-50 px-3 py-3" style="top: var(--admin-header-offset, 80px)"><button type="button" data-sort-key="specialties" data-sort-direction="desc" class="inline-flex items-center gap-1">Specialties <i class="fa-solid fa-sort text-[10px]" aria-hidden="true"></i></button></th>
+                  <th class="sticky z-30 bg-gray-50 px-3 py-3" style="top: var(--admin-header-offset, 80px)"><button type="button" data-sort-key="max_mentees" data-sort-direction="desc" class="inline-flex items-center gap-1">Cap <i class="fa-solid fa-sort text-[10px]" aria-hidden="true"></i></button></th>
+                  <th class="sticky z-30 bg-gray-50 px-3 py-3" style="top: var(--admin-header-offset, 80px)"><button type="button" data-sort-key="timezone" data-sort-direction="desc" class="inline-flex items-center gap-1">Timezone <i class="fa-solid fa-sort text-[10px]" aria-hidden="true"></i></button></th>
+                  <th class="sticky z-30 bg-gray-50 px-3 py-3" style="top: var(--admin-header-offset, 80px)"><button type="button" data-sort-key="referred_by" data-sort-direction="desc" class="inline-flex items-center gap-1">Referral <i class="fa-solid fa-sort text-[10px]" aria-hidden="true"></i></button></th>
+                  <th class="sticky z-30 bg-gray-50 px-3 py-3" style="top: var(--admin-header-offset, 80px)"><button type="button" data-sort-key="slack_username" data-sort-direction="desc" class="inline-flex items-center gap-1">Slack <i class="fa-solid fa-sort text-[10px]" aria-hidden="true"></i></button></th>
+                  <th class="sticky z-30 bg-gray-50 px-3 py-3" style="top: var(--admin-header-offset, 80px)"><button type="button" data-sort-key="email" data-sort-direction="desc" class="inline-flex items-center gap-1">Email <i class="fa-solid fa-sort text-[10px]" aria-hidden="true"></i></button></th>
+                  <th class="sticky z-30 bg-gray-50 px-3 py-3" style="top: var(--admin-header-offset, 80px)"><button type="button" data-sort-key="assignments" data-sort-direction="desc" class="inline-flex items-center gap-1">Assignments (count) <i class="fa-solid fa-sort text-[10px]" aria-hidden="true"></i></button></th>
+                  <th class="sticky z-30 bg-gray-50 px-3 py-3 text-right" style="top: var(--admin-header-offset, 80px)"><button type="button" data-sort-key="actions" data-sort-direction="desc" class="inline-flex items-center gap-1">Actions <i class="fa-solid fa-sort text-[10px]" aria-hidden="true"></i></button></th>
                 </tr>
               </thead>
               <tbody class="divide-y divide-[#E5E5E5]">
                 {mentor_rows}
               </tbody>
             </table>
+          </div>
+
+          <div class="border-t border-[#E5E5E5] bg-gray-50/60 px-5 py-4">
+            <h3 class="text-sm font-bold uppercase tracking-wide text-[#111827]">Add mentor</h3>
+            <form method="POST" action="{self.mentor_action_path}" class="mt-3 grid gap-3 sm:grid-cols-2 lg:grid-cols-5 xl:grid-cols-10">
+              <input type="hidden" name="action" value="create">
+              <input name="name" required maxlength="100" placeholder="Name" class="rounded-md border border-gray-300 px-2.5 py-2 text-sm text-gray-800">
+              <input name="github_username" required maxlength="39" placeholder="GitHub username" class="rounded-md border border-gray-300 px-2.5 py-2 text-sm text-gray-800">
+              <input name="specialties" maxlength="300" placeholder="specialty1, specialty2" class="rounded-md border border-gray-300 px-2.5 py-2 text-sm text-gray-800">
+              <input name="max_mentees" type="number" min="1" max="10" value="3" class="rounded-md border border-gray-300 px-2.5 py-2 text-sm text-gray-800">
+              <input name="timezone" maxlength="60" placeholder="Timezone" class="rounded-md border border-gray-300 px-2.5 py-2 text-sm text-gray-800">
+              <input name="referred_by" maxlength="39" placeholder="Referral" class="rounded-md border border-gray-300 px-2.5 py-2 text-sm text-gray-800">
+              <input name="slack_username" maxlength="80" placeholder="Slack" class="rounded-md border border-gray-300 px-2.5 py-2 text-sm text-gray-800">
+              <input name="email" type="email" maxlength="255" placeholder="Email" class="rounded-md border border-gray-300 px-2.5 py-2 text-sm text-gray-800">
+              <input name="assignments" placeholder="repo#123, repo#456" class="rounded-md border border-gray-300 px-2.5 py-2 text-sm text-gray-800">
+              <div class="flex items-center justify-between gap-3 rounded-md border border-gray-300 bg-white px-3 py-2">
+                <label class="inline-flex items-center gap-2 text-xs font-semibold uppercase tracking-wide text-gray-600">
+                  <input name="active" type="checkbox" value="1" checked>
+                  Published
+                </label>
+                <button type="submit" class="inline-flex items-center gap-2 rounded-md bg-[#E10101] px-3 py-2 text-xs font-semibold text-white transition hover:bg-red-700">
+                  <i class="fa-solid fa-plus" aria-hidden="true"></i>
+                  Add mentor
+                </button>
+              </div>
+            </form>
           </div>
         </div>
         """
@@ -676,10 +972,15 @@ class AdminService:
                 m.active,
                 m.timezone,
                 m.referred_by,
+                m.email,
+                m.slack_username,
+                COALESCE(a.assignment_refs, '') AS assignment_refs,
                 COALESCE(a.assignment_count, 0) AS assignment_count
             FROM mentors m
             LEFT JOIN (
-                SELECT mentor_login, COUNT(*) AS assignment_count
+                SELECT mentor_login,
+                       COUNT(*) AS assignment_count,
+                       GROUP_CONCAT(issue_repo || '#' || issue_number, ', ') AS assignment_refs
                 FROM mentor_assignments
                 GROUP BY mentor_login
             ) a
@@ -701,54 +1002,48 @@ class AdminService:
         name = mentor.get("name", "")
         active = int(mentor.get("active") or 0) == 1
         specialties = mentor.get("specialties_list") or []
-        specialty_html = " ".join(
-            f'<span class="rounded bg-gray-100 px-1.5 py-0.5 text-xs text-gray-600">{_escape(str(item))}</span>'
-            for item in specialties
-        ) or '<span class="text-xs text-gray-400">-</span>'
-        badge = (
-            '<span class="inline-flex items-center rounded-full border border-emerald-200 bg-emerald-50 px-2 py-0.5 text-xs font-semibold text-emerald-700">Published</span>'
-            if active
-            else '<span class="inline-flex items-center rounded-full border border-gray-200 bg-gray-50 px-2 py-0.5 text-xs font-semibold text-gray-600">Blocked</span>'
-        )
-        primary_action = "block" if active else "publish"
-        primary_label = "Block" if active else "Publish"
-        primary_class = (
-            "border-gray-300 text-gray-700 hover:bg-gray-50"
-            if active
-            else "border-emerald-200 text-emerald-700 hover:bg-emerald-50"
-        )
+        specialties_value = ", ".join(str(item) for item in specialties)
+        email = mentor.get("email") or ""
+        slack_username = mentor.get("slack_username") or ""
+        assignment_refs = mentor.get("assignment_refs") or ""
+        assignment_count = int(mentor.get("assignment_count") or 0)
+        form_id = f"mentor-form-{username.lower().replace('_', '-')}"
         return f"""
-        <tr>
-          <td class="px-4 py-4">
-            <div class="flex items-center gap-3">
-              <img src="https://github.com/{_escape(username)}.png" alt="{_escape(name)}" class="h-9 w-9 rounded-full border border-[#E5E5E5] bg-white object-cover">
-              <div>
-                <p class="font-semibold text-[#111827]">{_escape(name)}</p>
-                <a href="https://github.com/{_escape(username)}" target="_blank" rel="noopener" class="text-xs text-red-600 hover:underline">@{_escape(username)}</a>
-              </div>
+        <tr data-mentor-row data-mentor="{_escape(name).lower()}" data-name="{_escape(name).lower()}" data-github_username="{_escape(username).lower()}" data-active="{1 if active else 0}" data-max_mentees="{int(mentor.get('max_mentees') or 3)}" data-assignment_count="{assignment_count}">
+          <td class="px-3 py-2">
+            <div class="flex items-center gap-2">
+              <a href="https://github.com/{_escape(username)}" target="_blank" rel="noopener noreferrer" aria-label="Open @{_escape(username)} on GitHub" class="inline-flex h-8 w-8 shrink-0 overflow-hidden rounded-full border border-[#E5E5E5] bg-white focus:outline-none focus-visible:ring-2 focus-visible:ring-[#E10101] focus-visible:ring-offset-2">
+                <img src="https://github.com/{_escape(username)}.png" alt="{_escape(name)}" class="h-full w-full shrink-0 object-cover transition hover:opacity-90">
+              </a>
+              <span data-autosave-status data-state="idle" class="inline-flex items-center rounded-full border border-gray-200 bg-gray-50 px-2 py-0.5 text-[11px] font-semibold text-gray-500">Idle</span>
+            </div>
+            <form id="{form_id}" method="POST" action="{self.mentor_action_path}">
+              <input type="hidden" name="action" value="save">
+              <input type="hidden" name="original_github_username" value="{_escape(username)}">
+            </form>
+          </td>
+          <td class="px-3 py-2"><input form="{form_id}" data-field="name" name="name" value="{_escape(name)}" class="w-40 rounded-md border border-gray-300 px-2.5 py-2 text-sm text-gray-800" maxlength="100" required></td>
+          <td class="px-3 py-2"><input form="{form_id}" data-field="github_username" name="github_username" value="{_escape(username)}" class="w-36 rounded-md border border-gray-300 px-2.5 py-2 text-sm text-gray-800" maxlength="39" required></td>
+          <td class="px-3 py-2 text-center">
+            <label class="inline-flex items-center justify-center">
+              <input form="{form_id}" data-field="active" name="active" type="checkbox" value="1" {'checked' if active else ''}>
+            </label>
+          </td>
+          <td class="px-3 py-2"><input form="{form_id}" data-field="specialties" name="specialties" value="{_escape(specialties_value)}" class="w-48 rounded-md border border-gray-300 px-2.5 py-2 text-sm text-gray-800" maxlength="300" placeholder="frontend, python"></td>
+          <td class="px-3 py-2"><input form="{form_id}" data-field="max_mentees" name="max_mentees" type="number" min="1" max="10" value="{int(mentor.get('max_mentees') or 3)}" class="w-20 rounded-md border border-gray-300 px-2.5 py-2 text-sm text-gray-800"></td>
+          <td class="px-3 py-2"><input form="{form_id}" data-field="timezone" name="timezone" value="{_escape(mentor.get('timezone') or '')}" class="w-28 rounded-md border border-gray-300 px-2.5 py-2 text-sm text-gray-800" maxlength="60"></td>
+          <td class="px-3 py-2"><input form="{form_id}" data-field="referred_by" name="referred_by" value="{_escape(mentor.get('referred_by') or '')}" class="w-28 rounded-md border border-gray-300 px-2.5 py-2 text-sm text-gray-800" maxlength="39"></td>
+          <td class="px-3 py-2"><input form="{form_id}" data-field="slack_username" name="slack_username" value="{_escape(slack_username)}" class="w-32 rounded-md border border-gray-300 px-2.5 py-2 text-sm text-gray-800" maxlength="80"></td>
+          <td class="px-3 py-2"><input form="{form_id}" data-field="email" name="email" type="email" value="{_escape(email)}" class="w-56 rounded-md border border-gray-300 px-2.5 py-2 text-sm text-gray-800" maxlength="255"></td>
+          <td class="px-3 py-2">
+            <div class="space-y-1">
+              <span data-assignment-count class="inline-flex items-center rounded-full border border-gray-200 bg-gray-50 px-2 py-0.5 text-[11px] font-semibold text-gray-600">{assignment_count} total</span>
+              <input form="{form_id}" data-field="assignments" name="assignments" value="{_escape(assignment_refs)}" class="w-48 rounded-md border border-gray-300 px-2.5 py-2 text-sm text-gray-800" placeholder="repo#123, repo#456">
             </div>
           </td>
-          <td class="px-4 py-4">{badge}</td>
-          <td class="px-4 py-4"><div class="flex flex-wrap gap-1">{specialty_html}</div></td>
-          <td class="px-4 py-4 text-gray-600">{int(mentor.get('max_mentees') or 3)}</td>
-          <td class="px-4 py-4 text-gray-600">{_escape(mentor.get('timezone') or '-')}</td>
-          <td class="px-4 py-4 text-gray-600">{_escape(mentor.get('referred_by') or '-')}</td>
-          <td class="px-4 py-4 text-gray-600">{int(mentor.get('assignment_count') or 0)}</td>
-          <td class="px-4 py-4">
-            <div class="flex flex-wrap gap-2">
-              <form method="POST" action="/admin/mentors/action">
-                <input type="hidden" name="github_username" value="{_escape(username)}">
-                <input type="hidden" name="action" value="{primary_action}">
-                <button
-                  type="submit"
-                  data-confirm-title="{('Block mentor?' if active else 'Publish mentor?')}"
-                  data-confirm-message="{('This will hide the mentor from the public mentor pool until you publish them again.' if active else 'This will make the mentor visible in the public mentor pool again.')}"
-                  data-confirm-cta="{('<i class=&quot;fa-solid fa-ban&quot; aria-hidden=&quot;true&quot;></i>Block mentor' if active else '<i class=&quot;fa-solid fa-bullhorn&quot; aria-hidden=&quot;true&quot;></i>Publish mentor')}"
-                  class="inline-flex items-center gap-1 rounded-md border px-3 py-2 text-xs font-semibold transition {primary_class}">
-                  {primary_label}
-                </button>
-              </form>
-              <form method="POST" action="/admin/mentors/action">
+          <td class="px-3 py-2">
+            <div class="flex items-center justify-end gap-2">
+              <form method="POST" action="{self.mentor_action_path}">
                 <input type="hidden" name="github_username" value="{_escape(username)}">
                 <input type="hidden" name="action" value="delete">
                 <button
@@ -756,7 +1051,8 @@ class AdminService:
                   data-confirm-title="Delete mentor?"
                   data-confirm-message="This permanently removes the mentor record and clears related assignments from the admin panel."
                   data-confirm-cta="<i class=&quot;fa-solid fa-trash&quot; aria-hidden=&quot;true&quot;></i>Delete mentor"
-                  class="inline-flex items-center gap-1 rounded-md border border-red-200 px-3 py-2 text-xs font-semibold text-red-700 transition hover:bg-red-50">
+                  class="inline-flex items-center gap-1 rounded-md border border-red-200 px-2.5 py-2 text-xs font-semibold text-red-700 transition hover:bg-red-50">
+                  <i class="fa-solid fa-trash" aria-hidden="true"></i>
                   Delete
                 </button>
               </form>
@@ -765,24 +1061,263 @@ class AdminService:
         </tr>
         """
 
-    async def _handle_mentor_action(self, request):
-        if not await self._current_admin(request):
-            return self._redirect("/admin/login")
+    async def _handle_mentor_action(self, request, username: str):
+        if not username:
+            return self._basic_auth_challenge()
 
         form = await self._form_data(request)
         github_username = (form.get("github_username") or "").strip().lstrip("@")
         action = (form.get("action") or "").strip().lower()
-        if not github_username or action not in {"publish", "block", "delete"}:
-            return self._redirect("/admin")
+        autosave = self._is_autosave_request(request)
+        if action not in {"save", "delete", "create"}:
+            if autosave:
+                return self._json({"ok": False, "error": "invalid_action"}, 400)
+            return self._redirect(self.admin_path)
 
         try:
-            if action == "publish":
-                await self._d1_run("UPDATE mentors SET active = 1 WHERE github_username = ?", (github_username,))
-            elif action == "block":
-                await self._d1_run("UPDATE mentors SET active = 0 WHERE github_username = ?", (github_username,))
+            if action == "create":
+              name = (form.get("name") or "").strip()
+              new_github_username = (form.get("github_username") or "").strip().lstrip("@")
+              specialties_raw = (form.get("specialties") or "").strip()
+              timezone = (form.get("timezone") or "").strip()
+              referred_by = (form.get("referred_by") or "").strip().lstrip("@")
+              email = (form.get("email") or "").strip().lower()
+              slack_username = (form.get("slack_username") or "").strip().lstrip("@")
+              assignments_value = (form.get("assignments") or "").strip()
+              active = 1 if (form.get("active") or "") == "1" else 0
+
+              if not name:
+                if autosave:
+                  return self._json({"ok": False, "error": "name_required"}, 400)
+                return self._redirect(self.admin_path)
+              if not _GH_USERNAME_RE.match(new_github_username):
+                if autosave:
+                  return self._json({"ok": False, "error": "invalid_github_username"}, 400)
+                return self._redirect(self.admin_path)
+              if referred_by and not _GH_USERNAME_RE.match(referred_by):
+                if autosave:
+                  return self._json({"ok": False, "error": "invalid_referred_by"}, 400)
+                return self._redirect(self.admin_path)
+              if email and not _EMAIL_RE.match(email):
+                if autosave:
+                  return self._json({"ok": False, "error": "invalid_email"}, 400)
+                return self._redirect(self.admin_path)
+              if slack_username and not _SLACK_USERNAME_RE.match(slack_username):
+                if autosave:
+                  return self._json({"ok": False, "error": "invalid_slack_username"}, 400)
+                return self._redirect(self.admin_path)
+              if assignments_value and self._parse_assignment_refs(assignments_value) is None:
+                if autosave:
+                  return self._json({"ok": False, "error": "invalid_assignments"}, 400)
+                return self._redirect(self.admin_path)
+
+              existing = await self._d1_first(
+                "SELECT github_username FROM mentors WHERE github_username = ?",
+                (new_github_username,),
+              )
+              if existing:
+                if autosave:
+                  return self._json({"ok": False, "error": "mentor_exists"}, 409)
+                return self._redirect(self.admin_path)
+
+              specialties_list = [
+                item.strip().lower()
+                for item in specialties_raw.split(",")
+                if item.strip()
+              ]
+              try:
+                max_mentees = int(form.get("max_mentees") or 3)
+              except Exception:
+                max_mentees = 3
+              max_mentees = max(1, min(10, max_mentees))
+
+              await self._d1_run(
+                """
+                INSERT INTO mentors (
+                  github_username,
+                  name,
+                  specialties,
+                  max_mentees,
+                  active,
+                  timezone,
+                  referred_by,
+                  email,
+                  slack_username
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                  new_github_username,
+                  name,
+                  json.dumps(specialties_list),
+                  max_mentees,
+                  active,
+                  timezone,
+                  referred_by,
+                  email,
+                  slack_username,
+                ),
+              )
+
+              if assignments_value:
+                if not await self._sync_assignments(new_github_username, new_github_username, assignments_value):
+                  if autosave:
+                    return self._json({"ok": False, "error": "assignment_sync_failed"}, 400)
+                  return self._redirect(self.admin_path)
+
+              if autosave:
+                return self._json({"ok": True, "github_username": new_github_username})
+
+            elif action == "save":
+                original_github_username = (form.get("original_github_username") or "").strip().lstrip("@")
+                if not original_github_username:
+                    if autosave:
+                        return self._json({"ok": False, "error": "missing_original_github_username"}, 400)
+                    return self._redirect(self.admin_path)
+
+                existing = await self._d1_first(
+                    """
+                    SELECT github_username, name, specialties, max_mentees, active, timezone, referred_by, email, slack_username
+                    FROM mentors
+                    WHERE github_username = ?
+                    """,
+                    (original_github_username,),
+                )
+                if not existing:
+                    if autosave:
+                        return self._json({"ok": False, "error": "mentor_not_found"}, 404)
+                    return self._redirect(self.admin_path)
+
+                try:
+                    existing_specialties = json.loads(existing.get("specialties") or "[]")
+                except Exception:
+                    existing_specialties = []
+
+                new_github_username = (
+                    (form.get("github_username") if "github_username" in form else existing.get("github_username") or "")
+                    .strip()
+                    .lstrip("@")
+                )
+                name = (form.get("name") if "name" in form else existing.get("name") or "").strip()
+                specialties_raw = (
+                    form.get("specialties")
+                    if "specialties" in form
+                    else ", ".join(str(item) for item in existing_specialties)
+                ).strip()
+                timezone = (form.get("timezone") if "timezone" in form else existing.get("timezone") or "").strip()
+                referred_by = (
+                    (form.get("referred_by") if "referred_by" in form else existing.get("referred_by") or "")
+                    .strip()
+                    .lstrip("@")
+                )
+                email = (form.get("email") if "email" in form else existing.get("email") or "").strip().lower()
+                slack_username = (
+                    (form.get("slack_username") if "slack_username" in form else existing.get("slack_username") or "")
+                    .strip()
+                    .lstrip("@")
+                )
+                assignments_value = (form.get("assignments") if "assignments" in form else "").strip()
+                if "active" in form:
+                    active = 1 if (form.get("active") or "") == "1" else 0
+                else:
+                    active = 1 if int(existing.get("active") or 0) == 1 else 0
+
+                validate_name = (not autosave) or ("name" in form)
+                validate_github_username = (not autosave) or ("github_username" in form)
+                validate_referred_by = (not autosave) or ("referred_by" in form)
+                validate_email = (not autosave) or ("email" in form)
+                validate_slack_username = (not autosave) or ("slack_username" in form)
+
+                if validate_name and not name:
+                  if autosave:
+                    return self._json({"ok": False, "error": "name_required"}, 400)
+                  return self._redirect(self.admin_path)
+                if validate_github_username and not _GH_USERNAME_RE.match(new_github_username):
+                  if autosave:
+                    return self._json({"ok": False, "error": "invalid_github_username"}, 400)
+                  return self._redirect(self.admin_path)
+                if validate_referred_by and referred_by and not _GH_USERNAME_RE.match(referred_by):
+                  if autosave:
+                    return self._json({"ok": False, "error": "invalid_referred_by"}, 400)
+                  return self._redirect(self.admin_path)
+                if validate_email and email and not _EMAIL_RE.match(email):
+                  if autosave:
+                    return self._json({"ok": False, "error": "invalid_email"}, 400)
+                  return self._redirect(self.admin_path)
+                if validate_slack_username and slack_username and not _SLACK_USERNAME_RE.match(slack_username):
+                  if autosave:
+                    return self._json({"ok": False, "error": "invalid_slack_username"}, 400)
+                  return self._redirect(self.admin_path)
+                if "assignments" in form and self._parse_assignment_refs(assignments_value) is None:
+                    if autosave:
+                        return self._json({"ok": False, "error": "invalid_assignments"}, 400)
+                    return self._redirect(self.admin_path)
+
+                specialties_list = [
+                    item.strip().lower()
+                    for item in specialties_raw.split(",")
+                    if item.strip()
+                ]
+                try:
+                    max_mentees = int(
+                        form.get("max_mentees") if "max_mentees" in form else existing.get("max_mentees") or 3
+                    )
+                except Exception:
+                    max_mentees = 3
+                max_mentees = max(1, min(10, max_mentees))
+
+                await self._d1_run(
+                    """
+                    UPDATE mentors
+                    SET github_username = ?,
+                        name = ?,
+                        specialties = ?,
+                        max_mentees = ?,
+                        active = ?,
+                        timezone = ?,
+                        referred_by = ?,
+                        email = ?,
+                        slack_username = ?
+                    WHERE github_username = ?
+                    """,
+                    (
+                        new_github_username,
+                        name,
+                        json.dumps(specialties_list),
+                        max_mentees,
+                        active,
+                        timezone,
+                        referred_by,
+                        email,
+                        slack_username,
+                        original_github_username,
+                    ),
+                )
+                if new_github_username != original_github_username:
+                    await self._d1_run(
+                        "UPDATE mentor_assignments SET mentor_login = ? WHERE mentor_login = ?",
+                        (new_github_username, original_github_username),
+                    )
+                if "assignments" in form:
+                    if not await self._sync_assignments(original_github_username, new_github_username, assignments_value):
+                        if autosave:
+                            return self._json({"ok": False, "error": "assignment_sync_failed"}, 400)
+                        return self._redirect(self.admin_path)
+
+                if autosave:
+                    return self._json({"ok": True, "github_username": new_github_username})
             else:
+                if not github_username:
+                    if autosave:
+                        return self._json({"ok": False, "error": "missing_github_username"}, 400)
+                    return self._redirect(self.admin_path)
                 await self._d1_run("DELETE FROM mentor_assignments WHERE mentor_login = ?", (github_username,))
                 await self._d1_run("DELETE FROM mentors WHERE github_username = ?", (github_username,))
+                if autosave:
+                    return self._json({"ok": True})
         except Exception as exc:
             console.error(f"[AdminService] Mentor action '{action}' failed for {github_username}: {exc}")
-        return self._redirect("/admin")
+            if autosave:
+                return self._json({"ok": False, "error": "internal_error"}, 500)
+
+        return self._redirect(self.admin_path)

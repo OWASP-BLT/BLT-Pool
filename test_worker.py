@@ -446,20 +446,109 @@ class TestHandleUnassign(unittest.TestCase):
         self.assertTrue(any("not currently assigned" in c for c in comments))
 
 
+class TestGetLastAssignRequester(unittest.TestCase):
+    """_get_last_assign_requester — finds the last human /assign commenter"""
+
+    def _run(self, api_pages, *, expected):
+        """Helper: pages is a list of comment lists returned page by page.
+        Each entry in api_pages is the list of comment dicts for that page.
+        """
+        page_index = [0]
+
+        async def _fake_api(method, path, token, body=None):
+            idx = page_index[0]
+            page_index[0] += 1
+            mock = MagicMock()
+            mock.status = 200
+            if idx < len(api_pages):
+                mock.text = AsyncMock(return_value=json.dumps(api_pages[idx]))
+            else:
+                mock.text = AsyncMock(return_value=json.dumps([]))
+            return mock
+
+        async def _inner():
+            with patch.object(_worker, "github_api", new=AsyncMock(side_effect=_fake_api)):
+                return await _worker._get_last_assign_requester("owner", "repo", 1, "tok")
+
+        result = _run(_inner())
+        self.assertEqual(result, expected)
+
+    def test_returns_login_of_last_assign_commenter(self):
+        comments = [
+            {"user": {"login": "bob", "type": "User"}, "body": "/assign"},
+        ]
+        self._run([comments], expected="bob")
+
+    def test_returns_first_match_on_descending_page(self):
+        # Comments are returned newest-first; the first /assign found is the latest one.
+        comments = [
+            {"user": {"login": "charlie", "type": "User"}, "body": "/assign"},
+            {"user": {"login": "alice", "type": "User"}, "body": "/assign"},
+        ]
+        self._run([comments], expected="charlie")
+
+    def test_skips_bot_comments(self):
+        comments = [
+            {"user": {"login": "some-bot[bot]", "type": "Bot"}, "body": "/assign"},
+            {"user": {"login": "alice", "type": "User"}, "body": "/assign"},
+        ]
+        self._run([comments], expected="alice")
+
+    def test_skips_non_assign_comments(self):
+        comments = [
+            {"user": {"login": "alice", "type": "User"}, "body": "Just a comment"},
+            {"user": {"login": "bob", "type": "User"}, "body": "/assign"},
+        ]
+        self._run([comments], expected="bob")
+
+    def test_returns_none_when_no_assign_comment(self):
+        comments = [
+            {"user": {"login": "alice", "type": "User"}, "body": "Just a comment"},
+        ]
+        self._run([comments], expected=None)
+
+    def test_returns_none_for_empty_comment_list(self):
+        self._run([[]], expected=None)
+
+    def test_paginates_until_assign_found(self):
+        # First page has 100 comments with no /assign; second page has one.
+        page1 = [
+            {"user": {"login": f"user{i}", "type": "User"}, "body": "hello"}
+            for i in range(100)
+        ]
+        page2 = [
+            {"user": {"login": "lateuser", "type": "User"}, "body": "/assign"},
+        ]
+        self._run([page1, page2], expected="lateuser")
+
+    def test_returns_none_on_api_error(self):
+        async def _fail_api(*a, **kw):
+            mock = MagicMock()
+            mock.status = 500
+            return mock
+
+        async def _inner():
+            with patch.object(_worker, "github_api", new=AsyncMock(side_effect=_fail_api)):
+                return await _worker._get_last_assign_requester("owner", "repo", 1, "tok")
+
+        self.assertIsNone(_run(_inner()))
+
+
 class TestHandleApprove(unittest.TestCase):
     """_approve — triage reviewer approves an issue for assignment"""
 
-    def _run_approve(self, payload, comments, github_calls, *, commenter="donnieblt"):
+    def _run_approve(self, payload, comments, github_calls, *, commenter="donnieblt", last_requester=None):
         async def _inner():
             with patch.object(_worker, "create_comment", new=AsyncMock(side_effect=lambda o, r, n, b, t: comments.append(b))):
                 with patch.object(_worker, "github_api", new=AsyncMock(side_effect=lambda *a, **kw: github_calls.append(a))):
-                    await _worker._approve(
-                        payload["repository"]["owner"]["login"],
-                        payload["repository"]["name"],
-                        payload["issue"],
-                        commenter,
-                        "tok",
-                    )
+                    with patch.object(_worker, "_get_last_assign_requester", new=AsyncMock(return_value=last_requester)):
+                        await _worker._approve(
+                            payload["repository"]["owner"]["login"],
+                            payload["repository"]["name"],
+                            payload["issue"],
+                            commenter,
+                            "tok",
+                        )
         _run(_inner())
 
     def test_approve_adds_help_wanted_label_and_assigns_opener(self):
@@ -477,6 +566,21 @@ class TestHandleApprove(unittest.TestCase):
             for method, path, *_ in calls
         ))
         self.assertTrue(any("approved" in c for c in comments))
+
+    def test_approve_assigns_last_assign_requester_over_opener(self):
+        # When someone already said /assign before the approve, they should be
+        # assigned instead of the issue opener.
+        payload = _make_issue_payload(issue_user={"login": "alice", "type": "User"})
+        comments, calls = [], []
+        self._run_approve(payload, comments, calls, last_requester="bob")
+        # bob (last requester) should be assigned, not alice (opener)
+        assign_calls = [
+            body for method, path, _tok, body in calls
+            if method == "POST" and "assignees" in path
+        ]
+        self.assertTrue(any("bob" in body.get("assignees", []) for body in assign_calls))
+        self.assertFalse(any("alice" in body.get("assignees", []) for body in assign_calls))
+        self.assertTrue(any("@bob" in c and "assigned" in c for c in comments))
 
     def test_approve_rejected_for_non_reviewer(self):
         payload = _make_issue_payload()
@@ -503,7 +607,7 @@ class TestHandleApprove(unittest.TestCase):
             method == "POST" and "labels" in path
             for method, path, *_ in calls
         ))
-        # No assignees POST since opener is unknown
+        # No assignees POST since opener is unknown and no prior /assign
         self.assertFalse(any(
             method == "POST" and "assignees" in path
             for method, path, *_ in calls
@@ -2169,13 +2273,14 @@ class TestTrackingOperations(unittest.TestCase):
         mock_db = MagicMock()
         mock_stmt = AsyncMock()
         mock_stmt.bind = MagicMock(return_value=mock_stmt)
-        mock_stmt.run = AsyncMock(return_value={"success": True})
+        mock_stmt.run = AsyncMock(return_value={"meta": {"changes": 1}})
         mock_db.prepare.return_value = mock_stmt
         
         env = types.SimpleNamespace(LEADERBOARD_DB=mock_db)
         payload = {
             "repository": {"owner": {"login": "OWASP-BLT"}},
             "comment": {
+                "id": 98765,
                 "user": {"login": "alice", "type": "User"},
                 "body": "Great work!",
                 "created_at": "2024-03-05T12:00:00Z",
@@ -2187,6 +2292,96 @@ class TestTrackingOperations(unittest.TestCase):
         
         # Should have called prepare for monthly increment
         self.assertGreater(mock_db.prepare.call_count, 0)
+
+    async def _test_track_comment_redelivery_no_double_increment(self):
+        """Webhook redelivery with the same comment_id must NOT produce a second increment.
+
+        Delivery 1: INSERT reports changes=1  → _d1_inc_monthly is called once.
+        Delivery 2: INSERT reports changes=0  → function exits early; no second increment.
+        """
+        payload = {
+            "repository": {"owner": {"login": "OWASP-BLT"}},
+            "comment": {
+                "id": 11111,
+                "user": {"login": "alice", "type": "User"},
+                "body": "Great work!",
+                "created_at": "2024-03-05T12:00:00Z",
+            },
+        }
+        # First delivery inserts a new row; second delivery hits the ON CONFLICT guard.
+        d1_run_mock = AsyncMock(side_effect=[
+            {"meta": {"changes": 1}},   # delivery 1 — INSERT succeeds
+            {"meta": {"changes": 0}},   # delivery 2 — INSERT ignored (duplicate)
+        ])
+        inc_mock = AsyncMock()
+
+        with patch.object(_worker, "_ensure_leaderboard_schema", new=AsyncMock()):
+            with patch.object(_worker, "_d1_run", new=d1_run_mock):
+                with patch.object(_worker, "_d1_inc_monthly", new=inc_mock):
+                    with patch.object(_worker, "console",
+                                      new=types.SimpleNamespace(log=lambda x: None,
+                                                                 error=lambda x: None)):
+                        env = types.SimpleNamespace(LEADERBOARD_DB=object())
+                        await _worker._track_comment_in_d1(payload, env)   # delivery 1
+                        await _worker._track_comment_in_d1(payload, env)   # simulated redelivery
+
+        # Despite two deliveries, the counter must only increment once.
+        self.assertEqual(inc_mock.await_count, 1)
+
+    def test_track_comment_redelivery_no_double_increment(self):
+        _run(self._test_track_comment_redelivery_no_double_increment())
+
+    async def _test_track_comment_inc_monthly_failure_then_retry_succeeds(self):
+        """When _d1_inc_monthly raises, the compensation DELETE unblocks the next delivery.
+
+        Delivery 1: INSERT succeeds → _d1_inc_monthly raises
+                    → compensation DELETE restores the row → exception re-raised.
+        Delivery 2: INSERT succeeds again (row was deleted) → _d1_inc_monthly succeeds.
+
+        Net result: exactly one successful increment despite the transient failure.
+        """
+        payload = {
+            "repository": {"owner": {"login": "OWASP-BLT"}},
+            "comment": {
+                "id": 22222,
+                "user": {"login": "bob", "type": "User"},
+                "body": "Nice fix!",
+                "created_at": "2024-04-01T10:00:00Z",
+            },
+        }
+        # _d1_run call order across both deliveries:
+        #   call 1 — delivery 1 INSERT (changes=1)
+        #   call 2 — compensation DELETE after _d1_inc_monthly raises
+        #   call 3 — delivery 2 INSERT (changes=1, since row was deleted)
+        d1_run_mock = AsyncMock(side_effect=[
+            {"meta": {"changes": 1}},   # delivery 1 INSERT
+            {"meta": {"changes": 1}},   # compensation DELETE
+            {"meta": {"changes": 1}},   # delivery 2 INSERT
+        ])
+        inc_mock = AsyncMock(side_effect=[Exception("transient DB error"), None])
+
+        with patch.object(_worker, "_ensure_leaderboard_schema", new=AsyncMock()):
+            with patch.object(_worker, "_d1_run", new=d1_run_mock):
+                with patch.object(_worker, "_d1_inc_monthly", new=inc_mock):
+                    with patch.object(_worker, "console",
+                                      new=types.SimpleNamespace(log=lambda x: None,
+                                                                 error=lambda x: None)):
+                        env = types.SimpleNamespace(LEADERBOARD_DB=object())
+
+                        # Delivery 1 — _d1_inc_monthly raises; compensation DELETE must run.
+                        with self.assertRaises(Exception, msg="transient DB error"):
+                            await _worker._track_comment_in_d1(payload, env)
+
+                        # Delivery 2 (simulated redelivery) — must succeed end-to-end.
+                        await _worker._track_comment_in_d1(payload, env)
+
+        # Two _d1_inc_monthly calls: one failing, one succeeding.
+        self.assertEqual(inc_mock.await_count, 2)
+        # Three _d1_run calls: INSERT → compensation DELETE → INSERT.
+        self.assertEqual(d1_run_mock.await_count, 3)
+
+    def test_track_comment_inc_monthly_failure_then_retry_succeeds(self):
+        _run(self._test_track_comment_inc_monthly_failure_then_retry_succeeds())
 
     async def _test_track_comment_ignores_commands(self):
         """Slash commands should not be counted as comment leaderboard activity."""
@@ -2268,6 +2463,68 @@ class TestTrackingOperations(unittest.TestCase):
     def test_track_pr_reopened_idempotent_when_already_open(self):
         _run(self._test_track_pr_reopened_idempotent_when_already_open())
 
+class TestHandleIssueCommentCtxDefer(unittest.TestCase):
+    """handle_issue_comment — referral deferral: ctx=None (inline) and ctx provided (waitUntil)."""
+
+    def _make_referral_payload(self):
+        """Payload with a non-command body and an explicit comment id."""
+        payload = _make_issue_payload(comment_body="Hey `@carol` great contribution!")
+        payload["comment"]["id"] = 77777
+        return payload
+
+    async def _test_ctx_none_awaits_referral_inline(self):
+        """When ctx=None, _process_referral_mentions is awaited directly before returning.
+
+        This is the local-test / non-Cloudflare fallback path.
+        """
+        payload = self._make_referral_payload()
+        env = types.SimpleNamespace(LEADERBOARD_DB=object())
+        referral_mock = AsyncMock()
+
+        with patch.object(_worker, "_track_comment_in_d1", new=AsyncMock()):
+            with patch.object(_worker, "_process_referral_mentions", new=referral_mock):
+                with patch.object(_worker, "console",
+                                  new=types.SimpleNamespace(log=lambda x: None,
+                                                             error=lambda x: None)):
+                    # Explicit ctx=None — must fall through to the inline await branch.
+                    await _worker.handle_issue_comment(payload, "tok", env=env, ctx=None)
+
+        # Referral processing must have been awaited synchronously.
+        referral_mock.assert_awaited_once()
+
+    async def _test_ctx_provided_schedules_waituntil(self):
+        """When ctx is provided, _process_referral_mentions is handed to ctx.waitUntil().
+
+        The referral coroutine must NOT have been awaited during the handler call itself —
+        it runs post-response in the Cloudflare Workers runtime.
+        """
+        payload = self._make_referral_payload()
+        env = types.SimpleNamespace(LEADERBOARD_DB=object())
+        referral_mock = AsyncMock()
+
+        wait_until_calls = []
+        mock_ctx = types.SimpleNamespace(
+            waitUntil=lambda coro: wait_until_calls.append(coro)
+        )
+
+        with patch.object(_worker, "_track_comment_in_d1", new=AsyncMock()):
+            with patch.object(_worker, "_process_referral_mentions", new=referral_mock):
+                with patch.object(_worker, "console",
+                                  new=types.SimpleNamespace(log=lambda x: None,
+                                                             error=lambda x: None)):
+                    await _worker.handle_issue_comment(payload, "tok", env=env, ctx=mock_ctx)
+
+        # ctx.waitUntil must have been called exactly once …
+        self.assertEqual(len(wait_until_calls), 1,
+                         "ctx.waitUntil should be called once for the deferred referral coroutine")
+        # … and the referral mock must NOT have been awaited yet (deferred to post-response).
+        referral_mock.assert_not_awaited()
+
+    def test_ctx_none_awaits_referral_inline(self):
+        _run(self._test_ctx_none_awaits_referral_inline())
+
+    def test_ctx_provided_schedules_waituntil(self):
+        _run(self._test_ctx_provided_schedules_waituntil())
 
 # ---------------------------------------------------------------------------
 # Backfill double-counting prevention tests
@@ -5499,12 +5756,12 @@ class TestGenerateMentorRow(unittest.TestCase):
         self.assertIn("42", html)
         self.assertIn("7", html)
         self.assertIn("PRs", html)
-        self.assertIn("Reviews", html)
+        self.assertIn("reviews", html)
 
     def test_stats_not_shown_when_none(self):
         html = _worker._generate_mentor_row(self._make_mentor(), stats=None)
         # Should not contain PR/review stat headings when stats are absent
-        self.assertNotIn("Reviews", html)
+        self.assertNotIn("reviews", html)
         self.assertNotIn("PRs", html)
 
     def test_stats_zero_values_shown(self):
@@ -5513,7 +5770,7 @@ class TestGenerateMentorRow(unittest.TestCase):
         )
         # Zero stats are still displayed when the stats dict is provided
         self.assertIn("PRs", html)
-        self.assertIn("Reviews", html)
+        self.assertIn("reviews", html)
 
 
 class TestIndexHtml(unittest.TestCase):
@@ -5567,7 +5824,7 @@ class TestIndexHtml(unittest.TestCase):
         mentors = [{"name": "Alice", "github_username": "alice", "active": True, "status": "available"}]
         html = _worker._index_html(mentors, mentor_stats={})
         # Stats headings should not appear when no stats are provided
-        self.assertNotIn("Reviews", html)
+        self.assertNotIn("reviews", html)
 
     def test_active_assignments_section_shown(self):
         """Active assignments section appears when assignments are provided."""
@@ -6024,6 +6281,384 @@ class TestTimeAgo(unittest.TestCase):
         result = self._ago(86400 * 400)
         self.assertIn("year", result)
 
+
+# ---------------------------------------------------------------------------
+# Contributor Referral System tests
+# ---------------------------------------------------------------------------
+
+class TestExtractMentions(unittest.TestCase):
+    """_extract_mentions — parse @usernames from comment bodies."""
+
+    def test_single_mention(self):
+        result = _worker._extract_mentions("Hey @alice, can you look at this?")
+        self.assertEqual(result, ["alice"])
+
+    def test_multiple_mentions(self):
+        result = _worker._extract_mentions("@alice and @bob should review.")
+        self.assertEqual(result, ["alice", "bob"])
+
+    def test_deduplicates(self):
+        result = _worker._extract_mentions("@alice is great, thanks @alice!")
+        self.assertEqual(result, ["alice"])
+
+    def test_lowercases(self):
+        result = _worker._extract_mentions("Hello @Alice")
+        self.assertEqual(result, ["alice"])
+
+    def test_empty_body(self):
+        result = _worker._extract_mentions("")
+        self.assertEqual(result, [])
+
+    def test_no_mentions(self):
+        result = _worker._extract_mentions("No mentions here.")
+        self.assertEqual(result, [])
+
+    def test_ignores_email_addresses(self):
+        # email addresses should not be captured as mentions
+        result = _worker._extract_mentions("Contact user@example.com for help.")
+        self.assertEqual(result, [])
+
+    def test_valid_username_with_hyphens(self):
+        result = _worker._extract_mentions("Thanks @jane-doe for the PR!")
+        self.assertEqual(result, ["jane-doe"])
+
+
+class TestUserHasPriorActivity(unittest.TestCase):
+    """_user_has_prior_activity — fail-closed behavior on GitHub API errors."""
+
+    def _make_resp(self, status, body="{}"):
+        r = MagicMock()
+        r.status = status
+        r.text = AsyncMock(return_value=body)
+        return r
+
+    def test_returns_false_when_no_activity(self):
+        """Returns False when both search calls return empty results."""
+        async def _inner():
+            with patch.object(_worker, "github_api", new=AsyncMock(
+                return_value=self._make_resp(200, '{"total_count": 0, "items": []}')
+            )):
+                return await _worker._user_has_prior_activity("acme", "newbie", "tok")
+        self.assertFalse(_run(_inner()))
+
+    def test_returns_true_when_author_has_issues(self):
+        """Returns True when the first search finds authored issues/PRs."""
+        async def _inner():
+            with patch.object(_worker, "github_api", new=AsyncMock(
+                return_value=self._make_resp(200, '{"total_count": 1, "items": [{}]}')
+            )):
+                return await _worker._user_has_prior_activity("acme", "veteran", "tok")
+        self.assertTrue(_run(_inner()))
+
+    def test_fails_closed_on_403_first_call(self):
+        """A 403 on the first search call returns True (fail closed)."""
+        responses = [self._make_resp(403)]
+
+        async def _inner():
+            with patch.object(_worker, "github_api", new=AsyncMock(side_effect=responses)):
+                return await _worker._user_has_prior_activity("acme", "somebody", "tok")
+        self.assertTrue(_run(_inner()))
+
+    def test_fails_closed_on_403_second_call(self):
+        """A 403 on the comment-search call returns True (fail closed)."""
+        responses = [
+            self._make_resp(200, '{"total_count": 0, "items": []}'),
+            self._make_resp(403),
+        ]
+
+        async def _inner():
+            with patch.object(_worker, "github_api", new=AsyncMock(side_effect=responses)):
+                return await _worker._user_has_prior_activity("acme", "somebody", "tok")
+        self.assertTrue(_run(_inner()))
+
+    def test_fails_closed_on_429_rate_limit(self):
+        """A 429 (rate limit) on either search call returns True (fail closed)."""
+        responses = [self._make_resp(429)]
+
+        async def _inner():
+            with patch.object(_worker, "github_api", new=AsyncMock(side_effect=responses)):
+                return await _worker._user_has_prior_activity("acme", "somebody", "tok")
+        self.assertTrue(_run(_inner()))
+
+
+class TestFormatReferralRankComment(unittest.TestCase):
+    """_format_referral_rank_comment — builds congratulation comment body."""
+
+    def _leaderboard(self):
+        return [
+            ("alice", 5),
+            ("bob", 4),
+            ("carol", 3),
+            ("dave", 2),
+            ("eve", 1),
+        ]
+
+    def test_contains_referral_marker(self):
+        body = _worker._format_referral_rank_comment("alice", 5, self._leaderboard())
+        self.assertIn(_worker.REFERRAL_MARKER, body)
+
+    def test_contains_total_and_rank(self):
+        body = _worker._format_referral_rank_comment("alice", 5, self._leaderboard())
+        self.assertIn("Total referrals: **5**", body)
+        self.assertIn("Current rank: **#1**", body)
+
+    def test_rank_3_shows_neighbours(self):
+        body = _worker._format_referral_rank_comment("carol", 3, self._leaderboard())
+        self.assertIn("carol", body.lower())
+        # 2 above carol (alice, bob) and 2 below (dave, eve) should all appear
+        self.assertIn("@alice", body)
+        self.assertIn("@bob", body)
+        self.assertIn("@dave", body)
+        self.assertIn("@eve", body)
+
+    def test_rank_1_shows_top_rows_only(self):
+        body = _worker._format_referral_rank_comment("alice", 5, self._leaderboard())
+        # alice is first; only rows 1-3 expected in the window
+        self.assertIn("@alice", body)
+        self.assertIn("@bob", body)
+        self.assertIn("@carol", body)
+
+    def test_you_marker_on_referrer_row(self):
+        body = _worker._format_referral_rank_comment("carol", 3, self._leaderboard())
+        self.assertIn("← you", body)
+
+    def test_empty_leaderboard(self):
+        # Should not crash with an actual empty leaderboard
+        body = _worker._format_referral_rank_comment("alice", 1, [])
+        self.assertIn(":tada:", body)
+        self.assertIn("alice", body)
+        # No table rows should appear
+        self.assertNotIn("| 1 |", body)
+
+
+class TestProcessReferralMentions(unittest.TestCase):
+    """_process_referral_mentions — integration of mention detection + D1 + comment."""
+
+    def _make_db(self):
+        """Return a simple in-memory dict-based D1 mock."""
+        db = MagicMock()
+        db._store = []
+        return db
+
+    def _make_env(self, db):
+        env = MagicMock()
+        env.LEADERBOARD_DB = db
+        return env
+
+    def test_posts_comment_when_new_contributor_mentioned(self):
+        comments = []
+        db = self._make_db()
+        env = self._make_env(db)
+
+        async def mock_activity(owner, username, token):
+            return False
+
+        async def mock_record_referral(db_, org, referrer, referred, repo, number, mk):
+            return True
+
+        async def mock_count(db_, org, referrer, mk):
+            return 1
+
+        async def mock_leaderboard(db_, org, mk):
+            return [(referrer.lower(), 1)]
+
+        referrer = "alice"
+
+        async def _inner():
+            with patch.object(_worker, "_ensure_leaderboard_schema", new=AsyncMock()):
+                with patch.object(_worker, "_is_valid_human_referree", new=AsyncMock(return_value=True)):  # ✅ FIX
+                    with patch.object(_worker, "_user_has_prior_activity", new=mock_activity):
+                        with patch.object(_worker, "_d1_record_referral", new=mock_record_referral):
+                            with patch.object(_worker, "_d1_get_referral_count", new=mock_count):
+                                with patch.object(_worker, "_d1_get_referral_leaderboard", new=mock_leaderboard):
+                                    with patch.object(_worker, "create_comment",
+                                                    new=AsyncMock(side_effect=lambda o, r, n, b, t: comments.append(b))):
+                                        await _worker._process_referral_mentions(
+                                            "OWASP-BLT", "BLT", 42, referrer,
+                                            "Welcome @newbie to the project!", "tok", env
+                                        )
+
+        _run(_inner())
+        self.assertEqual(len(comments), 1)
+
+    def test_no_comment_when_user_has_prior_activity(self):
+        """When the mentioned user is already active, no referral comment is posted."""
+        comments = []
+        db = self._make_db()
+        env = self._make_env(db)
+
+        async def mock_activity(owner, repo, username, token):
+            return True  # already has activity
+
+        async def _inner():
+            with patch.object(_worker, "_ensure_leaderboard_schema", new=AsyncMock()):
+                with patch.object(_worker, "_user_has_prior_activity", new=mock_activity):
+                    with patch.object(_worker, "create_comment",
+                                      new=AsyncMock(side_effect=lambda o, r, n, b, t: comments.append(b))):
+                        await _worker._process_referral_mentions(
+                            "OWASP-BLT", "BLT", 42, "alice",
+                            "Hey @existinguser, check this out!", "tok", env
+                        )
+
+        _run(_inner())
+        self.assertEqual(comments, [])
+
+    def test_no_comment_when_no_env(self):
+        """Without an env, _process_referral_mentions should be a no-op."""
+        comments = []
+        called = []
+
+        async def _inner():
+            with patch.object(_worker, "create_comment",
+                              new=AsyncMock(side_effect=lambda o, r, n, b, t: comments.append(b))):
+                with patch.object(_worker, "_user_has_prior_activity",
+                                  new=AsyncMock(side_effect=lambda *a: called.append(True) or False)):
+                    await _worker._process_referral_mentions(
+                        "OWASP-BLT", "BLT", 42, "alice",
+                        "Hello @newbie!", "tok", None  # env=None
+                    )
+
+        _run(_inner())
+        self.assertEqual(comments, [])
+        self.assertEqual(called, [])
+
+    def test_self_mention_is_ignored(self):
+        """A commenter mentioning themselves should not count as a referral."""
+        comments = []
+        db = self._make_db()
+        env = self._make_env(db)
+        activity_checks = []
+
+        async def mock_activity(owner, repo, username, token):
+            activity_checks.append(username)
+            return False
+
+        async def _inner():
+            with patch.object(_worker, "_ensure_leaderboard_schema", new=AsyncMock()):
+                with patch.object(_worker, "_user_has_prior_activity", new=mock_activity):
+                    with patch.object(_worker, "create_comment",
+                                      new=AsyncMock(side_effect=lambda o, r, n, b, t: comments.append(b))):
+                        await _worker._process_referral_mentions(
+                            "OWASP-BLT", "BLT", 42, "alice",
+                            "I am @alice and I rock!", "tok", env
+                        )
+
+        _run(_inner())
+        # alice mentioning herself should not trigger activity check
+        self.assertNotIn("alice", activity_checks)
+        self.assertEqual(comments, [])
+
+    def test_no_comment_when_no_mentions(self):
+        """A comment with no @-mentions should not trigger any referral logic."""
+        comments = []
+        db = self._make_db()
+        env = self._make_env(db)
+
+        async def _inner():
+            with patch.object(_worker, "_ensure_leaderboard_schema", new=AsyncMock()):
+                with patch.object(_worker, "create_comment",
+                                  new=AsyncMock(side_effect=lambda o, r, n, b, t: comments.append(b))):
+                    await _worker._process_referral_mentions(
+                        "OWASP-BLT", "BLT", 42, "alice",
+                        "No mentions in this comment.", "tok", env
+                    )
+
+        _run(_inner())
+        self.assertEqual(comments, [])
+
+    def test_mentions_capped_at_max(self):
+        """Only MAX_REFERRAL_MENTIONS_PER_COMMENT unique mentions are checked per comment."""
+        checked = []
+        db = self._make_db()
+        env = self._make_env(db)
+
+        async def mock_activity(owner, repo, username, token):
+            checked.append(username)
+            return True  # treat all as active so no referral is recorded
+
+        # Build a body with more mentions than the cap.
+        cap = _worker.MAX_REFERRAL_MENTIONS_PER_COMMENT
+        extra = "@user" + " @user".join(str(i) for i in range(cap + 3))
+
+        async def _inner():
+            with patch.object(_worker, "_ensure_leaderboard_schema", new=AsyncMock()):
+                with patch.object(_worker, "_user_has_prior_activity", new=mock_activity):
+                    await _worker._process_referral_mentions(
+                        "OWASP-BLT", "BLT", 42, "alice", extra, "tok", env
+                    )
+
+        _run(_inner())
+        self.assertLessEqual(len(checked), cap)
+
+    def test_bot_mention_filtered_out(self):
+        comments = []
+        db = self._make_db()
+        env = self._make_env(db)
+
+        async def _inner():
+            with patch.object(_worker, "_ensure_leaderboard_schema", new=AsyncMock()):
+                with patch.object(_worker, "_is_valid_human_referree", new=AsyncMock(return_value=False)):
+                    with patch.object(_worker, "create_comment",
+                                    new=AsyncMock(side_effect=lambda *a: comments.append(a))):
+                        await _worker._process_referral_mentions(
+                            "OWASP-BLT", "BLT", 42, "alice",
+                            "Hello @coderabbitai[bot]", "tok", env
+                        )
+
+        _run(_inner())
+        self.assertEqual(comments, [])
+
+    def test_mixed_mentions_only_human_processed(self):
+        comments = []
+        db = self._make_db()
+        env = self._make_env(db)
+
+        async def is_valid(user, token):
+            return user == "realuser"
+
+        async def mock_activity(owner, username, token):
+            return False
+
+        async def mock_record(*args):
+            return True
+
+        async def _inner():
+            with patch.object(_worker, "_ensure_leaderboard_schema", new=AsyncMock()):
+                with patch.object(_worker, "_is_valid_human_referree", new=is_valid):
+                    with patch.object(_worker, "_user_has_prior_activity", new=mock_activity):
+                        with patch.object(_worker, "_d1_record_referral", new=mock_record):
+                            with patch.object(_worker, "_d1_get_referral_count", new=AsyncMock(return_value=1)):
+                                with patch.object(_worker, "_d1_get_referral_leaderboard", new=AsyncMock(return_value=[])):
+                                    with patch.object(_worker, "create_comment",
+                                                    new=AsyncMock(side_effect=lambda *a: comments.append(a))):
+                                        await _worker._process_referral_mentions(
+                                            "OWASP-BLT", "BLT", 42, "alice",
+                                            "@realuser @botuser[bot]", "tok", env
+                                        )
+
+        _run(_inner())
+        self.assertEqual(len(comments), 1)
+
+    def test_org_mention_filtered(self):
+        comments = []
+        db = self._make_db()
+        env = self._make_env(db)
+
+        async def _inner():
+            with patch.object(_worker, "_ensure_leaderboard_schema", new=AsyncMock()):
+                with patch.object(_worker, "_is_valid_human_referree", new=AsyncMock(return_value=False)):
+                    with patch.object(
+                        _worker,
+                        "create_comment",
+                        new=AsyncMock(side_effect=lambda *a: comments.append(a)),
+                    ):
+                        await _worker._process_referral_mentions(
+                            "OWASP-BLT", "BLT", 42, "alice",
+                            "Hey `@google` check this", "tok", env
+                        )
+
+        _run(_inner())
+        self.assertEqual(comments, [])
 
 if __name__ == "__main__":
     unittest.main()
