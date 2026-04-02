@@ -6247,7 +6247,8 @@ async def _check_stale_assignments(owner: str, repo: str, token: str):
                 break
             issues.extend(page_issues)
             link_header = issues_resp.headers.get("Link") or ""
-            if 'rel="next"' not in link_header or len(page_issues) < per_page:
+            has_next = 'rel="next"' in link_header if link_header else len(page_issues) == per_page
+            if not has_next:
                 break
             page += 1
         if page > max_pages:
