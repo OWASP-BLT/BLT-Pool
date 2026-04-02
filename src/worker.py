@@ -6227,8 +6227,6 @@ async def scheduled(event, env):
 async def _check_stale_assignments(owner: str, repo: str, token: str):
     """Check a repository for stale issue assignments and unassign them."""
     try:
-        # Fetch all open issues across pages so repos with >100 open
-        # issues do not silently miss stale assignments.
         issues: list = []
         page = 1
         per_page = 100
