@@ -1,28 +1,7 @@
-"""BLT Action — Issue assignment slash commands and label management.
-
-This module contains all /assign, /unassign, /approve, /deny command
-handling and label-related automation extracted from worker.py as part
-of the refactoring described in issue #83.
-
-Responsibilities:
-    - /assign  — self-assign an approved issue
-    - /unassign — release an issue assignment
-    - /approve  — triage reviewer approves an issue for contribution
-    - /deny     — triage reviewer rejects and closes an issue
-    - Label existence guarantees (_ensure_label_exists)
-    - Pending-checks label updates (label_pending_checks)
-    - Unresolved-conversations label, check-run, and comment management
-    - Peer-review label enforcement
-"""
-
 import json
 from typing import Optional
 from urllib.parse import quote
 import time
-
-# ---------------------------------------------------------------------------
-# Constants (mirrors worker.py to avoid circular imports)
-# ---------------------------------------------------------------------------
 
 ASSIGN_COMMAND = "/assign"
 UNASSIGN_COMMAND = "/unassign"
@@ -39,9 +18,6 @@ UNRESOLVED_CONVERSATIONS_CHECK_NAME = "Unresolved Conversations"
 UNRESOLVED_CONVERSATIONS_MARKER = "<!-- BLT-UNRESOLVED-CONVERSATIONS -->"
 
 
-# ---------------------------------------------------------------------------
-# Label helpers
-# ---------------------------------------------------------------------------
 
 
 async def ensure_label_exists(
@@ -89,12 +65,6 @@ async def ensure_label_exists_with_description(
             "POST", f"/repos/{owner}/{repo}/labels", token,
             {"name": label_name, "color": color, "description": description},
         )
-
-
-# ---------------------------------------------------------------------------
-# /assign command
-# ---------------------------------------------------------------------------
-
 
 async def handle_assign(
     owner: str, repo: str, issue: dict, login: str, token: str,
@@ -171,9 +141,6 @@ async def handle_assign(
     )
 
 
-# ---------------------------------------------------------------------------
-# /unassign command
-# ---------------------------------------------------------------------------
 
 
 async def handle_unassign(
@@ -205,9 +172,6 @@ async def handle_unassign(
     )
 
 
-# ---------------------------------------------------------------------------
-# /approve command
-# ---------------------------------------------------------------------------
 
 
 async def handle_approve(
@@ -277,10 +241,6 @@ async def handle_approve(
     )
 
 
-# ---------------------------------------------------------------------------
-# /deny command
-# ---------------------------------------------------------------------------
-
 
 async def handle_deny(
     owner: str, repo: str, issue: dict, login: str, token: str,
@@ -311,7 +271,7 @@ async def handle_deny(
         return
     await create_comment_fn(
         owner, repo, num,
-        f"❌ This issue has been denied by @{login} and will be closed.\n\n"
+        f" This issue has been denied by @{login} and will be closed.\n\n"
         "If you believe this was a mistake, please open a new issue with more details.",
         token,
     )
@@ -321,13 +281,6 @@ async def handle_deny(
         token,
         {"state": "closed"},
     )
-
-
-# ---------------------------------------------------------------------------
-# Pending-checks label
-# ---------------------------------------------------------------------------
-
-
 async def label_pending_checks(
     owner: str, repo: str, pr_number: int, head_sha: str, token: str,
     github_api_fn
@@ -386,11 +339,6 @@ async def try_label_pending_checks(
         await label_pending_checks(owner, repo, pr["number"], head_sha, token, github_api_fn)
     except Exception as exc:
         console.error(f"[BLT] label_pending_checks failed (best-effort, ignored): {exc}")
-
-
-# ---------------------------------------------------------------------------
-# Unresolved conversations
-# ---------------------------------------------------------------------------
 
 
 async def check_unresolved_conversations(
@@ -513,14 +461,7 @@ async def check_unresolved_conversations(
         else:
             await create_comment_fn(owner, repo, number, comment_body, token)
     elif existing_comment_id is not None:
-        await github_api_fn("DELETE", f"/repos/{owner}/{repo}/issues/comments/{existing_comment_id}", token)
-
-
-# ---------------------------------------------------------------------------
-# Peer-review enforcement
-# ---------------------------------------------------------------------------
-
-
+        await github_api_fn("DELETE", f"/repos/{owner}/{repo}/issues/comments/{existing_comment_id}", token
 def is_excluded_reviewer(login: str) -> bool:
     """Return True if the reviewer is a bot or automated account."""
     if not login:
@@ -620,14 +561,4 @@ async def check_peer_review_and_comment(
             page += 1
         if not already_commented:
             body = f"""{marker}
-👋 Hi @{pr_author}!
-
-This pull request needs a peer review before it can be merged. Please request a review from a team member who is not:
-- The PR author
-- coderabbitai
-- copilot
-
-Once a valid peer review is submitted, this check will pass automatically. Thank you!
-
-> ⚠️ Peer review enforcement is active."""
-            await create_comment_fn(owner, repo, pr_number, body, token)
+        
