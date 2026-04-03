@@ -750,6 +750,6 @@ def format_reviewer_leaderboard_comment(leaderboard_data: dict, owner: str, pr_r
     comment += "\n---\n"
     comment += (
         "Reviews earn **+5 points** each in the monthly leaderboard "
-        "(first two reviewers per PR). Thank you to everyone who helps review PRs! 🙏\n"
+        "(first two reviewers per PR). Thank you to everyone who helps review PRs!\n"
     )
     return comment
