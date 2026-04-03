@@ -690,7 +690,7 @@ def format_leaderboard_comment(author_login: str, leaderboard_data: dict, owner:
     return comment
 
 
-def format_reviewer_leaderboard_comment(leaderboard_data: dict, owner: str, pr_reviewers: list = None) -> str:
+def format_reviewer_leaderboard_comment(leaderboard_data: dict, owner: str, pr_reviewers: Optional[list] = None) -> str:
     """Format a reviewer leaderboard comment showing top reviewers for the month."""
     sorted_users = leaderboard_data["sorted"]
     start_ts = leaderboard_data["start_timestamp"]
