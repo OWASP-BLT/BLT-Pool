@@ -52,12 +52,13 @@ async def ensure_label_exists_with_description(
     token: str, github_api_fn
 ) -> None:
     """Create or update a label to ensure it exists with the correct color/description."""
-    resp = await github_api_fn("GET", f"/repos/{owner}/{repo}/labels/{label_name}", token)
+    encoded_name = quote(label_name, safe='')
+    resp = await github_api_fn("GET", f"/repos/{owner}/{repo}/labels/{encoded_name}", token)
     if resp.status == 200:
         data = json.loads(await resp.text())
         if data.get("color") != color or data.get("description") != description:
             await github_api_fn(
-                "PATCH", f"/repos/{owner}/{repo}/labels/{label_name}", token,
+                "PATCH", f"/repos/{owner}/{repo}/labels/{encoded_name}", token,
                 {"color": color, "description": description},
             )
     elif resp.status == 404:
@@ -527,7 +528,7 @@ async def update_peer_review_labels(
     current_labels = json.loads(await resp.text())
     current_label_names = {label.get("name") for label in current_labels}
     if old_label in current_label_names:
-        await github_api_fn("DELETE", f"/repos/{owner}/{repo}/issues/{pr_number}/labels/{old_label}", token)
+        await github_api_fn("DELETE", f"/repos/{owner}/{repo}/issues/{pr_number}/labels/{quote(old_label, safe='')}", token)
     if new_label not in current_label_names:
         await github_api_fn("POST", f"/repos/{owner}/{repo}/issues/{pr_number}/labels", token, {"labels": [new_label]})
 

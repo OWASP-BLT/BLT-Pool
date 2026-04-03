@@ -469,26 +469,26 @@ async def track_review(payload: dict, env, is_bot_fn, d1_binding_fn) -> None:
     )
     if exists:
         return
-    cnt_row = await d1_first(
-        db,
-        """
-        SELECT COUNT(*) AS cnt FROM leaderboard_review_credits
-        WHERE org = ? AND repo = ? AND pr_number = ? AND month_key = ?
-        """,
-        (org, repo, pr_number, mk),
-    )
-    already = int((cnt_row or {}).get("cnt") or 0)
-    if already >= 2:
-        return
-    await d1_run(
+    result = await d1_run(
         db,
         """
         INSERT INTO leaderboard_review_credits (org, repo, pr_number, month_key, reviewer_login, created_at)
-        VALUES (?, ?, ?, ?, ?, ?)
+        SELECT ?, ?, ?, ?, ?, ?
+        WHERE (
+            SELECT COUNT(*) FROM leaderboard_review_credits
+            WHERE org = ? AND repo = ? AND pr_number = ? AND month_key = ?
+        ) < 2
         """,
-        (org, repo, pr_number, mk, reviewer_login, int(time.time())),
+        (org, repo, pr_number, mk, reviewer_login, int(time.time()),
+         org, repo, pr_number, mk),
     )
-    await inc_monthly(db, org, mk, reviewer_login, "reviews", 1)
+    rows_written = 0
+    try:
+        rows_written = int(getattr(result, "rowsWritten", None) or 0)
+    except Exception:
+        pass
+    if rows_written > 0:
+        await inc_monthly(db, org, mk, reviewer_login, "reviews", 1)
 
 
 
