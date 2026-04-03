@@ -474,7 +474,9 @@ async def check_unresolved_conversations(
         else:
             await create_comment_fn(owner, repo, number, comment_body, token)
     elif existing_comment_id is not None:
-        await github_api_fn("DELETE", f"/repos/{owner}/{repo}/issues/comments/{existing_comment_id}", token
+        await github_api_fn("DELETE", f"/repos/{owner}/{repo}/issues/comments/{existing_comment_id}", token)
+
+
 def is_excluded_reviewer(login: str) -> bool:
     """Return True if the reviewer is a bot or automated account.
 
