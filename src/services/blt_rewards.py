@@ -1,25 +1,9 @@
-"""BLT Rewards — Leaderboard calculation, tracking, and display.
-
-This module contains all leaderboard-related functionality extracted from
-worker.py as part of the refactoring described in issue #83.
-
-Responsibilities:
-    - Monthly stats tracking (merged PRs, closed PRs, reviews, comments)
-    - D1 database helpers for leaderboard tables
-    - Backfill logic for historical data
-    - Leaderboard comment formatting and posting
-    - Reviewer leaderboard formatting and posting
-"""
-
 import calendar
 import json
 import time
 from typing import Optional, Tuple
 from urllib.parse import quote
 
-# ---------------------------------------------------------------------------
-# Leaderboard marker constants
-# ---------------------------------------------------------------------------
 
 LEADERBOARD_MARKER = "<!-- leaderboard-bot -->"
 REVIEWER_LEADERBOARD_MARKER = "<!-- reviewer-leaderboard-bot -->"
@@ -27,9 +11,6 @@ MERGED_PR_COMMENT_MARKER = "<!-- merged-pr-comment-bot -->"
 LEADERBOARD_COMMAND = "/leaderboard"
 MAX_OPEN_PRS_PER_AUTHOR = 50
 
-# ---------------------------------------------------------------------------
-# Month helpers
-# ---------------------------------------------------------------------------
 
 
 def month_key(ts: Optional[int] = None) -> str:
@@ -74,9 +55,6 @@ def avatar_img_tag(login: str, size: int = 20) -> str:
     )
 
 
-# ---------------------------------------------------------------------------
-# D1 helpers
-# ---------------------------------------------------------------------------
 
 
 def d1_binding(env):
@@ -159,9 +137,6 @@ async def d1_has_column(db, table_name: str, column_name: str) -> bool:
     return False
 
 
-# ---------------------------------------------------------------------------
-# Schema creation
-# ---------------------------------------------------------------------------
 
 
 async def ensure_leaderboard_schema(db) -> None:
@@ -251,9 +226,6 @@ async def ensure_leaderboard_schema(db) -> None:
     )
 
 
-# ---------------------------------------------------------------------------
-# PR and comment tracking
-# ---------------------------------------------------------------------------
 
 
 async def inc_open_pr(db, org: str, user_login: str, delta: int) -> None:
@@ -519,9 +491,6 @@ async def track_review(payload: dict, env, is_bot_fn, d1_binding_fn) -> None:
     await inc_monthly(db, org, mk, reviewer_login, "reviews", 1)
 
 
-# ---------------------------------------------------------------------------
-# Stats calculation
-# ---------------------------------------------------------------------------
 
 
 async def calculate_stats_from_d1(owner: str, env) -> Optional[dict]:
@@ -591,9 +560,6 @@ async def calculate_stats_from_d1(owner: str, env) -> Optional[dict]:
     }
 
 
-# ---------------------------------------------------------------------------
-# Backfill helpers
-# ---------------------------------------------------------------------------
 
 
 async def get_backfill_state(db, owner: str, mk: str) -> dict:
@@ -671,10 +637,6 @@ async def reset_leaderboard_month(org: str, mk: str, db) -> dict:
         deleted["leaderboard_open_prs"] = f"error: {e}"
     return deleted
 
-
-# ---------------------------------------------------------------------------
-# Comment formatting
-# ---------------------------------------------------------------------------
 
 
 def format_leaderboard_comment(author_login: str, leaderboard_data: dict, owner: str, note: str = "") -> str:
