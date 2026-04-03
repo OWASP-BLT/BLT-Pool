@@ -682,7 +682,7 @@ def format_leaderboard_comment(author_login: str, leaderboard_data: dict, owner:
     comment += "\n---\n"
     comment += (
         f"**Scoring this month** (across {owner} org): Open PRs (+1 each), Merged PRs (+10), "
-        "Closed (not merged) (−2), Reviews (+5; first two per PR in-month), "
+        "Closed (not merged) (-2), Reviews (+5; first two per PR in-month), "
         "Comments (+2, excludes CodeRabbit). Run `/leaderboard` on any issue or PR to see your rank!\n"
     )
     if note:
