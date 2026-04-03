@@ -36,14 +36,17 @@ def month_window(mk: str) -> Tuple[int, int]:
 
 
 def parse_github_timestamp(ts_str: str) -> int:
-    """Parse GitHub ISO 8601 timestamp to Unix timestamp."""
-    import re
-    match = re.match(r"(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})Z", ts_str)
-    if match:
-        year, month, day, hour, minute, second = map(int, match.groups())
-        dt = time.struct_time((year, month, day, hour, minute, second, 0, 0, 0))
-        return int(calendar.timegm(dt))
-    return 0
+    """Parse a GitHub ISO 8601 timestamp (e.g. '2024-03-05T12:34:56Z') to a
+    Unix timestamp integer.  Returns 0 for any invalid or empty input.
+    """
+    if not ts_str:
+        return 0
+    try:
+        from datetime import datetime, timezone
+        dt = datetime.strptime(ts_str, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+        return int(dt.timestamp())
+    except (ValueError, TypeError):
+        return 0
 
 
 def avatar_img_tag(login: str, size: int = 20) -> str:
@@ -72,15 +75,14 @@ def _to_py(value):
 
 
 async def d1_run(db, sql: str, params: tuple = ()):
+    from js import console
     try:
-        from js import console
         stmt = db.prepare(sql)
         if params:
             stmt = stmt.bind(*params)
         result = await stmt.run()
         return result
     except Exception as e:
-        from js import console
         console.error(f"[D1.run] Error executing {sql[:60]}: {e}")
         raise
 
@@ -105,9 +107,9 @@ async def d1_all(db, sql: str, params: tuple = ()) -> list:
         rows = result.get("results")
     if rows is None:
         try:
-            rows = result.get("results")
-        except Exception:
             rows = getattr(result, "results", None)
+        except (TypeError, AttributeError):
+            pass
     rows = _to_py(rows)
     if rows is None:
         return []
@@ -254,6 +256,8 @@ async def inc_open_pr(db, org: str, user_login: str, delta: int) -> None:
 async def inc_monthly(db, org: str, mk: str, user_login: str, field: str, delta: int = 1) -> None:
     from js import console
     now = int(time.time())
+    # SECURITY: field is interpolated into SQL — only these whitelisted column
+    # names are permitted. Any other value is rejected to prevent SQL injection.
     if field not in {"merged_prs", "closed_prs", "reviews", "comments"}:
         return
     try:

@@ -188,7 +188,19 @@ async def handle_approve(
             token,
         )
         return
-    if issue.get("pull_request") or issue.get("state") == "closed":
+    if issue.get("pull_request"):
+        await create_comment_fn(
+            owner, repo, num,
+            f"@{login} The `/approve` command only works on issues, not pull requests.",
+            token,
+        )
+        return
+    if issue.get("state") == "closed":
+        await create_comment_fn(
+            owner, repo, num,
+            f"@{login} This issue is already closed and cannot be approved.",
+            token,
+        )
         return
     await github_api_fn(
         "POST",
@@ -464,17 +476,27 @@ async def check_unresolved_conversations(
     elif existing_comment_id is not None:
         await github_api_fn("DELETE", f"/repos/{owner}/{repo}/issues/comments/{existing_comment_id}", token
 def is_excluded_reviewer(login: str) -> bool:
-    """Return True if the reviewer is a bot or automated account."""
+    """Return True if the reviewer is a bot or automated account.
+
+    Mirrors the _is_bot() logic in worker.py — keep both in sync when adding
+    new bot patterns.
+    """
     if not login:
         return True
     login_lower = login.lower()
     excluded_exact = {
-        "coderabbitai[bot]", "dependabot[bot]", "dependabot-preview[bot]",
-        "dependabot", "github-actions[bot]",
+        "coderabbitai[bot]",
+        "dependabot[bot]",
+        "dependabot-preview[bot]",
+        "dependabot",
+        "github-actions[bot]",
     }
     if login_lower in excluded_exact:
         return True
-    bot_patterns = ["[bot]", "bot]", "copilot", "renovate", "actions-user", "sentry", "snyk", "sonarcloud", "codecov"]
+    bot_patterns = [
+        "[bot]", "bot]", "copilot", "renovate", "actions-user",
+        "coderabbit", "coderabbitai", "sentry", "snyk", "sonarcloud", "codecov",
+    ]
     return any(pattern in login_lower for pattern in bot_patterns)
 
 
