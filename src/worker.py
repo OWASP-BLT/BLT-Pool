@@ -6102,6 +6102,55 @@ async def on_fetch(request, env) -> Response:
     if method == "GET" and path == "/callback":
         return _html(_callback_html())
 
+    # Admin: backfill referred_by data for mentors who were referred by contributors.
+    # Requires ADMIN_SECRET env variable.
+    # POST body: {"updates": [{"github_username": "mentorX", "referred_by": "contributorY"}, ...]}
+    if method == "POST" and path in {"/admin/backfill-referrer", f"{_admin_path(env)}/backfill-referrer"}:
+        admin_secret = getattr(env, "ADMIN_SECRET", "")
+        if not admin_secret:
+            return _json({"error": "Admin endpoint not configured"}, 403)
+        auth_header = (request.headers.get("Authorization") or "").strip()
+        if auth_header != f"Bearer {admin_secret}":
+            return _json({"error": "Unauthorized"}, 401)
+        try:
+            body = json.loads(await request.text())
+        except Exception:
+            return _json({"error": "Invalid JSON body"}, 400)
+        updates = body.get("updates")
+        if not isinstance(updates, list) or not updates:
+            return _json(
+                {"error": "Missing or empty 'updates' list. Expected: [{\"github_username\": \"...\", \"referred_by\": \"...\"}, ...]"},
+                400,
+            )
+        db = _d1_binding(env)
+        if not db:
+            return _json({"error": "No D1 binding available"}, 500)
+        results: dict = {"updated": [], "skipped": [], "errors": []}
+        _GH_RE = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9\-]{0,37}[A-Za-z0-9])?")
+        for entry in updates:
+            mentor_username = (entry.get("github_username") or "").strip().lstrip("@")
+            referred_by = (entry.get("referred_by") or "").strip().lstrip("@")
+            if not mentor_username or not referred_by:
+                results["skipped"].append({"entry": entry, "reason": "missing github_username or referred_by"})
+                continue
+            if not _GH_RE.fullmatch(mentor_username):
+                results["skipped"].append({"entry": entry, "reason": "invalid github_username format"})
+                continue
+            if not _GH_RE.fullmatch(referred_by):
+                results["skipped"].append({"entry": entry, "reason": "invalid referred_by format"})
+                continue
+            try:
+                stmt = db.prepare("UPDATE mentors SET referred_by = ? WHERE github_username = ?")
+                result = await stmt.bind(referred_by, mentor_username).run()
+                meta = getattr(result, "meta", {}) or {}
+                if isinstance(meta, dict) and meta.get("changes", 1) == 0:
+                    results["skipped"].append({"entry": entry, "reason": "mentor not found in DB"})
+                else:
+                    results["updated"].append({"github_username": mentor_username, "referred_by": referred_by})
+            except Exception as exc:
+                results["errors"].append({"entry": entry, "error": str(exc)})
+        return _json({"ok": True, "results": results})
+
     # Admin: reset corrupted leaderboard data for a given org/month so a fresh
     # backfill can re-populate it.  Requires ADMIN_SECRET env variable.
     if method == "POST" and path in {"/admin/reset-leaderboard-month", f"{_admin_path(env)}/reset-leaderboard-month"}:
