@@ -6564,6 +6564,7 @@ async def on_fetch(request, env, ctx=None) -> Response:
         db = _d1_binding(env)
         if not db:
             return _json({"error": "No D1 binding available"}, 500)
+        await _ensure_leaderboard_schema(db)
         results: dict = {"updated": [], "skipped": [], "errors": []}
         _GH_RE = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9\-]{0,37}[A-Za-z0-9])?")
         for entry in updates:
