@@ -6102,9 +6102,6 @@ async def on_fetch(request, env) -> Response:
     if method == "GET" and path == "/callback":
         return _html(_callback_html())
 
-    # Admin: backfill referred_by data for mentors who were referred by contributors.
-    # Requires ADMIN_SECRET env variable.
-    # POST body: {"updates": [{"github_username": "mentorX", "referred_by": "contributorY"}, ...]}
     if method == "POST" and path in {"/admin/backfill-referrer", f"{_admin_path(env)}/backfill-referrer"}:
         admin_secret = getattr(env, "ADMIN_SECRET", "")
         if not admin_secret:
