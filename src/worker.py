@@ -33,7 +33,7 @@ import re
 import time
 from typing import Optional, Tuple
 from urllib.parse import quote, urlparse
-
+import asyncio
 from js import Headers, Response, console, fetch  # Cloudflare Workers JS bindings
 from index_template import GITHUB_PAGE_HTML  # Landing page HTML template
 from services.check_orchestrator import (
@@ -688,6 +688,11 @@ async def _ensure_leaderboard_schema(db) -> None:
             db,
             "ALTER TABLE mentors ADD COLUMN slack_username TEXT NOT NULL DEFAULT ''",
         )
+    if not await _d1_has_column(db, "mentors", "total_prs"):
+        await _d1_run(
+            db,
+            "ALTER TABLE mentors ADD COLUMN total_prs INTEGER NOT NULL DEFAULT 0",
+        )
     await _d1_run(
         db,
         """
@@ -698,6 +703,30 @@ async def _ensure_leaderboard_schema(db) -> None:
             reviews INTEGER NOT NULL DEFAULT 0,
             fetched_at INTEGER NOT NULL,
             PRIMARY KEY (org, github_username)
+        )
+        """,
+    )
+    await _d1_run(
+        db,
+        """
+        CREATE TABLE IF NOT EXISTS contributor_referrals (
+            org TEXT NOT NULL,
+            month_key TEXT NOT NULL,
+            referrer_login TEXT NOT NULL,
+            referred_login TEXT NOT NULL,
+            repo TEXT NOT NULL,
+            issue_number INTEGER NOT NULL,
+            created_at INTEGER NOT NULL,
+            PRIMARY KEY (org, month_key, referrer_login, referred_login)
+        )
+        """,
+    )
+    await _d1_run(
+        db,
+        """
+        CREATE TABLE IF NOT EXISTS leaderboard_processed_comments (
+            comment_id INTEGER NOT NULL PRIMARY KEY,
+            processed_at INTEGER NOT NULL
         )
         """,
     )
@@ -749,7 +778,7 @@ async def _load_mentors_from_d1(db) -> list:
         await _ensure_leaderboard_schema(db)
         rows = await _d1_all(
             db,
-            "SELECT github_username, name, specialties, max_mentees, active, timezone, referred_by, email, slack_username FROM mentors",
+            "SELECT github_username, name, specialties, max_mentees, active, timezone, referred_by, email, slack_username, total_prs FROM mentors",
         )
         mentors = []
         for row in rows:
@@ -767,6 +796,7 @@ async def _load_mentors_from_d1(db) -> list:
                 "referred_by": row.get("referred_by") or "",
                 "email": row.get("email") or "",
                 "slack_username": row.get("slack_username") or "",
+                "total_prs": int(row.get("total_prs") or 0),
             })
         console.log(f"[MentorPool] Loaded {len(mentors)} mentors from D1")
         return mentors
@@ -1010,6 +1040,7 @@ async def _d1_inc_monthly(db, org: str, month_key: str, user_login: str, field: 
         console.log(f"[D1] Updated {field} org={org} month={month_key} user={user_login} +{delta}")
     except Exception as e:
         console.error(f"[D1] Failed to update {field} org={org} month={month_key} user={user_login}: {e}")
+        raise
 
 
 async def _track_pr_opened_in_d1(payload: dict, env) -> None:
@@ -1181,13 +1212,48 @@ async def _track_comment_in_d1(payload: dict, env) -> None:
         return
     org = (payload.get("repository") or {}).get("owner", {}).get("login", "")
     login = user.get("login", "")
+    comment_id = comment.get("id")
     created_at = comment.get("created_at")
-    if not (org and login):
+    if not (org and login and comment_id):
         return
 
     await _ensure_leaderboard_schema(db)
+    
+    # Atomic dedup — only increment if this comment_id has never been processed.
+    # Mirrors the INSERT OR IGNORE + changes pattern already used in _d1_record_referral.
+    result = await _d1_run(
+        db,
+        """
+        INSERT INTO leaderboard_processed_comments (comment_id, processed_at)
+        VALUES (?, ?)
+        ON CONFLICT (comment_id) DO NOTHING
+        """,
+        (comment_id, int(time.time())),
+    )
+    changes = 0
+    if isinstance(result, dict):
+        changes = int((result.get("meta") or {}).get("changes") or 0)
+    else:
+        meta = getattr(result, "meta", None)
+        if meta is not None:
+            changes = int(getattr(meta, "changes", 0) or 0)
+
+    if changes == 0:
+        # Already processed — skip to prevent double-counting on redelivery.
+        console.log(f"[D1] Skipping duplicate comment_id={comment_id}")
+        return
+
     mk = _month_key(_parse_github_timestamp(created_at) if created_at else int(time.time()))
-    await _d1_inc_monthly(db, org, mk, login, "comments", 1)
+    try:
+        await _d1_inc_monthly(db, org, mk, login, "comments", 1)
+    except Exception:
+        # Compensate so a redelivery can retry counting this comment.
+        await _d1_run(
+            db,
+            "DELETE FROM leaderboard_processed_comments WHERE comment_id = ?",
+            (comment_id,),
+        )
+        raise
 
 
 async def _track_review_in_d1(payload: dict, env) -> None:
@@ -1249,6 +1315,314 @@ async def _track_review_in_d1(payload: dict, env) -> None:
         (org, repo, pr_number, mk, reviewer_login, int(time.time())),
     )
     await _d1_inc_monthly(db, org, mk, reviewer_login, "reviews", 1)
+
+
+# ---------------------------------------------------------------------------
+# Contributor Referral System
+# ---------------------------------------------------------------------------
+
+#: Regex that matches GitHub @mention tokens in comment bodies.
+_MENTION_RE = re.compile(r"(?<![`\w])@([A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?)")
+
+#: HTML comment marker attached to referral congratulation comments so they
+#: can be programmatically identified (for example by tooling or future code).
+REFERRAL_MARKER = "<!-- blt-referral-bot -->"
+
+#: Maximum number of @-mentions inspected for referrals in a single comment.
+#: Caps the number of GitHub search API calls triggered per comment.
+MAX_REFERRAL_MENTIONS_PER_COMMENT = 5
+
+
+def _extract_mentions(body: str) -> list:
+    """Return a deduplicated list of @-mentioned GitHub usernames from *body*.
+
+    Mentions immediately preceded by a backtick or word character are excluded
+    by the regex lookbehind, but this does not robustly skip all usernames
+    that appear inside inline or fenced code spans.
+    """
+    return list(dict.fromkeys(m.lower() for m in _MENTION_RE.findall(body)))
+
+async def _user_has_prior_activity(owner: str, username: str, token: str) -> bool:
+    """Return True if *username* has any prior across the entire *owner* org.
+
+    Checks (in order, stopping early):
+    1. Issues or PRs authored by the user (search API).
+    2. Comments on issues/PRs authored by the user (search API).
+
+    Fails closed: a non-200 response (rate limit, permission error, network
+    failure) is treated as "activity present" so that transient API errors
+    never inflate referral counts or trigger spurious congratulation comments.
+    """
+    
+    base = f"org:{owner}+fork:false"
+    u = username  # GitHub treats logins case-insensitively
+
+    # 1) Authored issues/PRs anywhere in the org.
+    authored_q = f"/search/issues?q={base}+author:{u}&per_page=1"
+    resp = await github_api("GET", authored_q, token)
+    if resp.status != 200:
+        console.error(
+            f"[Referral] Search API returned {resp.status} for {u} in {base}; "
+            "treating as active to fail closed"
+        )
+        return True
+    data = json.loads(await resp.text())
+    if int(data.get("total_count") or 0) > 0:
+        return True
+
+    # 2) Comments authored anywhere in the org.
+    comments_q = f"/search/issues?q={base}+commenter:{u}&per_page=1"
+    resp2 = await github_api("GET", comments_q, token)
+    if resp2.status != 200:
+        console.error(
+            f"[Referral] Comment-search API returned {resp2.status} for {u} in {base}; "
+            "treating as active to fail closed"
+        )
+        return True
+    data2 = json.loads(await resp2.text())
+    if int(data2.get("total_count") or 0) > 0:
+        return True
+
+    return False
+
+
+async def _d1_record_referral(
+    db, org: str, referrer: str, referred: str, repo: str, issue_number: int, month_key: str
+) -> bool:
+    """Insert a referral record.  Returns True when inserted, False when it already existed."""
+    now = int(time.time())
+    try:
+        # Use a single INSERT with ON CONFLICT DO NOTHING for atomic idempotency,
+        # avoiding a SELECT→INSERT race under concurrent webhook deliveries.
+        result = await _d1_run(
+            db,
+            """
+            INSERT INTO contributor_referrals
+                (org, month_key, referrer_login, referred_login, repo, issue_number, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT (org, month_key, referrer_login, referred_login) DO NOTHING
+            """,
+            (org, month_key, referrer.lower(), referred.lower(), repo, issue_number, now),
+        )
+        # Determine whether a row was actually inserted from the reported change count.
+        changes = 0
+        if isinstance(result, dict):
+            meta = result.get("meta") or {}
+            changes = int(meta.get("changes") or 0)
+        else:
+            meta = getattr(result, "meta", None)
+            if meta is not None:
+                changes = int(getattr(meta, "changes", 0) or 0)
+        return changes > 0
+    except Exception as exc:
+        console.error(f"[Referral] Failed to record referral {referrer}->{referred}: {exc}")
+        return False
+
+
+async def _d1_get_referral_count(db, org: str, referrer: str, month_key: str) -> int:
+    """Return the total number of successful referrals made by *referrer* in *month_key*."""
+    try:
+        row = await _d1_first(
+            db,
+            """
+            SELECT COUNT(*) AS cnt FROM contributor_referrals
+            WHERE org = ? AND month_key = ? AND referrer_login = ?
+            """,
+            (org, month_key, referrer.lower()),
+        )
+        return int((row or {}).get("cnt") or 0)
+    except Exception as exc:
+        console.error(f"[Referral] Failed to get referral count for {referrer}: {exc}")
+        return 0
+
+
+async def _d1_get_referral_leaderboard(db, org: str, month_key: str) -> list:
+    """Return list of (login, count) tuples sorted descending by referral count."""
+    try:
+        rows = await _d1_all(
+            db,
+            """
+            SELECT referrer_login, COUNT(*) AS cnt
+            FROM contributor_referrals
+            WHERE org = ? AND month_key = ?
+            GROUP BY referrer_login
+            ORDER BY cnt DESC, referrer_login ASC
+            """,
+            (org, month_key),
+        )
+        return [(r["referrer_login"], int(r["cnt"])) for r in rows]
+    except Exception as exc:
+        console.error(f"[Referral] Failed to get leaderboard for {org}/{month_key}: {exc}")
+        return []
+
+
+def _format_referral_rank_comment(
+    referrer: str,
+    total: int,
+    leaderboard: list,
+) -> str:
+    """Build the congratulation comment body for a successful referral.
+
+    Shows the referrer's rank along with 2 users above and 2 below in the
+    monthly leaderboard.
+    """
+    # Find rank (1-based, lower is better). Falls back to one beyond last place
+    # when the referrer is not yet present in the leaderboard.
+    rank = next(
+        (i + 1 for i, (login, _) in enumerate(leaderboard) if login == referrer.lower()),
+        len(leaderboard) + 1,
+    )
+
+    lines = [
+        REFERRAL_MARKER,
+        f":tada: @{referrer} You referred a new contributor! "
+        f"Total referrals: **{total}**. Current rank: **#{rank}**.",
+        "",
+        "**Monthly Referral Leaderboard (your neighborhood)**",
+        "",
+        "| Rank | Contributor | Referrals |",
+        "| ---: | :---------- | --------: |",
+    ]
+
+    # Show 2 above + self + 2 below (clamped to list bounds).
+    start = max(0, rank - 3)
+    end = min(len(leaderboard), rank + 2)
+    for i in range(start, end):
+        entry_login, entry_count = leaderboard[i]
+        pos = i + 1
+        marker = " ← you" if entry_login == referrer.lower() else ""
+        lines.append(f"| {pos} | @{entry_login}{marker} | {entry_count} |")
+
+    return "\n".join(lines)
+
+_user_cache: dict[str, dict] = {}
+_MAX = 1000  # optional cap
+
+# --- Referral human gate -------------------------------------------------
+_DEFAULT_REFERRAL_BLOCKLIST = {
+    'owasp-blt', 'openai', 'anthropic', 'claude',
+    'google', 'microsoft', 'github', 'github-actions[bot]',
+    'dependabot[bot]', 'coderabbitai[bot]', 'owasp-blt[bot]',
+    'copilot[bot]', 'sentry[bot]',
+}
+
+async def _github_user(login: str, token: str) -> dict | None:
+    key = (login or "").strip().lower()
+    if not key:
+        return None
+
+    if key in _user_cache:
+        return _user_cache[key]
+
+    resp = await github_api("GET", f"/users/{key}", token)
+    if resp.status != 200:
+        return None  # don't cache failures to avoid sticky errors
+
+    data = json.loads(await resp.text() or "{}")
+    if len(_user_cache) >= _MAX:  # simple FIFO eviction
+        _user_cache.pop(next(iter(_user_cache)))
+    _user_cache[key] = data
+    return data
+
+async def _is_valid_human_referree(login: str, token: str,
+                                   block: set[str] = _DEFAULT_REFERRAL_BLOCKLIST) -> bool:
+    """Return True only for real human GitHub users (not orgs/teams/bots/service accts)."""
+    login_lower = (login or "").strip().lower()
+    if not login_lower or '/' in login_lower:            # team mention like `@org/team`
+        return False
+    if login_lower.endswith('[bot]') or login_lower in block:
+        return False
+    user = await _github_user(login_lower, token)
+    return bool(user) and (user.get('type', '').lower() == 'user')
+
+async def _process_referral_mentions(
+    owner: str,
+    repo: str,
+    issue_number: int,
+    commenter: str,
+    body: str,
+    token: str,
+    env,
+) -> None:
+    """Detect @-mentions of new contributors and record referrals in D1.
+
+    For each mentioned username that has no prior activity in the repo, a
+    referral is recorded and the commenter receives a congratulation comment.
+    """
+    db = _d1_binding(env)
+    if not db:
+        return
+
+    mentions = _extract_mentions(body)
+    if not mentions:
+        return
+
+    # Strip the commenter themselves from mentions.
+    mentions = [m for m in mentions if m != commenter.lower()]
+    if not mentions:
+        return
+
+    # Cap the number of mentions inspected per comment to avoid rate-limit bursts.
+    if len(mentions) > MAX_REFERRAL_MENTIONS_PER_COMMENT:
+        console.log(
+            f"[Referral] Capping mentions from {len(mentions)} to "
+            f"{MAX_REFERRAL_MENTIONS_PER_COMMENT} in {owner}/{repo}#{issue_number}"
+        )
+        mentions = mentions[:MAX_REFERRAL_MENTIONS_PER_COMMENT]
+
+    # Keep only valid human users (not orgs/teams/bots/AI/service accounts)
+    filtered = []
+    for m in mentions:
+        try:
+            if await _is_valid_human_referree(m, token):
+                filtered.append(m)
+        except Exception:
+            # Fail-closed for referrals: if we cannot verify, do not award
+            # Log for operability and incident triage.
+            pass
+    mentions = list(dict.fromkeys(filtered))
+    if not mentions:
+        return
+
+    # Cap the number of mentions processed per comment to avoid rate-limit bursts.
+    if len(mentions) > MAX_REFERRAL_MENTIONS_PER_COMMENT:
+        console.log(
+            f"[Referral] Capping mentions from {len(mentions)} to "
+            f"{MAX_REFERRAL_MENTIONS_PER_COMMENT} in {owner}/{repo}#{issue_number}"
+        )
+        mentions = mentions[:MAX_REFERRAL_MENTIONS_PER_COMMENT]
+
+    await _ensure_leaderboard_schema(db)
+    mk = _month_key()
+    new_referrals = []
+
+    # Allow GitHub Search indexing to catch up before querying.
+    await asyncio.sleep(5)
+
+    for mentioned in mentions:
+        try:
+            already_active = await _user_has_prior_activity(owner, mentioned, token)
+            if already_active:
+                continue
+            recorded = await _d1_record_referral(
+                db, owner, commenter, mentioned, repo, issue_number, mk
+            )
+            if recorded:
+                new_referrals.append(mentioned)
+        except Exception as exc:
+            console.error(f"[Referral] Error processing mention @{mentioned}: {exc}")
+
+    if not new_referrals:
+        return
+
+    # Post one congrats comment covering all newly referred users.
+    try:
+        total = await _d1_get_referral_count(db, owner, commenter, mk)
+        leaderboard = await _d1_get_referral_leaderboard(db, owner, mk)
+        comment_body = _format_referral_rank_comment(commenter, total, leaderboard)
+        await create_comment(owner, repo, issue_number, comment_body, token)
+    except Exception as exc:
+        console.error(f"[Referral] Failed to post congratulation comment: {exc}")
 
 
 async def _calculate_leaderboard_stats_from_d1(owner: str, env) -> Optional[dict]:
@@ -3456,10 +3830,11 @@ async def _check_stale_mentor_assignments(owner: str, repo: str, token: str) -> 
 # ---------------------------------------------------------------------------
 
 
-async def handle_issue_comment(payload: dict, token: str, env=None) -> None:
+async def handle_issue_comment(payload: dict, token: str, env=None, ctx=None) -> None:
     comment = payload["comment"]
     issue = payload["issue"]
-    if not _is_human(comment["user"]):
+    # Require a human AND not a bot account (covers [bot] suffix, service users)
+    if (not _is_human(comment["user"])) or _is_bot(comment["user"]):
         return
 
     # Persist comments to D1 for leaderboard scoring.
@@ -3475,6 +3850,23 @@ async def handle_issue_comment(payload: dict, token: str, env=None) -> None:
     login = comment["user"]["login"]
     issue_number = issue["number"]
     comment_id = comment.get("id")
+
+    # Process @-mentions for the contributor referral system.
+    if env is not None:
+        async def _deferred_referral():
+            try:
+                await _process_referral_mentions(
+                    owner, repo, issue_number, login, body, token, env
+                )
+            except Exception as exc:
+                console.error(f"[Referral] Failed to process mentions: {exc}")
+
+        if ctx is not None:
+            # Cloudflare Workers: runs after 200 OK is sent — no redelivery risk.
+            ctx.waitUntil(_deferred_referral())
+        else:
+            # Fallback for local tests / non-CW runtimes.
+            await _deferred_referral()
 
     # Add eyes reaction immediately to acknowledge command receipt
     if comment_id and command:
@@ -3638,14 +4030,50 @@ async def _unassign(
     )
 
 
+async def _get_last_assign_requester(
+    owner: str, repo: str, num: int, token: str
+) -> Optional[str]:
+    """Return the login of the last human who commented ``/assign`` on the issue, or None."""
+    try:
+        page = 1
+        per_page = 100
+        while True:
+            resp = await github_api(
+                "GET",
+                f"/repos/{owner}/{repo}/issues/{num}/comments"
+                f"?per_page={per_page}&page={page}&sort=created&direction=desc",
+                token,
+            )
+            if resp.status != 200:
+                return None
+            comments = json.loads(await resp.text())
+            if not comments:
+                break
+            for c in comments:
+                user = c.get("user") or {}
+                body = (c.get("body") or "").strip()
+                login = user.get("login", "")
+                if not login or not _is_human(user):
+                    continue
+                if _extract_command(body) == ASSIGN_COMMAND:
+                    return login
+            if len(comments) < per_page:
+                break
+            page += 1
+    except Exception:
+        pass
+    return None
+
+
 async def _approve(
     owner: str, repo: str, issue: dict, login: str, token: str
 ) -> None:
     """Handle the ``/approve`` command (triage reviewer approves an issue for assignment).
 
     Only :data:`TRIAGE_REVIEWER` is authorised to use this command.  When
-    approved the ``help wanted`` label is added and the issue opener is
-    assigned so they can start work immediately.
+    approved the ``help wanted`` label is added.  The issue is then assigned to
+    the last person who requested ``/assign`` (if any); otherwise the issue
+    opener is assigned so they can start work immediately.
     """
     num = issue["number"]
     if login.lower() != TRIAGE_REVIEWER.lower():
@@ -3666,31 +4094,33 @@ async def _approve(
         token,
         {"labels": [HELP_WANTED_LABEL]},
     )
-    # Assign the issue to the person who opened it, respecting existing assignees
-    # and the global MAX_ASSIGNEES limit enforced by the /assign workflow.
+    # Determine who to assign: prefer the last person who said /assign, falling
+    # back to the issue opener so they can start work immediately.
     opener = issue.get("user", {}).get("login", "")
-    opener_assigned = False
+    last_requester = await _get_last_assign_requester(owner, repo, num, token)
+    assignee = last_requester or opener
+    assignee_was_assigned = False
     assignment_note = ""
-    if opener:
+    if assignee:
         assignees = issue.get("assignees") or []
         assignee_logins = {
             a.get("login")
             for a in assignees
             if isinstance(a, dict) and a.get("login")
         }
-        # If the opener is already assigned, we don't need to call the API again.
-        if opener in assignee_logins:
-            opener_assigned = True
+        # If the chosen assignee is already assigned, we don't need to call the API again.
+        if assignee in assignee_logins:
+            assignee_was_assigned = True
         # If we've reached the maximum number of assignees, do not add another.
         elif len(assignee_logins) >= MAX_ASSIGNEES:
             assignment_note = (
                 "However, this issue already has the maximum number of assignees, "
-                "so the opener was not additionally assigned."
+                "so the chosen assignee was not additionally assigned."
             )
-        # If someone else has already claimed the issue, avoid assigning the opener.
+        # If someone else has already claimed the issue, avoid assigning over them.
         elif assignee_logins:
             assignment_note = (
-                "Note: this issue already has an assignee, so the opener was not "
+                "Note: this issue already has an assignee, so the chosen assignee was not "
                 "automatically assigned."
             )
         else:
@@ -3698,11 +4128,11 @@ async def _approve(
                 "POST",
                 f"/repos/{owner}/{repo}/issues/{num}/assignees",
                 token,
-                {"assignees": [opener]},
+                {"assignees": [assignee]},
             )
-            opener_assigned = True
-    if opener and opener_assigned:
-        assignment_text = f"@{opener} You have been assigned — good luck! 🚀\n\n"
+            assignee_was_assigned = True
+    if assignee and assignee_was_assigned:
+        assignment_text = f"@{assignee} You have been assigned — good luck! 🚀\n\n"
     elif assignment_note:
         assignment_text = assignment_note + "\n\n"
     else:
@@ -4771,7 +5201,7 @@ async def handle_pull_request_for_review(payload: dict, token: str) -> None:
 # ---------------------------------------------------------------------------
 
 
-async def handle_webhook(request, env) -> Response:
+async def handle_webhook(request, env, ctx=None) -> Response:
     """Verify the GitHub webhook signature and route to the correct handler."""
     body_text = await request.text()
     payload_bytes = body_text.encode("utf-8")
@@ -4862,7 +5292,7 @@ async def handle_webhook(request, env) -> Response:
                 )
 
         if event == "issue_comment" and action == "created":
-            await handle_issue_comment(payload, token, env)
+            await handle_issue_comment(payload, token, env, ctx=ctx)
         elif event == "issues":
             if action == "opened":
                 await handle_issue_opened(payload, token, blt_api_url)
@@ -5174,15 +5604,17 @@ def _generate_mentor_row(mentor: dict, stats: Optional[dict] = None) -> str:
         if specialty_chips else ''
     )
 
-    # Compact stats row — shown only when D1 data is available.
-    if stats:
-        merged_prs = int(stats.get("merged_prs") or 0)
-        reviews = int(stats.get("reviews") or 0)
+    # Frontend PR count uses the same canonical backend source as admin:
+    # mentors.total_prs in D1. Reviews still come from mentor_stats cache.
+    has_total_prs = "total_prs" in mentor and mentor.get("total_prs") is not None
+    if stats or has_total_prs:
+        total_prs = int(mentor.get("total_prs") or 0)
+        reviews = int((stats or {}).get("reviews") or 0)
         stats_row = (
             f'<div class="mt-1.5 flex flex-wrap items-center gap-x-3 gap-y-0.5">'
             f'<span class="text-xs text-gray-400 whitespace-nowrap">'
             f'<i class="fa-solid fa-code-pull-request mr-0.5 text-gray-300" aria-hidden="true"></i>'
-            f'<span class="font-semibold text-gray-600">{merged_prs}</span> PRs</span>'
+            f'<span class="font-semibold text-gray-600">{total_prs}</span> PRs</span>'
             f'<span class="text-xs text-gray-400 whitespace-nowrap">'
             f'<i class="fa-solid fa-magnifying-glass-chart mr-0.5 text-gray-300" aria-hidden="true"></i>'
             f'<span class="font-semibold text-gray-600">{reviews}</span> reviews</span>'
@@ -5355,6 +5787,10 @@ def _index_html(mentors: list = None, mentor_stats: Optional[dict] = None, activ
           <ol class="space-y-0">
             {lb_items}
           </ol>
+          <div class="mt-4 rounded-lg bg-gray-50 border border-[#E5E5E5] px-3 py-2">
+            <p class="text-xs font-semibold text-gray-600 mb-1"><i class="fa-solid fa-circle-info mr-1 text-[#E10101]" aria-hidden="true"></i>How to refer a friend</p>
+            <p class="text-xs text-gray-500">Mention them in any issue or PR comment, e.g. <code class="rounded bg-gray-200 px-1 py-0.5 text-xs font-mono text-gray-700">Hey @username, check this out!</code> — if they have no prior activity, it counts as a referral.</p>
+          </div>
         </section>'''
     else:
         leaderboard_html = '''
@@ -5365,7 +5801,11 @@ def _index_html(mentors: list = None, mentor_stats: Optional[dict] = None, activ
             </div>
             <h3 class="text-lg font-bold text-[#111827]">Referral Leaderboard</h3>
           </div>
-          <p class="text-sm text-gray-500">No referrals yet — be the first to invite a mentor!</p>
+          <p class="mb-4 text-sm text-gray-500">No referrals yet — be the first to invite a friend!</p>
+          <div class="rounded-lg bg-gray-50 border border-[#E5E5E5] px-3 py-2">
+            <p class="text-xs font-semibold text-gray-600 mb-1"><i class="fa-solid fa-circle-info mr-1 text-[#E10101]" aria-hidden="true"></i>How to refer a friend</p>
+            <p class="text-xs text-gray-500">Mention them in any issue or PR comment, e.g. <code class="rounded bg-gray-200 px-1 py-0.5 text-xs font-mono text-gray-700">Hey @username, check this out!</code> — if they have no prior activity, it counts as a referral.</p>
+          </div>
         </section>'''
 
     return f'''<!DOCTYPE html>
@@ -6027,7 +6467,7 @@ def _html(html: str, status: int = 200) -> Response:
 # ---------------------------------------------------------------------------
 
 
-async def on_fetch(request, env) -> Response:
+async def on_fetch(request, env, ctx=None) -> Response:
     method = request.method
     path = urlparse(str(request.url)).path.rstrip("/") or "/"
 
@@ -6096,7 +6536,7 @@ async def on_fetch(request, env) -> Response:
         return await _handle_add_mentor(request, env)
 
     if method == "POST" and path == "/api/github/webhooks":
-        return await handle_webhook(request, env)
+        return await handle_webhook(request, env, ctx=ctx)
 
     # GitHub redirects here after a successful installation
     if method == "GET" and path == "/callback":
