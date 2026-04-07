@@ -6553,6 +6553,8 @@ async def on_fetch(request, env, ctx=None) -> Response:
             body = json.loads(await request.text())
         except Exception:
             return _json({"error": "Invalid JSON body"}, 400)
+        if not isinstance(body, dict):
+            return _json({"error": "JSON body must be an object"}, 400)
         updates = body.get("updates")
         if not isinstance(updates, list) or not updates:
             return _json(
