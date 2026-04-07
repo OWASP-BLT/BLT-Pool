@@ -6087,19 +6087,28 @@ class TestOnFetchHomepage(unittest.TestCase):
 class TestHandleAddMentor(unittest.TestCase):
     """POST /api/mentors — inserts a new mentor into D1."""
 
-    def _make_post_request(self, body: dict):
+    def _make_post_request(self, body: dict, headers: dict | None = None):
         import json as _json
+        header_map = {str(k): v for k, v in (headers or {}).items()}
         req = types.SimpleNamespace(
             method="POST",
             url="http://localhost/api/mentors",
-            headers=types.SimpleNamespace(get=lambda k, d=None: d),
+            headers=types.SimpleNamespace(get=lambda k, d=None: header_map.get(k, d)),
             text=AsyncMock(return_value=_json.dumps(body)),
         )
         return req
 
-    def _run_add(self, body: dict, db_raises=False, gh_user_exists=True, existing_mentor=False):
-        req = self._make_post_request(body)
-        env = types.SimpleNamespace()
+    def _run_add(
+        self,
+        body: dict,
+        db_raises=False,
+        gh_user_exists=True,
+        existing_mentor=False,
+        env=None,
+        headers: dict | None = None,
+    ):
+        req = self._make_post_request(body, headers=headers)
+        env = env or types.SimpleNamespace()
         captured = {}
 
         async def _inner():
@@ -6245,6 +6254,51 @@ class TestHandleAddMentor(unittest.TestCase):
     def test_invalid_referred_by_format_returns_400(self):
         resp, _ = self._run_add({"name": "Jane Doe", "github_username": "janedoe", "referred_by": "bad user!"})
         self.assertEqual(resp.status, 400)
+
+    def test_invalid_email_format_returns_400(self):
+        resp, _ = self._run_add({"name": "Jane Doe", "github_username": "janedoe", "email": "not-an-email"})
+        self.assertEqual(resp.status, 400)
+        import json as _json
+        data = _json.loads(resp.body)
+        self.assertIn("invalid email format", data["error"].lower())
+
+    def test_invalid_slack_username_format_returns_400(self):
+        resp, _ = self._run_add({"name": "Jane Doe", "github_username": "janedoe", "slack_username": "bad user!"})
+        self.assertEqual(resp.status, 400)
+        import json as _json
+        data = _json.loads(resp.body)
+        self.assertIn("invalid slack username format", data["error"].lower())
+
+    def test_valid_email_and_slack_username_are_saved(self):
+        resp, captured = self._run_add(
+            {
+                "name": "Jane Doe",
+                "github_username": "janedoe",
+                "email": "Mentor@Example.com",
+                "slack_username": "@mentor.handle",
+            }
+        )
+        self.assertEqual(resp.status, 201)
+        self.assertEqual(captured["add_args"].kwargs["email"], "mentor@example.com")
+        self.assertEqual(captured["add_args"].kwargs["slack_username"], "mentor.handle")
+
+    def test_missing_mentor_form_key_returns_401_when_configured(self):
+        resp, _ = self._run_add(
+            {"name": "Jane Doe", "github_username": "janedoe"},
+            env=types.SimpleNamespace(MENTOR_FORM_KEY="secret-key"),
+        )
+        self.assertEqual(resp.status, 401)
+        import json as _json
+        data = _json.loads(resp.body)
+        self.assertEqual(data["error"], "unauthorized")
+
+    def test_matching_mentor_form_key_allows_submission(self):
+        resp, _ = self._run_add(
+            {"name": "Jane Doe", "github_username": "janedoe"},
+            env=types.SimpleNamespace(MENTOR_FORM_KEY="secret-key"),
+            headers={"X-Mentor-Form-Key": "secret-key"},
+        )
+        self.assertEqual(resp.status, 201)
 
 
 class TestTimeAgo(unittest.TestCase):

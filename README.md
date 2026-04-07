@@ -42,6 +42,7 @@ The app runs as a Python Cloudflare Worker. D1 is used for both the leaderboard 
 
 - `GET /` renders the BLT-Pool mentor directory.
 - `GET /github-app` renders the GitHub App landing page.
+- `GET /api/assignments` returns active mentor assignments from D1.
 - `POST /api/mentors` adds a mentor to the D1-backed mentor pool.
 - `POST /api/github/webhooks` receives GitHub webhook events.
 - `GET /health` returns a health check response.
@@ -207,6 +208,34 @@ Validation implemented in `worker.py`:
 - Specialty tags are validated before insert
 - Invalid payloads return `400`
 - Successful inserts return `201`
+
+### Assignments API
+
+Returns active mentor assignments from D1.
+
+#### Endpoint
+
+- GET /api/assignments
+
+#### Response
+
+```json
+{
+  "assignments": [
+    {
+      "mentor_login": "mentor",
+      "mentee_login": "mentee",
+      "issue_number": 123,
+      "repo": "repo-name",
+      "created_at": "2026-03-24T10:15:30Z"
+    }
+  ],
+  "count": 1
+}
+
+Notes
+- Data is sourced from the mentor_assignments table in D1
+- This endpoint is currently unauthenticated and intended for integration use
 
 ## Seeded Mentors
 
