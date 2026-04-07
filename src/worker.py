@@ -6580,7 +6580,9 @@ async def on_fetch(request, env, ctx=None) -> Response:
                 results["skipped"].append({"entry": entry, "reason": "invalid referred_by format"})
                 continue
             try:
-                stmt = db.prepare("UPDATE mentors SET referred_by = ? WHERE github_username = ?")
+                stmt = db.prepare(
+                    "UPDATE mentors SET referred_by = ? WHERE lower(github_username) = lower(?)"
+                )
                 result = await stmt.bind(referred_by, mentor_username).run()
                 meta = getattr(result, "meta", {}) or {}
                 if isinstance(meta, dict) and meta.get("changes", 1) == 0:
