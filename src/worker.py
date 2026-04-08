@@ -6596,8 +6596,18 @@ async def on_fetch(request, env, ctx=None) -> Response:
         await _ensure_leaderboard_schema(db)
         results: dict = {"updated": [], "skipped": [], "errors": []}
         for entry in updates:
-            mentor_username = (entry.get("github_username") or "").strip().lstrip("@")
-            referred_by = (entry.get("referred_by") or "").strip().lstrip("@")
+            if not isinstance(entry, dict):
+                results["skipped"].append({"entry": entry, "reason": "entry must be an object"})
+                continue
+            raw_mentor_username = entry.get("github_username")
+            raw_referred_by = entry.get("referred_by")
+            if not isinstance(raw_mentor_username, str) or not isinstance(raw_referred_by, str):
+                results["skipped"].append(
+                    {"entry": entry, "reason": "github_username and referred_by must be strings"}
+                )
+                continue
+            mentor_username = raw_mentor_username.strip().lstrip("@")
+            referred_by = raw_referred_by.strip().lstrip("@")
             if not mentor_username or not referred_by:
                 results["skipped"].append({"entry": entry, "reason": "missing github_username or referred_by"})
                 continue
