@@ -6566,17 +6566,16 @@ async def on_fetch(request, env, ctx=None) -> Response:
             return _json({"error": "No D1 binding available"}, 500)
         await _ensure_leaderboard_schema(db)
         results: dict = {"updated": [], "skipped": [], "errors": []}
-        _GH_RE = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9\-]{0,37}[A-Za-z0-9])?")
         for entry in updates:
             mentor_username = (entry.get("github_username") or "").strip().lstrip("@")
             referred_by = (entry.get("referred_by") or "").strip().lstrip("@")
             if not mentor_username or not referred_by:
                 results["skipped"].append({"entry": entry, "reason": "missing github_username or referred_by"})
                 continue
-            if not _GH_RE.fullmatch(mentor_username):
+            if not _GH_USERNAME_RE.match(mentor_username):
                 results["skipped"].append({"entry": entry, "reason": "invalid github_username format"})
                 continue
-            if not _GH_RE.fullmatch(referred_by):
+            if not _GH_USERNAME_RE.match(referred_by):
                 results["skipped"].append({"entry": entry, "reason": "invalid referred_by format"})
                 continue
             try:
@@ -6584,8 +6583,15 @@ async def on_fetch(request, env, ctx=None) -> Response:
                     "UPDATE mentors SET referred_by = ? WHERE lower(github_username) = lower(?)"
                 )
                 result = await stmt.bind(referred_by, mentor_username).run()
-                meta = getattr(result, "meta", {}) or {}
-                if isinstance(meta, dict) and meta.get("changes", 1) == 0:
+                changes = 0
+                if isinstance(result, dict):
+                    meta = result.get("meta") or {}
+                    changes = int(meta.get("changes") or 0)
+                else:
+                    meta = getattr(result, "meta", None)
+                    if meta is not None:
+                        changes = int(getattr(meta, "changes", 0) or 0)
+                if changes == 0:
                     results["skipped"].append({"entry": entry, "reason": "mentor not found in DB"})
                 else:
                     results["updated"].append({"github_username": mentor_username, "referred_by": referred_by})
