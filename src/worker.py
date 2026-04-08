@@ -147,6 +147,7 @@ def pem_to_pkcs8_der(pem: str) -> bytes:
 
 
 def _b64url(data: bytes) -> str:
+    """Encode *data* as URL-safe base64 without padding characters."""
     return base64.urlsafe_b64encode(data).rstrip(b"=").decode("ascii")
 
 
@@ -221,6 +222,7 @@ async def create_github_jwt(app_id: str, private_key_pem: str) -> str:
 
 
 def _gh_headers(token: str) -> Headers:
+    """Build standard GitHub API request headers for the given *token*."""
     h = {
         "Accept": "application/vnd.github+json",
         "Content-Type": "application/json",
@@ -479,6 +481,7 @@ def _d1_binding(env):
 
 
 async def _d1_run(db, sql: str, params: tuple = ()):
+    """Execute a single D1 SQL statement, logging and re-raising any errors."""
     try:
         stmt = db.prepare(sql)
         if params:
@@ -500,6 +503,7 @@ def _to_py(value):
 
 
 async def _d1_all(db, sql: str, params: tuple = ()) -> list:
+    """Run a D1 SELECT and return all rows, handling JS proxy serialization."""
     stmt = db.prepare(sql)
     if params:
         stmt = stmt.bind(*params)
@@ -540,6 +544,7 @@ async def _d1_all(db, sql: str, params: tuple = ()) -> list:
 
 
 async def _d1_first(db, sql: str, params: tuple = ()):
+    """Return the first row from a D1 query, or None if no rows matched."""
     rows = await _d1_all(db, sql, params)
     return rows[0] if rows else None
 
@@ -692,6 +697,11 @@ async def _ensure_leaderboard_schema(db) -> None:
         await _d1_run(
             db,
             "ALTER TABLE mentors ADD COLUMN total_prs INTEGER NOT NULL DEFAULT 0",
+        )
+    if not await _d1_has_column(db, "mentors", "referred_by"):
+        await _d1_run(
+            db,
+            "ALTER TABLE mentors ADD COLUMN referred_by TEXT NOT NULL DEFAULT ''",
         )
     await _d1_run(
         db,
@@ -1507,6 +1517,7 @@ _DEFAULT_REFERRAL_BLOCKLIST = {
 }
 
 async def _github_user(login: str, token: str) -> dict | None:
+    """Fetch a GitHub user object by login, using an in-process cache."""
     key = (login or "").strip().lower()
     if not key:
         return None
@@ -1707,6 +1718,7 @@ async def _calculate_leaderboard_stats_from_d1(owner: str, env) -> Optional[dict
 
 
 async def _get_backfill_state(db, owner: str, month_key: str) -> dict:
+    """Return the stored backfill cursor state for the given org and month."""
     row = await _d1_first(
         db,
         """
@@ -1724,6 +1736,7 @@ async def _get_backfill_state(db, owner: str, month_key: str) -> dict:
 
 
 async def _set_backfill_state(db, owner: str, month_key: str, next_page: int, completed: bool) -> None:
+    """Persist the backfill cursor state for the given org and month."""
     try:
         await _d1_run(
             db,
@@ -6444,6 +6457,7 @@ async def _handle_add_mentor(request, env) -> "Response":
 
 
 def _json(data, status: int = 200) -> Response:
+    """Serialize *data* to a JSON Response with CORS headers."""
     return Response.new(
         json.dumps(data),
         status=status,
@@ -6455,6 +6469,7 @@ def _json(data, status: int = 200) -> Response:
 
 
 def _html(html: str, status: int = 200) -> Response:
+    """Wrap an HTML string in a Response with the correct Content-Type."""
     return Response.new(
         html,
         status=status,
@@ -6468,6 +6483,7 @@ def _html(html: str, status: int = 200) -> Response:
 
 
 async def on_fetch(request, env, ctx=None) -> Response:
+    """Cloudflare Workers entry point — route incoming HTTP requests to handlers."""
     method = request.method
     path = urlparse(str(request.url)).path.rstrip("/") or "/"
 
