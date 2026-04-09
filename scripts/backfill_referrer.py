@@ -22,12 +22,12 @@ import re
 import urllib.request
 import urllib.error
 
-REFERRAL_DATA = [
-   
-    {"github_username": "example-mentor-1", "referred_by": "referrer-a"},
-    {"github_username": "example-mentor-2", "referred_by": "referrer-b"},
-]
 
+REFERRAL_DATA = [
+    
+    {"github_username": "ramansh18", "referred_by": "ojaswa072"},
+
+]
 
 _GH_RE = re.compile(r"^[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,37}[a-zA-Z0-9])?$")
 
@@ -100,7 +100,6 @@ def main() -> None:
             errors.append({"entry": entry, "reason": str(exc)})
             continue
 
-        
         try:
             changes = result["result"][0]["meta"]["changes"]
         except (KeyError, IndexError, TypeError):
