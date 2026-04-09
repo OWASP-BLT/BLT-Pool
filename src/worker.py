@@ -6610,8 +6610,8 @@ async def on_fetch(request, env, ctx=None) -> Response:
                     {"entry": entry, "reason": "github_username and referred_by must be strings"}
                 )
                 continue
-            mentor_username = raw_mentor_username.strip().lstrip("@")
-            referred_by = raw_referred_by.strip().lstrip("@")
+            mentor_username = raw_mentor_username.strip().lstrip("@").lower()
+            referred_by = raw_referred_by.strip().lstrip("@").lower()
             if not mentor_username or not referred_by:
                 results["skipped"].append({"entry": entry, "reason": "missing github_username or referred_by"})
                 continue
