@@ -700,10 +700,14 @@ async def _ensure_leaderboard_schema(db) -> None:
             "ALTER TABLE mentors ADD COLUMN total_prs INTEGER NOT NULL DEFAULT 0",
         )
     if not await _d1_has_column(db, "mentors", "referred_by"):
-        await _d1_run(
-            db,
-            "ALTER TABLE mentors ADD COLUMN referred_by TEXT NOT NULL DEFAULT ''",
-        )
+        try:
+            await _d1_run(
+                db,
+                "ALTER TABLE mentors ADD COLUMN referred_by TEXT NOT NULL DEFAULT ''",
+            )
+        except Exception as _alter_err:
+            if not await _d1_has_column(db, "mentors", "referred_by"):
+                raise _alter_err
     await _d1_run(
         db,
         """
