@@ -6639,7 +6639,8 @@ async def on_fetch(request, env, ctx=None) -> Response:
                 else:
                     results["updated"].append({"github_username": mentor_username, "referred_by": referred_by})
             except Exception as exc:
-                results["errors"].append({"entry": entry, "error": str(exc)})
+                console.error(f"[backfill-referrer] DB error for entry {entry!r}: {exc}")
+                results["errors"].append({"entry": entry, "error": "db_error"})
         return _json({"ok": True, "results": results})
 
     # Admin: reset corrupted leaderboard data for a given org/month so a fresh
