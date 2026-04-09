@@ -22,12 +22,19 @@ import re
 import urllib.request
 import urllib.error
 
-
 REFERRAL_DATA = [
-    
+
     {"github_username": "ramansh18", "referred_by": "ojaswa072"},
 
+    {"github_username": "gitsofaryan", "referred_by": "kunal241207"},
+
+    {"github_username": "RudraBhaskar9439", "referred_by": "kunal241207"},
+
+    {"github_username": "Mohammedfaiyaz29", "referred_by": "kunal241207"},
+
+    {"github_username": "sarafarajnasardi", "referred_by": "swaparup36"},
 ]
+
 
 _GH_RE = re.compile(r"^[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,37}[a-zA-Z0-9])?$")
 
@@ -110,6 +117,7 @@ def main() -> None:
         else:
             updated.append({"github_username": mentor, "referred_by": referrer})
 
+    # Summary
     print(f"\n✅ Updated : {len(updated)}")
     for u in updated:
         print(f"   {u['github_username']} ← referred by {u['referred_by']}")
