@@ -773,6 +773,7 @@ async def _load_mentors_from_d1(db) -> list:
     """
     try:
         await _ensure_leaderboard_schema(db)
+        await _backfill_referred_by(db)        # <-- ADD THIS LINE
         rows = await _d1_all(
             db,
             "SELECT github_username, name, specialties, max_mentees, active, timezone, referred_by, email, slack_username FROM mentors",
@@ -6086,7 +6087,6 @@ async def on_fetch(request, env) -> Response:
         if db:
             try:
                 await _ensure_leaderboard_schema(db)
-                await _backfill_referred_by(db)   # <-- ADD THIS
                 active_assignments = await _d1_get_active_assignments(db, org)
             except Exception as exc:
                 console.error(f"[MentorPool] Failed to fetch active assignments for homepage: {exc}")
