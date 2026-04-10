@@ -817,7 +817,7 @@ async def _load_mentors_from_d1(db) -> list:
     """
     try:
         await _ensure_leaderboard_schema(db)
-        await _backfill_referred_by(db)        # <-- ADD THIS LINE
+        await _backfill_referred_by(db)      
         rows = await _d1_all(
             db,
             "SELECT github_username, name, title, bio, specialties, max_mentees, active, timezone, referred_by, email, slack_username, total_prs FROM mentors",
