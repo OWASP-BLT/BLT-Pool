@@ -704,6 +704,32 @@ async def _ensure_leaderboard_schema(db) -> None:
     await _populate_mentors_table(db)
 
 
+async def _backfill_referred_by(db) -> None:
+    """
+    Idempotent one-time backfill of referred_by data for mentors.
+    Runs automatically on every worker startup via on_fetch.
+    Only updates rows where referred_by is NULL or empty — safe to run repeatedly.
+    Closes: https://github.com/OWASP-BLT/BLT-Pool/issues/52
+    """
+    REFERRAL_DATA = [
+        ("ramansh18", "ojaswa072"),
+        ("gitsofaryan", "kunal241207"),
+        ("RudraBhaskar9439", "kunal241207"),
+        ("Mohammedfaiyaz29", "kunal241207"),
+        ("sarafarajnasardi", "swaparup36"),
+    ]
+    for github_username, referred_by in REFERRAL_DATA:
+        try:
+            stmt = db.prepare(
+                "UPDATE mentors SET referred_by = ? "
+                "WHERE lower(github_username) = lower(?) "
+                "AND (referred_by IS NULL OR referred_by = '')"
+            )
+            await stmt.bind(referred_by, github_username).run()
+        except Exception:
+            pass
+
+
 # ---------------------------------------------------------------------------
 # Mentor table helpers
 # ---------------------------------------------------------------------------
@@ -6060,6 +6086,7 @@ async def on_fetch(request, env) -> Response:
         if db:
             try:
                 await _ensure_leaderboard_schema(db)
+                await _backfill_referred_by(db)   # <-- ADD THIS
                 active_assignments = await _d1_get_active_assignments(db, org)
             except Exception as exc:
                 console.error(f"[MentorPool] Failed to fetch active assignments for homepage: {exc}")
