@@ -559,197 +559,23 @@ async def _d1_has_column(db, table_name: str, column_name: str) -> bool:
 
 
 async def _ensure_leaderboard_schema(db) -> None:
-    """Create leaderboard tables if they do not exist."""
-    await _d1_run(
-        db,
-        """
-        CREATE TABLE IF NOT EXISTS leaderboard_monthly_stats (
-            org TEXT NOT NULL,
-            month_key TEXT NOT NULL,
-            user_login TEXT NOT NULL,
-            merged_prs INTEGER NOT NULL DEFAULT 0,
-            closed_prs INTEGER NOT NULL DEFAULT 0,
-            reviews INTEGER NOT NULL DEFAULT 0,
-            comments INTEGER NOT NULL DEFAULT 0,
-            updated_at INTEGER NOT NULL,
-            PRIMARY KEY (org, month_key, user_login)
-        )
-        """,
-    )
-    await _d1_run(
-        db,
-        """
-        CREATE TABLE IF NOT EXISTS leaderboard_open_prs (
-            org TEXT NOT NULL,
-            user_login TEXT NOT NULL,
-            open_prs INTEGER NOT NULL DEFAULT 0,
-            updated_at INTEGER NOT NULL,
-            PRIMARY KEY (org, user_login)
-        )
-        """,
-    )
-    await _d1_run(
-        db,
-        """
-        CREATE TABLE IF NOT EXISTS leaderboard_pr_state (
-            org TEXT NOT NULL,
-            repo TEXT NOT NULL,
-            pr_number INTEGER NOT NULL,
-            author_login TEXT NOT NULL,
-            state TEXT NOT NULL,
-            merged INTEGER NOT NULL DEFAULT 0,
-            closed_at INTEGER,
-            updated_at INTEGER NOT NULL,
-            PRIMARY KEY (org, repo, pr_number)
-        )
-        """,
-    )
-    await _d1_run(
-        db,
-        """
-        CREATE TABLE IF NOT EXISTS leaderboard_review_credits (
-            org TEXT NOT NULL,
-            repo TEXT NOT NULL,
-            pr_number INTEGER NOT NULL,
-            month_key TEXT NOT NULL,
-            reviewer_login TEXT NOT NULL,
-            created_at INTEGER NOT NULL,
-            PRIMARY KEY (org, repo, pr_number, month_key, reviewer_login)
-        )
-        """,
-    )
-    await _d1_run(
-        db,
-        """
-        CREATE TABLE IF NOT EXISTS leaderboard_backfill_state (
-            org TEXT NOT NULL,
-            month_key TEXT NOT NULL,
-            next_page INTEGER NOT NULL DEFAULT 1,
-            completed INTEGER NOT NULL DEFAULT 0,
-            updated_at INTEGER NOT NULL,
-            PRIMARY KEY (org, month_key)
-        )
-        """,
-    )
-    await _d1_run(
-        db,
-        """
-        CREATE TABLE IF NOT EXISTS leaderboard_backfill_repo_done (
-            org TEXT NOT NULL,
-            month_key TEXT NOT NULL,
-            repo TEXT NOT NULL,
-            updated_at INTEGER NOT NULL,
-            PRIMARY KEY (org, month_key, repo)
-        )
-        """,
-    )
-    await _d1_run(
-        db,
-        """
-        CREATE TABLE IF NOT EXISTS mentor_assignments (
-            org TEXT NOT NULL,
-            mentor_login TEXT NOT NULL,
-            issue_repo TEXT NOT NULL,
-            issue_number INTEGER NOT NULL,
-            assigned_at INTEGER NOT NULL,
-            mentee_login TEXT NOT NULL DEFAULT '',
-            PRIMARY KEY (org, issue_repo, issue_number)
-        )
-        """,
-    )
-    # Migration: add mentee_login only when missing to avoid duplicate-column errors.
-    if not await _d1_has_column(db, "mentor_assignments", "mentee_login"):
-        await _d1_run(
-            db,
-            "ALTER TABLE mentor_assignments ADD COLUMN mentee_login TEXT NOT NULL DEFAULT ''",
-        )
-    await _d1_run(
-        db,
-        """
-        CREATE TABLE IF NOT EXISTS mentors (
-            github_username TEXT NOT NULL PRIMARY KEY,
-            name TEXT NOT NULL,
-            title TEXT NOT NULL DEFAULT '',
-            bio TEXT NOT NULL DEFAULT '',
-            specialties TEXT NOT NULL DEFAULT '[]',
-            max_mentees INTEGER NOT NULL DEFAULT 3,
-            active INTEGER NOT NULL DEFAULT 1,
-            timezone TEXT NOT NULL DEFAULT '',
-            referred_by TEXT NOT NULL DEFAULT '',
-            email TEXT NOT NULL DEFAULT '',
-            slack_username TEXT NOT NULL DEFAULT ''
-        )
-        """,
-    )
-    if not await _d1_has_column(db, "mentors", "title"):
-        await _d1_run(
-            db,
-            "ALTER TABLE mentors ADD COLUMN title TEXT NOT NULL DEFAULT ''",
-        )
-    if not await _d1_has_column(db, "mentors", "bio"):
-        await _d1_run(
-            db,
-            "ALTER TABLE mentors ADD COLUMN bio TEXT NOT NULL DEFAULT ''",
-        )
-    if not await _d1_has_column(db, "mentors", "email"):
-        await _d1_run(
-            db,
-            "ALTER TABLE mentors ADD COLUMN email TEXT NOT NULL DEFAULT ''",
-        )
-    if not await _d1_has_column(db, "mentors", "slack_username"):
-        await _d1_run(
-            db,
-            "ALTER TABLE mentors ADD COLUMN slack_username TEXT NOT NULL DEFAULT ''",
-        )
-    if not await _d1_has_column(db, "mentors", "total_prs"):
-        await _d1_run(
-            db,
-            "ALTER TABLE mentors ADD COLUMN total_prs INTEGER NOT NULL DEFAULT 0",
-        )
-    await _d1_run(
-        db,
-        """
-        CREATE TABLE IF NOT EXISTS mentor_stats_cache (
-            org TEXT NOT NULL,
-            github_username TEXT NOT NULL,
-            merged_prs INTEGER NOT NULL DEFAULT 0,
-            reviews INTEGER NOT NULL DEFAULT 0,
-            fetched_at INTEGER NOT NULL,
-            PRIMARY KEY (org, github_username)
-        )
-        """,
-    )
-    await _d1_run(
-        db,
-        """
-        CREATE TABLE IF NOT EXISTS contributor_referrals (
-            org TEXT NOT NULL,
-            month_key TEXT NOT NULL,
-            referrer_login TEXT NOT NULL,
-            referred_login TEXT NOT NULL,
-            repo TEXT NOT NULL,
-            issue_number INTEGER NOT NULL,
-            created_at INTEGER NOT NULL,
-            PRIMARY KEY (org, month_key, referrer_login, referred_login)
-        )
-        """,
-    )
-    await _d1_run(
-        db,
-        """
-        CREATE TABLE IF NOT EXISTS leaderboard_processed_comments (
-            comment_id INTEGER NOT NULL PRIMARY KEY,
-            processed_at INTEGER NOT NULL
-        )
-        """,
-    )
+    """No-op compatibility shim — schema is now managed exclusively via Wrangler
+    D1 migration files under migrations/.
+
+    All CREATE TABLE and ALTER TABLE statements that previously lived here have
+    been moved to:
+      migrations/0000_initial_schema.sql  — full baseline schema
+      migrations/0001_backfill_referred_by.sql — data backfill for referred_by
+
+    Apply migrations with:
+        wrangler d1 migrations apply LEADERBOARD_DB
+
+    This function is retained so that existing call-sites do not need to be
+    updated, but it no longer issues any DDL at runtime.
+    """
+    # Seed the mentors table with the curated initial list (INSERT OR IGNORE —
+    # safe to call on every cold start; never overwrites existing data).
     await _populate_mentors_table(db)
-
-
-# ---------------------------------------------------------------------------
-# Mentor table helpers
-# ---------------------------------------------------------------------------
-
 async def _populate_mentors_table(db) -> None:
     """Seed the mentors table with the initial mentor list (idempotent).
 
