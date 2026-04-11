@@ -78,55 +78,46 @@ SET referred_by = 'ShirshJain'
 WHERE lower(github_username) = 'ananya'
   AND (referred_by IS NULL OR referred_by = '');
 
--- Savio D'souza → Kunal (primary mentor)
 UPDATE mentors
 SET referred_by = 'Kunal1522'
 WHERE lower(github_username) = 'saviod'
   AND (referred_by IS NULL OR referred_by = '');
 
--- Mohammed Aashik → Manikandan Chandran
 UPDATE mentors
 SET referred_by = 'ManikandanChandran'
 WHERE lower(github_username) = 'mohammedaashik'
   AND (referred_by IS NULL OR referred_by = '');
 
--- Jayant → Manikandan Chandran (primary mentor)
 UPDATE mentors
 SET referred_by = 'ManikandanChandran'
 WHERE lower(github_username) = 'jayant'
   AND (referred_by IS NULL OR referred_by = '');
 
--- Shaz Zahra Zaidi → Rehan
 UPDATE mentors
 SET referred_by = 'Rehan'
 WHERE lower(github_username) = 'shazzahrazaidi'
   AND (referred_by IS NULL OR referred_by = '');
 
--- Siddharth Bansal → Rishab Kumar Jha (primary mentor)
 UPDATE mentors
 SET referred_by = 'Rishab87'
 WHERE lower(github_username) = 'sidd190'
   AND (referred_by IS NULL OR referred_by = '');
 
--- Rosai → Jisan (primary mentor)
 UPDATE mentors
 SET referred_by = 'Jisan'
 WHERE lower(github_username) = 'rosai'
   AND (referred_by IS NULL OR referred_by = '');
 
--- Shubhang pathak → Aaditya Sharma
 UPDATE mentors
 SET referred_by = 'AadityaSharma'
 WHERE lower(github_username) = 'shubhangpathak'
   AND (referred_by IS NULL OR referred_by = '');
 
--- Sakshee → Akshay Behl (primary mentor)
 UPDATE mentors
 SET referred_by = 'AkshayBehl'
 WHERE lower(github_username) = 'sakshee'
   AND (referred_by IS NULL OR referred_by = '');
 
--- Arnav Kirti → shriyash soni (primary mentor)
 UPDATE mentors
 SET referred_by = 'shriyashsoni'
 WHERE lower(github_username) = 'arnavkirti'
