@@ -1,10 +1,3 @@
--- Migration: 0000_initial_schema
--- Baseline schema for all D1 tables.
--- This migration establishes all tables as the single source of truth for
--- schema evolution, replacing the runtime DDL previously executed in
--- _ensure_leaderboard_schema (src/worker.py) and _ensure_tables
--- (src/services/admin/service.py).
-
 CREATE TABLE IF NOT EXISTS leaderboard_monthly_stats (
     org TEXT NOT NULL,
     month_key TEXT NOT NULL,
