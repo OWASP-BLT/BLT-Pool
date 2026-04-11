@@ -559,19 +559,21 @@ async def _d1_has_column(db, table_name: str, column_name: str) -> bool:
 
 
 async def _ensure_leaderboard_schema(db) -> None:
-    """No-op compatibility shim — schema is now managed exclusively via Wrangler
-    D1 migration files under migrations/.
+    """Compatibility shim for legacy call-sites.
 
-    All CREATE TABLE and ALTER TABLE statements that previously lived here have
-    been moved to:
+    Schema is now managed exclusively via Wrangler D1 migration files under
+    migrations/, so this function no longer issues any CREATE TABLE or ALTER
+    TABLE statements at runtime. All schema changes that previously lived here
+    have been moved to:
       migrations/0000_initial_schema.sql  — full baseline schema
       migrations/0001_backfill_referred_by.sql — data backfill for referred_by
 
     Apply migrations with:
         wrangler d1 migrations apply LEADERBOARD_DB
 
-    This function is retained so that existing call-sites do not need to be
-    updated, but it no longer issues any DDL at runtime.
+    This helper is retained so existing call-sites do not need to be updated.
+    It still performs idempotent seed writes for the mentors table via
+    _populate_mentors_table(db).
     """
     # Seed the mentors table with the curated initial list (INSERT OR IGNORE —
     # safe to call on every cold start; never overwrites existing data).
