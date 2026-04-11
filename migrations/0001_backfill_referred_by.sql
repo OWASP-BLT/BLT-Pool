@@ -1,9 +1,3 @@
--- Migration: 0001_backfill_referred_by
--- Backfill the referred_by column for mentors whose referral data was missing
--- at the time of insertion. Each UPDATE is idempotent — it only patches rows
--- where referred_by is currently NULL or empty string.
--- Closes: https://github.com/OWASP-BLT/BLT-Pool/issues/52
-
 UPDATE mentors
 SET referred_by = 'mdkaifansari04'
 WHERE lower(github_username) = 'rinkitadhana'
