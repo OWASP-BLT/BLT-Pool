@@ -1,18 +1,3 @@
--- mentor              referred_by
--- rinkitadhana        mdkaifansari04
--- rajgupta36          mdkaifansari04
--- shriyashsoni        arnavkirti
--- mohammedfaiyaz29    arnavkirti
--- vaswani2003         pritz395
--- kittenbytes         pritz395
--- captain-t2004       e-esakman
--- elsheik21           s3dfx-cyber
--- kunal1522           s3dfx-cyber
--- rudrabhaskar9439    rudra-rps
--- dev-sanidhya        rudra-rps
--- vedantanand17       sidd190
--- rishab87            sidd190
-
 UPDATE mentors SET referred_by = 'mdkaifansari04'
 WHERE lower(github_username) = 'rinkitadhana' AND (referred_by IS NULL OR referred_by = '');
 
@@ -203,11 +188,6 @@ INSERT INTO contributor_referrals (org, month_key, referrer_login, referred_logi
 VALUES ('OWASP-BLT', '2026-04', lower('aryanjain'), lower('shivanandu'), 'BLT-Pool', 0, 1744329600)
 ON CONFLICT (org, month_key, referrer_login, referred_login) DO NOTHING;
 
--- ── Part C: Additional contributors found in Slack overview screenshots ───────
--- These 4 entries were visible in the full checklist view (images 12, 13, 15)
--- but were missing from the initial backfill.
-
--- 14. swaparupmukherjee ← sakshamgupta (primary), sarafarajnasardi
 UPDATE mentors SET referred_by = 'sakshamgupta'
 WHERE lower(github_username) = 'swaparupmukherjee' AND (referred_by IS NULL OR referred_by = '');
 
@@ -219,7 +199,6 @@ INSERT INTO contributor_referrals (org, month_key, referrer_login, referred_logi
 VALUES ('OWASP-BLT', '2026-04', lower('sarafarajnasardi'), lower('swaparupmukherjee'), 'BLT-Pool', 0, 1744329600)
 ON CONFLICT (org, month_key, referrer_login, referred_login) DO NOTHING;
 
--- 15. devislodhwal ← gauruarora
 UPDATE mentors SET referred_by = 'gauravarora'
 WHERE lower(github_username) = 'devislodhwal' AND (referred_by IS NULL OR referred_by = '');
 
@@ -227,7 +206,6 @@ INSERT INTO contributor_referrals (org, month_key, referrer_login, referred_logi
 VALUES ('OWASP-BLT', '2026-04', lower('gauravarora'), lower('devislodhwal'), 'BLT-Pool', 0, 1744329600)
 ON CONFLICT (org, month_key, referrer_login, referred_login) DO NOTHING;
 
--- 16. amoghsunil ← sahildhillon
 UPDATE mentors SET referred_by = 'sahildhillon'
 WHERE lower(github_username) = 'amoghsunil' AND (referred_by IS NULL OR referred_by = '');
 
@@ -235,7 +213,6 @@ INSERT INTO contributor_referrals (org, month_key, referrer_login, referred_logi
 VALUES ('OWASP-BLT', '2026-04', lower('sahildhillon'), lower('amoghsunil'), 'BLT-Pool', 0, 1744329600)
 ON CONFLICT (org, month_key, referrer_login, referred_login) DO NOTHING;
 
--- 17. rudrapratapsingh ← rudra9439 (primary), sanidhyashishodia
 UPDATE mentors SET referred_by = 'rudra9439'
 WHERE lower(github_username) = 'rudrapratapsingh' AND (referred_by IS NULL OR referred_by = '');
 
