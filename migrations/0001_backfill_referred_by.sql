@@ -1,12 +1,3 @@
--- Migration: 0001_backfill_referred_by
--- Backfill referred_by for mentors whose referral data was missing at insertion.
--- Each UPDATE is idempotent (only patches rows where referred_by IS NULL or empty).
--- Multiple mentors per contributor are stored in contributor_referrals, one row
--- per mentor-contributor pair. referred_by stores the primary (first) mentor only.
---
--- Closes: https://github.com/OWASP-BLT/BLT-Pool/issues/52
---
--- ── Part A: Original 13 mentor → referrer pairs ─────────────────────────────
 -- mentor              referred_by
 -- rinkitadhana        mdkaifansari04
 -- rajgupta36          mdkaifansari04
@@ -61,27 +52,6 @@ WHERE lower(github_username) = 'vedantanand17' AND (referred_by IS NULL OR refer
 UPDATE mentors SET referred_by = 'sidd190'
 WHERE lower(github_username) = 'rishab87' AND (referred_by IS NULL OR referred_by = '');
 
--- ── Part B: Contributor checklist — 13 assignees (Apr 2026) ─────────────────
--- referred_by = primary (first) mentor only; all mentors stored in
--- contributor_referrals below (one row per mentor-contributor pair).
---
--- assignee           primary mentor       all mentors                          PRs
--- preetham           vinamra              vinamra, carla                       39
--- mdkaifansari04     raj                  raj, rinkitadhana                    52
--- ananya             shirshjain           shirshjain, ankitsinghsisodya        19
--- saviod             kunal1522            kunal1522, chigorin                  20
--- mohammedaashik     manikandanchandran   manikandanchandran                   —
--- jayant             manikandanchandran   manikandanchandran, bishaldas        —
--- shazzahrazaidi     rehan                rehan                                8
--- sidd190            rishab87             rishab87, vedantanand17              30
--- rosai              jisan                jisan, shivam                        70
--- shubhangpathak     aadityasharma        aadityasharma                        —
--- sakshee            akshaybehl           akshaybehl, arpitchaudhary,          28
---                                         vedantanand17, sakshamgupta
--- arnavkirti         shriyashsoni         shriyashsoni, mohammedfaiyaz29,      —
---                                         mariyan-zarev, tanishtyagi, ankitshankar
--- shivanandu         kunal1522            kunal1522, aryanjain                 1
-
 UPDATE mentors SET referred_by = 'vinamra'
 WHERE lower(github_username) = 'preetham' AND (referred_by IS NULL OR referred_by = '');
 
@@ -121,11 +91,6 @@ WHERE lower(github_username) = 'arnavkirti' AND (referred_by IS NULL OR referred
 UPDATE mentors SET referred_by = 'kunal1522'
 WHERE lower(github_username) = 'shivanandu' AND (referred_by IS NULL OR referred_by = '');
 
--- ── contributor_referrals: one row per mentor-contributor pair ───────────────
--- All logins lowercase to match runtime normalization.
--- Explicit conflict target matches the PRIMARY KEY definition.
-
--- 1. preetham ← vinamra, carla
 INSERT INTO contributor_referrals (org, month_key, referrer_login, referred_login, repo, issue_number, created_at)
 VALUES ('OWASP-BLT', '2026-04', lower('vinamra'), lower('preetham'), 'BLT-Pool', 0, 1744329600)
 ON CONFLICT (org, month_key, referrer_login, referred_login) DO NOTHING;
@@ -134,7 +99,6 @@ INSERT INTO contributor_referrals (org, month_key, referrer_login, referred_logi
 VALUES ('OWASP-BLT', '2026-04', lower('carla'), lower('preetham'), 'BLT-Pool', 0, 1744329600)
 ON CONFLICT (org, month_key, referrer_login, referred_login) DO NOTHING;
 
--- 2. mdkaifansari04 ← raj, rinkitadhana
 INSERT INTO contributor_referrals (org, month_key, referrer_login, referred_login, repo, issue_number, created_at)
 VALUES ('OWASP-BLT', '2026-04', lower('raj'), lower('mdkaifansari04'), 'BLT-Pool', 0, 1744329600)
 ON CONFLICT (org, month_key, referrer_login, referred_login) DO NOTHING;
@@ -143,7 +107,6 @@ INSERT INTO contributor_referrals (org, month_key, referrer_login, referred_logi
 VALUES ('OWASP-BLT', '2026-04', lower('rinkitadhana'), lower('mdkaifansari04'), 'BLT-Pool', 0, 1744329600)
 ON CONFLICT (org, month_key, referrer_login, referred_login) DO NOTHING;
 
--- 3. ananya ← shirshjain, ankitsinghsisodya
 INSERT INTO contributor_referrals (org, month_key, referrer_login, referred_login, repo, issue_number, created_at)
 VALUES ('OWASP-BLT', '2026-04', lower('shirshjain'), lower('ananya'), 'BLT-Pool', 0, 1744329600)
 ON CONFLICT (org, month_key, referrer_login, referred_login) DO NOTHING;
@@ -152,7 +115,6 @@ INSERT INTO contributor_referrals (org, month_key, referrer_login, referred_logi
 VALUES ('OWASP-BLT', '2026-04', lower('ankitsinghsisodya'), lower('ananya'), 'BLT-Pool', 0, 1744329600)
 ON CONFLICT (org, month_key, referrer_login, referred_login) DO NOTHING;
 
--- 4. saviod ← kunal1522, chigorin
 INSERT INTO contributor_referrals (org, month_key, referrer_login, referred_login, repo, issue_number, created_at)
 VALUES ('OWASP-BLT', '2026-04', lower('kunal1522'), lower('saviod'), 'BLT-Pool', 0, 1744329600)
 ON CONFLICT (org, month_key, referrer_login, referred_login) DO NOTHING;
@@ -161,12 +123,10 @@ INSERT INTO contributor_referrals (org, month_key, referrer_login, referred_logi
 VALUES ('OWASP-BLT', '2026-04', lower('chigorin'), lower('saviod'), 'BLT-Pool', 0, 1744329600)
 ON CONFLICT (org, month_key, referrer_login, referred_login) DO NOTHING;
 
--- 5. mohammedaashik ← manikandanchandran
 INSERT INTO contributor_referrals (org, month_key, referrer_login, referred_login, repo, issue_number, created_at)
 VALUES ('OWASP-BLT', '2026-04', lower('manikandanchandran'), lower('mohammedaashik'), 'BLT-Pool', 0, 1744329600)
 ON CONFLICT (org, month_key, referrer_login, referred_login) DO NOTHING;
 
--- 6. jayant ← manikandanchandran, bishaldas
 INSERT INTO contributor_referrals (org, month_key, referrer_login, referred_login, repo, issue_number, created_at)
 VALUES ('OWASP-BLT', '2026-04', lower('manikandanchandran'), lower('jayant'), 'BLT-Pool', 0, 1744329600)
 ON CONFLICT (org, month_key, referrer_login, referred_login) DO NOTHING;
@@ -175,12 +135,10 @@ INSERT INTO contributor_referrals (org, month_key, referrer_login, referred_logi
 VALUES ('OWASP-BLT', '2026-04', lower('bishaldas'), lower('jayant'), 'BLT-Pool', 0, 1744329600)
 ON CONFLICT (org, month_key, referrer_login, referred_login) DO NOTHING;
 
--- 7. shazzahrazaidi ← rehan
 INSERT INTO contributor_referrals (org, month_key, referrer_login, referred_login, repo, issue_number, created_at)
 VALUES ('OWASP-BLT', '2026-04', lower('rehan'), lower('shazzahrazaidi'), 'BLT-Pool', 0, 1744329600)
 ON CONFLICT (org, month_key, referrer_login, referred_login) DO NOTHING;
 
--- 8. sidd190 ← rishab87, vedantanand17
 INSERT INTO contributor_referrals (org, month_key, referrer_login, referred_login, repo, issue_number, created_at)
 VALUES ('OWASP-BLT', '2026-04', lower('rishab87'), lower('sidd190'), 'BLT-Pool', 0, 1744329600)
 ON CONFLICT (org, month_key, referrer_login, referred_login) DO NOTHING;
@@ -189,7 +147,6 @@ INSERT INTO contributor_referrals (org, month_key, referrer_login, referred_logi
 VALUES ('OWASP-BLT', '2026-04', lower('vedantanand17'), lower('sidd190'), 'BLT-Pool', 0, 1744329600)
 ON CONFLICT (org, month_key, referrer_login, referred_login) DO NOTHING;
 
--- 9. rosai ← jisan, shivam
 INSERT INTO contributor_referrals (org, month_key, referrer_login, referred_login, repo, issue_number, created_at)
 VALUES ('OWASP-BLT', '2026-04', lower('jisan'), lower('rosai'), 'BLT-Pool', 0, 1744329600)
 ON CONFLICT (org, month_key, referrer_login, referred_login) DO NOTHING;
@@ -198,12 +155,10 @@ INSERT INTO contributor_referrals (org, month_key, referrer_login, referred_logi
 VALUES ('OWASP-BLT', '2026-04', lower('shivam'), lower('rosai'), 'BLT-Pool', 0, 1744329600)
 ON CONFLICT (org, month_key, referrer_login, referred_login) DO NOTHING;
 
--- 10. shubhangpathak ← aadityasharma
 INSERT INTO contributor_referrals (org, month_key, referrer_login, referred_login, repo, issue_number, created_at)
 VALUES ('OWASP-BLT', '2026-04', lower('aadityasharma'), lower('shubhangpathak'), 'BLT-Pool', 0, 1744329600)
 ON CONFLICT (org, month_key, referrer_login, referred_login) DO NOTHING;
 
--- 11. sakshee ← akshaybehl, arpitchaudhary, vedantanand17, sakshamgupta
 INSERT INTO contributor_referrals (org, month_key, referrer_login, referred_login, repo, issue_number, created_at)
 VALUES ('OWASP-BLT', '2026-04', lower('akshaybehl'), lower('sakshee'), 'BLT-Pool', 0, 1744329600)
 ON CONFLICT (org, month_key, referrer_login, referred_login) DO NOTHING;
@@ -220,7 +175,6 @@ INSERT INTO contributor_referrals (org, month_key, referrer_login, referred_logi
 VALUES ('OWASP-BLT', '2026-04', lower('sakshamgupta'), lower('sakshee'), 'BLT-Pool', 0, 1744329600)
 ON CONFLICT (org, month_key, referrer_login, referred_login) DO NOTHING;
 
--- 12. arnavkirti ← shriyashsoni, mohammedfaiyaz29, mariyan-zarev, tanishtyagi, ankitshankar
 INSERT INTO contributor_referrals (org, month_key, referrer_login, referred_login, repo, issue_number, created_at)
 VALUES ('OWASP-BLT', '2026-04', lower('shriyashsoni'), lower('arnavkirti'), 'BLT-Pool', 0, 1744329600)
 ON CONFLICT (org, month_key, referrer_login, referred_login) DO NOTHING;
@@ -241,7 +195,6 @@ INSERT INTO contributor_referrals (org, month_key, referrer_login, referred_logi
 VALUES ('OWASP-BLT', '2026-04', lower('ankitshankar'), lower('arnavkirti'), 'BLT-Pool', 0, 1744329600)
 ON CONFLICT (org, month_key, referrer_login, referred_login) DO NOTHING;
 
--- 13. shivanandu ← kunal1522, aryanjain
 INSERT INTO contributor_referrals (org, month_key, referrer_login, referred_login, repo, issue_number, created_at)
 VALUES ('OWASP-BLT', '2026-04', lower('kunal1522'), lower('shivanandu'), 'BLT-Pool', 0, 1744329600)
 ON CONFLICT (org, month_key, referrer_login, referred_login) DO NOTHING;
