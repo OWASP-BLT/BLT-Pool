@@ -1,13 +1,3 @@
-#!/usr/bin/env bash
-# check_no_runtime_ddl.sh
-#
-# Fails the build if any Python source file outside of migrations/ issues
-# bare CREATE TABLE or ALTER TABLE statements at runtime.
-# Schema changes must go through Wrangler migration files under migrations/.
-#
-# Usage:  bash scripts/check_no_runtime_ddl.sh
-# Exit 0 → clean; Exit 1 → violations found.
-
 set -euo pipefail
 
 SEARCH_DIRS=("src")
@@ -19,7 +9,7 @@ found=0
 for dir in "${SEARCH_DIRS[@]}"; do
     while IFS= read -r -d '' file; do
         while IFS= read -r line; do
-            # Skip pure comment lines
+    
             if echo "$line" | grep -qP "$IGNORE_COMMENT_PATTERN"; then
                 continue
             fi
