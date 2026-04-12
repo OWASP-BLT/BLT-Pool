@@ -20,9 +20,6 @@ UPDATE mentors SET referred_by = 'e-esakman'
 WHERE lower(github_username) = 'captain-t2004' AND (referred_by IS NULL OR referred_by = '');
 
 UPDATE mentors SET referred_by = 's3dfx-cyber'
-WHERE lower(github_username) = 'elsheik21' AND (referred_by IS NULL OR referred_by = '');
-
-UPDATE mentors SET referred_by = 's3dfx-cyber'
 WHERE lower(github_username) = 'kunal1522' AND (referred_by IS NULL OR referred_by = '');
 
 UPDATE mentors SET referred_by = 'rudra-rps'
@@ -44,7 +41,7 @@ UPDATE mentors SET referred_by = 'shirshjain'
 WHERE lower(github_username) = 'ananya' AND (referred_by IS NULL OR referred_by = '');
 
 UPDATE mentors SET referred_by = 'kunal1522'
-WHERE lower(github_username) = 'saviod' AND (referred_by IS NULL OR referred_by = '');
+WHERE lower(github_username) = 'saviodsouza' AND (referred_by IS NULL OR referred_by = '');
 
 UPDATE mentors SET referred_by = 'manikandanchandran'
 WHERE lower(github_username) = 'mohammedaashik' AND (referred_by IS NULL OR referred_by = '');
@@ -98,11 +95,11 @@ VALUES ('OWASP-BLT', '2026-04', lower('ankitsinghsisodya'), lower('ananya'), 'BL
 ON CONFLICT (org, month_key, referrer_login, referred_login) DO NOTHING;
 
 INSERT INTO contributor_referrals (org, month_key, referrer_login, referred_login, repo, issue_number, created_at)
-VALUES ('OWASP-BLT', '2026-04', lower('kunal1522'), lower('saviod'), 'BLT-Pool', 0, 1744329600)
+VALUES ('OWASP-BLT', '2026-04', lower('kunal1522'), lower('saviodsouza'), 'BLT-Pool', 0, 1744329600)
 ON CONFLICT (org, month_key, referrer_login, referred_login) DO NOTHING;
 
 INSERT INTO contributor_referrals (org, month_key, referrer_login, referred_login, repo, issue_number, created_at)
-VALUES ('OWASP-BLT', '2026-04', lower('chigorin'), lower('saviod'), 'BLT-Pool', 0, 1744329600)
+VALUES ('OWASP-BLT', '2026-04', lower('chigorin'), lower('saviodsouza'), 'BLT-Pool', 0, 1744329600)
 ON CONFLICT (org, month_key, referrer_login, referred_login) DO NOTHING;
 
 INSERT INTO contributor_referrals (org, month_key, referrer_login, referred_login, repo, issue_number, created_at)
