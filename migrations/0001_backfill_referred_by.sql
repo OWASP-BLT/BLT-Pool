@@ -34,11 +34,6 @@ WHERE lower(github_username) = 'dev-sanidhya' AND (referred_by IS NULL OR referr
 UPDATE mentors SET referred_by = 'sidd190'
 WHERE lower(github_username) = 'vedantanand17' AND (referred_by IS NULL OR referred_by = '');
 
--- NOTE: rishab87's referred_by is intentionally left unset here.
--- rishab87 is a mentor (Part A) whose own referrer data is not in scope for this migration.
--- Setting referred_by = 'sidd190' would create a circular reference since
--- sidd190 (Part B contributor) lists rishab87 as their invited mentor.
-
 UPDATE mentors SET referred_by = 'vinamra'
 WHERE lower(github_username) = 'preetham' AND (referred_by IS NULL OR referred_by = '');
 
@@ -77,14 +72,6 @@ WHERE lower(github_username) = 'arnavkirti' AND (referred_by IS NULL OR referred
 
 UPDATE mentors SET referred_by = 'kunal1522'
 WHERE lower(github_username) = 'shivanandu' AND (referred_by IS NULL OR referred_by = '');
-
--- NOTE: issue_number = 0 is used as a deliberate backfill sentinel throughout
--- this migration. These referral relationships were established outside the normal
--- issue-assignment workflow (via Slack Contributor Checklist, not through a specific
--- BLT issue). Downstream queries that join or filter on issue_number should treat
--- 0 as a "pre-existing / checklist-based referral" and exclude it from
--- issue-specific lookups. The contributor_referrals PRIMARY KEY ensures no
--- duplicates regardless of the sentinel value.
 
 INSERT INTO contributor_referrals (org, month_key, referrer_login, referred_login, repo, issue_number, created_at)
 VALUES ('OWASP-BLT', '2026-04', lower('vinamra'), lower('preetham'), 'BLT-Pool', 0, 1744329600)
