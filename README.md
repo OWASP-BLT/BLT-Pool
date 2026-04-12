@@ -49,7 +49,7 @@ The app runs as a Python Cloudflare Worker. D1 is used for both the leaderboard 
 
 ### D1 Data Model
 
-The worker creates and uses several D1 tables at runtime:
+The worker relies on D1 tables created via Wrangler migration files under `migrations/`:
 
 - `mentors` stores mentor profile records such as name, GitHub username, specialties, timezone, max mentees, and referral source.
 - `mentor_assignments` stores active mentor-to-issue assignments so the homepage can show current load.
