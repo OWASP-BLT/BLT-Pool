@@ -3227,6 +3227,22 @@ async def _assign_mentor_to_issue(
         {"labels": [MENTOR_ASSIGNED_LABEL]},
     )
 
+    # Step 5: Add the mentor as a GitHub assignee (best-effort).
+    assignee_resp = await github_api(
+        "POST",
+        f"/repos/{owner}/{repo}/issues/{issue_number}/assignees",
+        token,
+        {"assignees": [mentor_username]},
+    )
+    assignee_status = getattr(assignee_resp, "status", None)
+    if assignee_status not in (200, 201):
+        console.error(
+            f"[MentorPool] Failed to add @{mentor_username} as GitHub assignee "
+            f"for {owner}/{repo}#{issue_number} (status={assignee_status}). "
+            "Mentor lacks repo collaborator access or the token is insufficient. "
+            "Label and comment were still applied."
+        )
+
     specialties_info = ""
     if mentor.get("specialties"):
         specialties_info = f" (specialties: {', '.join(mentor['specialties'])})"
@@ -3301,8 +3317,9 @@ async def handle_mentor_unassign(
     - Deleting the D1 assignment record.
     - Posting a confirmation comment.
 
-    The issue author, the currently assigned mentor, or any repo maintainer
-    (admin or maintain permission) may use this command.
+    The issue author, the current issue assignee, the currently assigned
+    mentor, or any repo maintainer (admin or maintain permission) may use
+    this command.
     """
     issue_number = issue["number"]
     current_labels = {lb.get("name", "").lower() for lb in issue.get("labels", [])}
@@ -3322,22 +3339,26 @@ async def handle_mentor_unassign(
         owner, repo, issue_number, token
     )
 
-    # Permission check: allow the issue author, the assigned mentor, or any
-    # repo maintainer (admin/maintain) to unmentor.  The maintainer check calls
-    # the GitHub API so we skip it when one of the cheaper conditions already
-    # grants access.
+    # Permission check: allow the issue author, any current issue assignee,
+    # the assigned mentor, or any repo maintainer (admin/maintain) to unmentor.
+    # The maintainer check calls the GitHub API so we skip it when one of the
+    # cheaper conditions already grants access.
     issue_author = (issue.get("user") or {}).get("login", "")
     is_issue_author = login.lower() == issue_author.lower()
     is_assigned_mentor = current_mentor and login.lower() == current_mentor.lower()
-    if not is_issue_author and not is_assigned_mentor:
+    issue_assignee_logins = {
+        (a.get("login") or "").lower() for a in (issue.get("assignees") or [])
+    }
+    is_current_assignee = login.lower() in issue_assignee_logins
+    if not is_issue_author and not is_assigned_mentor and not is_current_assignee:
         is_repo_maintainer = await _is_maintainer(owner, repo, login, token)
         if not is_repo_maintainer:
             await create_comment(
                 owner,
                 repo,
                 issue_number,
-                f"@{login} Only the issue author, the assigned mentor, or a repo maintainer "
-                "can remove a mentor assignment. "
+                f"@{login} Only the issue author, a current assignee, the assigned mentor, "
+                "or a repo maintainer can remove a mentor assignment. "
                 "Use `/rematch` if you'd like a different mentor.\n\n"
                 "— [OWASP BLT-Pool](https://pool.owaspblt.org)",
                 token,
@@ -4664,9 +4685,11 @@ async def check_unresolved_conversations(payload, token):
         page += 1
 
     if unresolved:
+        pr_author_login = (pr.get("user") or {}).get("login", "")
+        username_block = f"@{pr_author_login}\n\n" if pr_author_login else ""
         comment_body = (
             f"{marker}\n"
-            f"⚠️ This pull request has **{unresolved_count} unresolved review "
+            f"{username_block}⚠️ This pull request has **{unresolved_count} unresolved review "
             f"{noun}** that must be resolved before merging."
         )
         if existing_comment_id is not None:

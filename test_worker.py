@@ -4073,6 +4073,7 @@ class TestCheckUnresolvedConversations(unittest.TestCase):
         _run(_inner())
         self.assertTrue(len(comment_bodies) >= 1, "Expected a comment to be posted")
         self.assertIn(_worker.UNRESOLVED_CONVERSATIONS_MARKER, comment_bodies[0])
+        self.assertIn("@alice", comment_bodies[0])
         self.assertIn("1", comment_bodies[0])
 
     def test_updates_existing_comment_when_unresolved(self):
@@ -4954,6 +4955,21 @@ class TestHandleMentorUnassign(unittest.TestCase):
         api_calls, comments = [], []
         self._run_unmentor(issue, "charlie", "bob", api_calls, comments,
                            is_maintainer=True)
+        endpoints_called = [str(call) for call in api_calls]
+        self.assertTrue(any("labels/mentor-assigned" in e for e in endpoints_called))
+        self.assertTrue(any("assignees" in e for e in endpoints_called))
+        self.assertTrue(any("cancelled" in c.lower() for c in comments))
+
+    def test_current_assignee_can_unmentor(self):
+        issue = {
+            "number": 7,
+            "labels": [{"name": "mentor-assigned"}],
+            "assignees": [{"login": "dave"}],
+            "user": {"login": "alice"},
+        }
+        api_calls, comments = [], []
+        # dave is an assignee but not the author or the mentor
+        self._run_unmentor(issue, "dave", "bob", api_calls, comments)
         endpoints_called = [str(call) for call in api_calls]
         self.assertTrue(any("labels/mentor-assigned" in e for e in endpoints_called))
         self.assertTrue(any("assignees" in e for e in endpoints_called))
