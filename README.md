@@ -219,7 +219,6 @@ The worker currently seeds an initial mentor pool in code so the homepage is pop
 - Vinamra Vaswani
 - Carla Voorhees
 - Akshay Behl
-- Ahmed ElSheik
 - Kunal Kashyap
 - Rudra Bhaskar
 - Sanidhya Shishodia
