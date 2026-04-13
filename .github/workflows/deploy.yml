@@ -25,17 +25,12 @@ jobs:
       - name: Check no runtime DDL in source
         run: bash scripts/check_no_runtime_ddl.sh
 
-      # ── Step 1: Apply D1 migrations BEFORE deploying the worker ──────────
-      # This ensures tables exist before the new worker code goes live.
-      # Deploying the worker first on a fresh D1 instance would cause
-      # immediate failures on all table-dependent operations.
       - name: Apply D1 migrations
         run: wrangler d1 migrations apply LEADERBOARD_DB --remote
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
 
-      # ── Step 2: Deploy the worker AFTER migrations succeed ───────────────
       - name: Deploy worker
         run: wrangler deploy
         env:
