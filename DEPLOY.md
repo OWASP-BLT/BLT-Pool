@@ -1,61 +1,56 @@
-# Deployment Guide — BLT-Pool Worker
+# Deployment Guide — BLT-Pool
 
-## ⚠️ Critical Deployment Order
+## ⚠️ Required Deployment Order
 
-As of the migration introduced in PR #120, the D1 database schema is managed
-exclusively via Wrangler migration files under `migrations/`. The worker no
-longer creates tables at runtime.
+Since `_ensure_leaderboard_schema()` and `_ensure_tables()` are now **no-op
+shims** (schema is managed exclusively via Wrangler D1 migrations), the
+database schema **must be applied before** the worker code is deployed.
 
-**You must apply migrations BEFORE deploying the worker to any environment
-(including fresh D1 instances).** If the worker deploys first, all
-table-dependent operations will fail immediately.
+Deploying the worker first to a fresh D1 instance will cause immediate
+failures on all table-dependent operations.
 
-### Correct deployment order
+### Correct order
 
 ```bash
-# Step 1 — Apply all pending migrations to D1
+# 1. Apply all migrations to D1 first
 wrangler d1 migrations apply LEADERBOARD_DB
 
-# Step 2 — Deploy the worker
+# 2. Then deploy the worker
 wrangler deploy
 ```
 
-### For fresh environments (first-time setup)
+### For existing instances (upgrade)
 
 ```bash
-# Creates all tables via migrations/0000_initial_schema.sql
-wrangler d1 migrations apply LEADERBOARD_DB --env production
+# Apply any new migrations
+wrangler d1 migrations apply LEADERBOARD_DB
 
-# Then backfills referred_by and contributor_referrals
-# (handled automatically by 0001_backfill_referred_by.sql)
-
-# Then deploy
-wrangler deploy --env production
+# Deploy updated worker
+wrangler deploy
 ```
 
-### Checking migration status
+### Verifying migrations applied
 
 ```bash
-# List applied migrations
-wrangler d1 migrations list LEADERBOARD_DB
-
-# Check which migrations are pending
-wrangler d1 migrations list LEADERBOARD_DB --env production
+wrangler d1 execute LEADERBOARD_DB --command "SELECT name FROM sqlite_master WHERE type='table';"
 ```
 
-## Migration files
+All expected tables should appear:
+- `leaderboard_monthly_stats`
+- `leaderboard_open_prs`
+- `leaderboard_pr_state`
+- `leaderboard_review_credits`
+- `leaderboard_backfill_state`
+- `leaderboard_backfill_repo_done`
+- `mentor_assignments`
+- `mentors`
+- `mentor_stats_cache`
+- `contributor_referrals`
+- `leaderboard_processed_comments`
+
+### Migration files
 
 | File | Purpose |
 |------|---------|
-| `migrations/0000_initial_schema.sql` | Full baseline schema — all 11 tables |
-| `migrations/0001_backfill_referred_by.sql` | Backfill `referred_by` for 26 mentors/contributors + `contributor_referrals` rows |
-
-## CI guard
-
-`scripts/check_no_runtime_ddl.sh` enforces that no `CREATE TABLE` or
-`ALTER TABLE` statements exist in `src/**/*.py`. Run it in CI before every
-deploy to ensure migrations remain the single source of truth.
-
-```bash
-bash scripts/check_no_runtime_ddl.sh
-```
+| `migrations/0000_initial_schema.sql` | Full baseline schema for all tables |
+| `migrations/0001_backfill_referred_by.sql` | Backfill `referred_by` + `contributor_referrals` for 30 contributors/mentors |
