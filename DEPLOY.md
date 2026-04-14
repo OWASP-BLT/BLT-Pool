@@ -11,9 +11,10 @@ npm run deploy
 ```
 
 This runs:
-1. `wrangler d1 migrations apply LEADERBOARD_DB --remote` — applies any
+1. `bash scripts/check_no_runtime_ddl.sh` — verifies no runtime DDL has crept back into source (fails fast if found)
+2. `wrangler d1 migrations apply LEADERBOARD_DB --remote` — applies any
    pending SQL migrations to the D1 database on Cloudflare
-2. `wrangler deploy` — deploys the updated worker code
+3. `wrangler deploy` — deploys the updated worker code
 
 ## ⚠️ Why order matters
 
