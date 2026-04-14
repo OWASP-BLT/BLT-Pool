@@ -26,3 +26,6 @@ jobs:
 
       - name: Run Python test suite
         run: pytest -v
+
+      - name: Check no runtime DDL in source
+        run: bash scripts/check_no_runtime_ddl.sh
