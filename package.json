@@ -1,0 +1,12 @@
+{
+  "name": "blt-pool",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "deploy": "wrangler d1 migrations apply LEADERBOARD_DB --remote && wrangler deploy",
+    "deploy:local": "wrangler d1 migrations apply LEADERBOARD_DB --local && wrangler dev",
+    "migrations:apply": "wrangler d1 migrations apply LEADERBOARD_DB --remote",
+    "migrations:list": "wrangler d1 migrations list LEADERBOARD_DB --remote",
+    "ddl:check": "bash scripts/check_no_runtime_ddl.sh"
+  }
+}
