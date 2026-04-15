@@ -64,8 +64,8 @@ WHERE lower(github_username) = 'shubhangpathak' AND (referred_by IS NULL OR refe
 UPDATE mentors SET referred_by = 'akshaybehl'
 WHERE lower(github_username) = 'sakshee' AND (referred_by IS NULL OR referred_by = '');
 
-UPDATE mentors SET referred_by = 'shriyashsoni'
-WHERE lower(github_username) = 'arnavkirti' AND (referred_by IS NULL OR referred_by = '');
+-- arnavkirti referred_by intentionally omitted: shriyashsoni → arnavkirti is recorded below,
+-- so arnavkirti → shriyashsoni would be a circular reference.
 
 UPDATE mentors SET referred_by = 'kunal1522'
 WHERE lower(github_username) = 'shivanandu' AND (referred_by IS NULL OR referred_by = '');
@@ -121,10 +121,7 @@ ON CONFLICT (org, month_key, referrer_login, referred_login) DO NOTHING;
 INSERT INTO contributor_referrals (org, month_key, referrer_login, referred_login, repo, issue_number, created_at)
 VALUES ('OWASP-BLT', '2026-04', lower('rishab87'), lower('sidd190'), 'BLT-Pool', 0, 1744329600)
 ON CONFLICT (org, month_key, referrer_login, referred_login) DO NOTHING;
-
-INSERT INTO contributor_referrals (org, month_key, referrer_login, referred_login, repo, issue_number, created_at)
-VALUES ('OWASP-BLT', '2026-04', lower('vedantanand17'), lower('sidd190'), 'BLT-Pool', 0, 1744329600)
-ON CONFLICT (org, month_key, referrer_login, referred_login) DO NOTHING;
+-- vedantanand17 → sidd190 removed: mentors.referred_by for sidd190 is 'rishab87', not vedantanand17 (avoids double-credit)
 
 INSERT INTO contributor_referrals (org, month_key, referrer_login, referred_login, repo, issue_number, created_at)
 VALUES ('OWASP-BLT', '2026-04', lower('jisan'), lower('rosai'), 'BLT-Pool', 0, 1744329600)
