@@ -3197,9 +3197,9 @@ async def _assign_mentor_to_issue(
     mentor_username = mentor["github_username"]
 
     # Ensure labels exist in the repo before applying them.
-    await _ensure_label_exists(owner, repo, NEEDS_MENTOR_LABEL, MENTOR_LABEL_COLOR, token)
-    await _ensure_label_exists(
-        owner, repo, MENTOR_ASSIGNED_LABEL, MENTOR_ASSIGNED_LABEL_COLOR, token
+    await ensure_label_exists(owner, repo, NEEDS_MENTOR_LABEL, MENTOR_LABEL_COLOR, "", token)
+    await ensure_label_exists(
+        owner, repo, MENTOR_ASSIGNED_LABEL, MENTOR_ASSIGNED_LABEL_COLOR, "", token
     )
 
     # Apply mentor-assigned label.
@@ -3828,7 +3828,7 @@ async def _assign(
             f'"{HELP_WANTED_LABEL}" label before `/assign` can be used.',
             token,
         )
-        await _ensure_label_exists(owner, repo, NEEDS_APPROVAL_LABEL, NEEDS_APPROVAL_LABEL_COLOR, token)
+        await ensure_label_exists(owner, repo, NEEDS_APPROVAL_LABEL, NEEDS_APPROVAL_LABEL_COLOR, "", token)
         await github_api(
             "POST",
             f"/repos/{owner}/{repo}/issues/{num}/labels",
@@ -4478,32 +4478,135 @@ async def handle_pull_request_review_submitted(payload: dict, env=None) -> None:
     """Track review credits in D1 (first two unique reviewers per PR per month)."""
     await _track_review_in_d1(payload, env)
 
+async def handle_changes_requested_label(owner: str, repo: str, number: int, token: str) -> None:
+    """Add/remove 'changes-requested' label based on PR review state."""
+    # Fetch all reviews (paginated)
+    reviews = []
+    page = 1
+    while True:
+        resp = await github_api(
+            "GET",
+            f"/repos/{owner}/{repo}/pulls/{number}/reviews?per_page=100&page={page}",
+            token,
+        )
+        if resp.status != 200:
+            console.error(f"[BLT] Failed to fetch reviews page {page} for PR #{number}: {resp.status}")
+            return
+        page_reviews = json.loads(await resp.text())
+        if not page_reviews:
+            break
+        reviews.extend(page_reviews)
+        page += 1
 
-async def _ensure_label_exists(
-    owner: str, repo: str, name: str, color: str, token: str
-) -> None:
-    """Create a label if it does not already exist, or update its colour."""
+    # Track latest state per reviewer
+    reviewer_states = {}
+
+    reviews.sort(key=lambda r: r.get("submitted_at") or "")
+
+    for review in reviews:
+        user = (review.get("user") or {}).get("login")
+        state = review.get("state")
+
+        if not user:
+            continue
+
+        if state not in ("COMMENTED", "PENDING"):
+            reviewer_states[user] = state
+
+    has_changes_requested = any(
+        state == "CHANGES_REQUESTED"
+        for state in reviewer_states.values()
+    )
+
+    label_name = "changes-requested"
+    label_color = "e74c3c"
+
+    # Get current labels
     resp = await github_api(
         "GET",
-        f"/repos/{owner}/{repo}/labels/{quote(name, safe='')}",
+        f"/repos/{owner}/{repo}/issues/{number}/labels",
         token,
     )
-    if resp.status == 404:
-        await github_api(
-            "POST",
-            f"/repos/{owner}/{repo}/labels",
-            token,
-            {"name": name, "color": color},
-        )
-    elif resp.status == 200:
-        data = json.loads(await resp.text())
-        if data.get("color") != color:
+
+    if resp.status != 200:
+        return
+
+    labels = json.loads(await resp.text())
+    current = {label["name"] for label in labels}
+
+    if has_changes_requested:
+        # Only ensure label exists when we need to add it
+        if label_name not in current:
+            await ensure_label_exists(owner, repo, label_name, label_color, "", token)
             await github_api(
-                "PATCH",
-                f"/repos/{owner}/{repo}/labels/{quote(name, safe='')}",
+                "POST",
+                f"/repos/{owner}/{repo}/issues/{number}/labels",
                 token,
-                {"color": color},
+                {"labels": [label_name]},
             )
+    else:
+        if label_name in current:
+            await github_api(
+                "DELETE",
+                f"/repos/{owner}/{repo}/issues/{number}/labels/{quote(label_name, safe='')}",
+                token,
+            )
+
+    # Track latest state per reviewer
+    reviewer_states = {}
+
+    reviews.sort(key=lambda r: r.get("submitted_at") or "")
+
+    for review in reviews:
+        user = (review.get("user") or {}).get("login")
+        state = review.get("state")
+
+        if not user:
+            continue
+
+        if state not in ("COMMENTED", "PENDING"):
+            reviewer_states[user] = state
+
+    has_changes_requested = any(
+        state == "CHANGES_REQUESTED"
+        for state in reviewer_states.values()
+    )
+
+    label_name = "changes-requested"
+    label_color = "e74c3c"
+
+    # Get current labels
+    resp = await github_api(
+        "GET",
+        f"/repos/{owner}/{repo}/issues/{number}/labels",
+        token,
+    )
+
+    if resp.status != 200:
+        return
+
+    labels = json.loads(await resp.text())
+    current = {label["name"] for label in labels}
+
+    if has_changes_requested:
+        # Only ensure label exists when we need to add it
+        if label_name not in current:
+            await ensure_label_exists(owner, repo, label_name, label_color, "", token)
+            await github_api(
+                "POST",
+                f"/repos/{owner}/{repo}/issues/{number}/labels",
+                token,
+                {"labels": [label_name]},
+            )
+    else:
+        if label_name in current:
+            await github_api(
+                "DELETE",
+                f"/repos/{owner}/{repo}/issues/{number}/labels/{quote(label_name, safe='')}",
+                token,
+            )
+
+
 
 async def check_unresolved_conversations(payload, token):
     """Add label, create a check run, and post a comment if PR has unresolved review conversations."""
@@ -4582,9 +4685,9 @@ async def check_unresolved_conversations(payload, token):
     label = f"unresolved-conversations: {unresolved_count}"
 
     if unresolved:
-        await _ensure_label_exists(owner, repo, label, "e74c3c", token)  # Red
+        await ensure_label_exists(owner, repo, label, "e74c3c", "", token)
     else:
-        await _ensure_label_exists(owner, repo, label, "5cb85c", token)  # Green
+        await ensure_label_exists(owner, repo, label, "5cb85c", "", token)
 
     await github_api(
         "POST",
@@ -4755,7 +4858,7 @@ async def label_pending_checks(
     if pending_count > 0:
         noun = "check" if pending_count == 1 else "checks"
         label = f"{pending_count} {noun} pending"
-        await _ensure_label_exists(owner, repo, label, "e4c84b", token)
+        await ensure_label_exists(owner, repo, label, "e4c84b", "", token)
         await github_api(
             "POST",
             f"/repos/{owner}/{repo}/issues/{pr_number}/labels",
@@ -4930,13 +5033,14 @@ async def get_valid_reviewers(owner: str, repo: str, pr_number: int, pr_author: 
 
 async def ensure_label_exists(owner: str, repo: str, label_name: str, color: str, description: str, token: str) -> None:
     """Create or update a label to ensure it exists with the correct color/description."""
-    resp = await github_api("GET", f"/repos/{owner}/{repo}/labels/{label_name}", token)
+    encoded_name = quote(label_name, safe='')
+    resp = await github_api("GET", f"/repos/{owner}/{repo}/labels/{encoded_name}", token)
     
     if resp.status == 200:
         # Label exists, check if it needs update
         data = json.loads(await resp.text())
         if data.get("color") != color or data.get("description") != description:
-            update_resp = await github_api("PATCH", f"/repos/{owner}/{repo}/labels/{label_name}", token, {
+            update_resp = await github_api("PATCH", f"/repos/{owner}/{repo}/labels/{encoded_name}", token, {
                 "color": color,
                 "description": description,
             })
@@ -5036,6 +5140,7 @@ async def handle_pull_request_review(payload: dict, token: str) -> None:
     pr_author = pr["user"]["login"]
     
     await check_peer_review_and_comment(owner, repo, pr["number"], pr_author, token)
+    await handle_changes_requested_label(owner, repo, pr["number"], token)
 
 
 async def handle_pull_request_for_review(payload: dict, token: str) -> None:
@@ -5169,16 +5274,11 @@ async def handle_webhook(request, env, ctx=None) -> Response:
             elif action == "closed":
                 await handle_pull_request_closed(payload, token, env)
         elif event == "pull_request_review":
-            if action == "submitted":
-                # Preserve existing D1 review-credit tracking
-                await handle_pull_request_review_submitted(payload, env)
-                # Also check peer review status
+            if action in ("submitted", "dismissed"):
+                if action == "submitted":
+                    await handle_pull_request_review_submitted(payload, env)
+
                 await handle_pull_request_review(payload, token)
-                # Update unresolved conversations label/check/comment
-                await check_unresolved_conversations(payload, token)
-            elif action == "dismissed":
-                await handle_pull_request_review(payload, token)
-                # Update unresolved conversations label/check/comment
                 await check_unresolved_conversations(payload, token)
         elif event == "pull_request_review_comment":
             await check_unresolved_conversations(payload, token)
