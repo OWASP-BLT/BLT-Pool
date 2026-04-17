@@ -6599,18 +6599,33 @@ async def scheduled(event, env):
 async def _check_stale_assignments(owner: str, repo: str, token: str):
     """Check a repository for stale issue assignments and unassign them."""
     try:
-        # Fetch open issues with assignees
-        issues_resp = await github_api(
-            "GET",
-            f"/repos/{owner}/{repo}/issues?state=open&per_page=100",
-            token
-        )
-        
-        if issues_resp.status != 200:
-            return
-        
-        issues = json.loads(await issues_resp.text())
-        
+        issues: list = []
+        page = 1
+        per_page = 100
+        max_pages = 20
+        while page <= max_pages:
+            issues_resp = await github_api(
+                "GET",
+                f"/repos/{owner}/{repo}/issues?state=open&per_page={per_page}&page={page}",
+                token,
+            )
+            if issues_resp.status == 403:
+                console.warn(f"[CRON] GitHub rate limit hit while fetching issues for {owner}/{repo}; stopping pagination")
+                break
+            if issues_resp.status != 200:
+                return
+            page_issues = json.loads(await issues_resp.text())
+            if not isinstance(page_issues, list) or not page_issues:
+                break
+            issues.extend(page_issues)
+            link_header = issues_resp.headers.get("Link") or ""
+            has_next = 'rel="next"' in link_header if link_header else len(page_issues) == per_page
+            if not has_next:
+                break
+            page += 1
+        if page > max_pages:
+            console.warn(f"[CRON] Stale-assignment pagination capped at {max_pages} pages for {owner}/{repo}")
+
         # Filter issues that have assignees and are not pull requests
         assigned_issues = [
             issue for issue in issues
